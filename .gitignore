@@ -1,0 +1,15 @@
+# Local SQLite cache (regenerable, ~300MB — do not commit)
+fund_cache.db
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Streamlit / OS
+.streamlit/secrets.toml
+.DS_Store
