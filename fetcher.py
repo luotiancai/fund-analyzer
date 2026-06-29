@@ -61,13 +61,34 @@ def init_db():
     conn.close()
 
 
-# Approximate trading days per look-back window, used for max-drawdown slices.
-DRAWDOWN_WINDOWS = {"mdd_1m": 21, "mdd_3m": 63, "mdd_6m": 126, "mdd_1y": 252}
+# Look-back windows in CALENDAR days, matching how EastMoney defines 近1月/3月/
+# 6月/1年 (date-to-date from the latest NAV date), so the computed drawdown and
+# Sharpe cover the same period as the 近X 收益率 columns shown alongside them.
+DRAWDOWN_DAYS = {"mdd_1m": 30, "mdd_3m": 91, "mdd_6m": 182, "mdd_1y": 365}
 
 # Sharpe is only computed for longer windows (short windows are too noisy).
-SHARPE_WINDOWS = {"sharpe_6m": 126, "sharpe_1y": 252}
+SHARPE_DAYS = {"sharpe_6m": 182, "sharpe_1y": 365}
 
 TRADING_DAYS = 252
+
+
+def _window_by_date(df: pd.DataFrame, days_back: int) -> Optional[pd.DataFrame]:
+    """Rows from the anchor through the latest NAV, for a trailing date window.
+
+    The anchor is the last NAV on or before (latest_date - days_back); it is the
+    base point one period ago (e.g. the NAV "one year ago"). It is kept in the
+    slice so it can serve as the drawdown peak candidate and as the base for the
+    first in-window daily return. Returns None when the fund has no NAV old
+    enough to anchor the window (e.g. a fund younger than the period).
+
+    `df` must be sorted ascending by `date` with a 0..n-1 RangeIndex.
+    """
+    end_date = df["date"].max()
+    start_date = end_date - timedelta(days=days_back)
+    older = df[df["date"] <= start_date]
+    if older.empty:
+        return None
+    return df.loc[older.index[-1]:]
 
 
 def _max_drawdown(nav: pd.Series) -> Optional[float]:
@@ -80,13 +101,17 @@ def _max_drawdown(nav: pd.Series) -> Optional[float]:
     return float(-dd.min())
 
 
-def _period_sharpe(r: pd.Series, days: int, rf: float) -> Optional[float]:
-    """Annualized Sharpe over the most recent `days` daily returns.
+def _period_sharpe(df: pd.DataFrame, days_back: int, rf: float) -> Optional[float]:
+    """Annualized Sharpe over the trailing `days_back` calendar-day window.
 
     Returns None when the fund lacks enough history to cover the window.
     """
-    r = r.tail(days)
-    if len(r) < days * 0.8:
+    window = _window_by_date(df, days_back)
+    if window is None:
+        return None
+    # Drop the anchor's own return: it happened the day before the window opens.
+    r = window["r"].iloc[1:].dropna()
+    if len(r) < int(days_back / 365 * 200):
         return None
     mean_daily = r.mean()
     std_daily = r.std(ddof=1)
@@ -95,6 +120,14 @@ def _period_sharpe(r: pd.Series, days: int, rf: float) -> Optional[float]:
     ann_return = (1 + mean_daily) ** TRADING_DAYS - 1
     ann_vol = std_daily * np.sqrt(TRADING_DAYS)
     return float((ann_return - rf) / ann_vol)
+
+
+def _period_mdd(df: pd.DataFrame, days_back: int) -> Optional[float]:
+    """Max drawdown over the trailing `days_back` window, on accumulated NAV."""
+    window = _window_by_date(df, days_back)
+    if window is None:
+        return None
+    return _max_drawdown(window["acc_nav"])
 
 
 # ── Fund list ────────────────────────────────────────────────────────────────
@@ -194,11 +227,14 @@ def _save_nav_cache(code: str, df: pd.DataFrame):
 def fetch_nav(code: str) -> Optional[pd.DataFrame]:
     """Return ~1-year NAV history for a single fund.
 
-    Uses ak.fund_open_fund_info_em(symbol, indicator='单位净值走势').
-    Columns returned: 净值日期, 单位净值, 日增长率
+    Pulls both 单位净值走势 (unit NAV + daily growth) and 累计净值走势 (accumulated
+    NAV). Drawdown is later computed on the accumulated NAV so that dividend
+    distributions — which drop the *unit* NAV on the ex-date — don't register as
+    spurious drawdowns.
+    Columns: date, nav, daily_ret_pct, acc_nav
     """
     cached = _load_nav_cache(code)
-    if cached is not None:
+    if cached is not None and "acc_nav" in cached.columns:
         return cached
 
     try:
@@ -212,11 +248,26 @@ def fetch_nav(code: str) -> Optional[pd.DataFrame]:
             "日增长率": "daily_ret_pct",
         })
         df["date"] = pd.to_datetime(df["date"])
+
+        # Accumulated (dividend-reinvested) NAV for drawdown; fall back to unit
+        # NAV if the accumulated series can't be fetched or has gaps.
+        try:
+            acc = ak.fund_open_fund_info_em(symbol=code, indicator="累计净值走势")
+            acc = acc.rename(columns={"净值日期": "date", "累计净值": "acc_nav"})
+            acc["date"] = pd.to_datetime(acc["date"])
+            df = df.merge(acc[["date", "acc_nav"]], on="date", how="left")
+        except Exception:
+            df["acc_nav"] = df["nav"]
+        df["acc_nav"] = pd.to_numeric(df["acc_nav"], errors="coerce").fillna(
+            pd.to_numeric(df["nav"], errors="coerce")
+        )
+
         df = df.sort_values("date")
 
-        # Filter to last 365 + buffer days
-        cutoff = datetime.now() - timedelta(days=380)
-        df = df[df["date"] >= cutoff].copy()
+        # Filter to last 365 + buffer days; the buffer guarantees a NAV old
+        # enough to anchor the trailing-1-year window even across holiday gaps.
+        cutoff = datetime.now() - timedelta(days=400)
+        df = df[df["date"] >= cutoff].copy().reset_index(drop=True)
 
         if len(df) < 20:
             return None
@@ -287,22 +338,26 @@ def compute_sharpe_for_fund(code: str, rf: float = RISK_FREE_RATE) -> Optional[d
         return None
 
     df = nav_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
     # daily_ret_pct is percentage; convert to decimal
     if "daily_ret_pct" in df.columns:
         df["r"] = pd.to_numeric(df["daily_ret_pct"], errors="coerce") / 100.0
-    elif "nav" in df.columns:
-        df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
-        df["r"] = df["nav"].pct_change()
     else:
+        df["r"] = df["nav"].pct_change()
+    if "acc_nav" in df.columns:
+        df["acc_nav"] = pd.to_numeric(df["acc_nav"], errors="coerce").fillna(df["nav"])
+    else:
+        df["acc_nav"] = df["nav"]
+    df = df.sort_values("date").reset_index(drop=True)
+
+    returns = df["r"].dropna()
+    if len(returns) < 20:
         return None
 
-    df = df.dropna(subset=["r"])
-    if len(df) < 20:
-        return None
-
-    n = len(df)
-    mean_daily = df["r"].mean()
-    std_daily = df["r"].std(ddof=1)
+    n = len(returns)
+    mean_daily = returns.mean()
+    std_daily = returns.std(ddof=1)
 
     if std_daily == 0 or np.isnan(std_daily):
         return None
@@ -311,20 +366,12 @@ def compute_sharpe_for_fund(code: str, rf: float = RISK_FREE_RATE) -> Optional[d
     ann_vol = std_daily * np.sqrt(TRADING_DAYS)
     sharpe = (ann_return - rf) / ann_vol
 
-    # Per-period Sharpe (only longer windows; short ones are too noisy).
-    psharpe = {key: _period_sharpe(df["r"], days, rf) for key, days in SHARPE_WINDOWS.items()}
-
-    # Per-period max drawdown from the (ascending) NAV history. Only compute a
-    # window when the fund actually has enough history to (mostly) cover it,
-    # so e.g. a 1-month-old fund gets no "1-year" drawdown rather than a
-    # misleadingly small one.
-    nav_series = pd.to_numeric(nav_df["nav"], errors="coerce").dropna() \
-        if "nav" in nav_df.columns else None
-    mdd = {}
-    if nav_series is not None:
-        n_nav = len(nav_series)
-        for key, days in DRAWDOWN_WINDOWS.items():
-            mdd[key] = _max_drawdown(nav_series.tail(days)) if n_nav >= days * 0.8 else None
+    # Per-period Sharpe and max drawdown over trailing calendar-day windows,
+    # date-aligned with EastMoney's 近X 收益率. A fund younger than a window
+    # gets None for it (no anchor) rather than a misleadingly short reading.
+    # Drawdown runs on accumulated NAV so dividends aren't mistaken for drops.
+    psharpe = {key: _period_sharpe(df, days, rf) for key, days in SHARPE_DAYS.items()}
+    mdd = {key: _period_mdd(df, days) for key, days in DRAWDOWN_DAYS.items()}
 
     _save_sharpe(code, ann_return, ann_vol, sharpe, n, mdd, psharpe)
     return {
