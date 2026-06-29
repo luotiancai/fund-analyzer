@@ -28,7 +28,7 @@ with st.sidebar:
     ) / 100
 
     st.markdown("---")
-    force_refresh = st.button("🔄 强制刷新基金列表")
+    clear_cache_btn = st.button("🧹 清空所有缓存并重算")
     calc_btn = st.button("⚡ 计算夏普比率与回撤", type="primary")
 
     st.markdown("---")
@@ -37,11 +37,20 @@ with st.sidebar:
 
 # ── Load fund list ────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner="正在加载基金列表…")
-def load_fund_list(refresh: bool = False):
-    return fetcher.fetch_fund_list(force_refresh=refresh)
+def load_fund_list():
+    return fetcher.fetch_fund_list(force_refresh=False)
+
+# Clear-cache button: wipe the in-memory list memo, the SQLite list/NAV/Sharpe
+# tables, and any Sharpe results held in this session, then reload fresh. The
+# list re-fetches immediately below; Sharpe/回撤 recompute on the next ⚡ run.
+if clear_cache_btn:
+    fetcher.clear_all_caches()
+    load_fund_list.clear()
+    st.session_state.sharpe_results = {}
+    st.success("已清空所有缓存,基金列表已重新加载。请点击「⚡ 计算夏普比率与回撤」按新口径重算。")
 
 with st.spinner("加载基金列表中…"):
-    fund_df = load_fund_list(refresh=force_refresh)
+    fund_df = load_fund_list()
 
 if fund_df is None or fund_df.empty:
     st.error("无法获取基金列表，请检查网络连接。")

@@ -61,6 +61,21 @@ def init_db():
     conn.close()
 
 
+def clear_all_caches():
+    """Wipe every cache table: fund list, NAV history, computed Sharpe/drawdown.
+
+    Used by the sidebar "清空所有缓存" button so a code/口径 change can be picked
+    up cleanly — afterwards the list re-fetches and Sharpe/drawdown recompute on
+    the next ⚡ run rather than being served stale from cache.
+    """
+    conn = _conn()
+    conn.execute("DELETE FROM fund_list")
+    conn.execute("DELETE FROM fund_nav")
+    conn.execute("DELETE FROM fund_sharpe")
+    conn.commit()
+    conn.close()
+
+
 # Look-back windows in CALENDAR days, matching how EastMoney defines 近1月/3月/
 # 6月/1年 (date-to-date from the latest NAV date), so the computed drawdown and
 # Sharpe cover the same period as the 近X 收益率 columns shown alongside them.
