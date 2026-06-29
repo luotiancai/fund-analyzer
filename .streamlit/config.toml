@@ -1,0 +1,7 @@
+# 隐藏右上角的 Deploy 按钮和「⋮」开发者菜单，界面更清爽。
+# 改回开发者工具：把 toolbarMode 改为 "auto" 或 "developer"。
+[client]
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false
