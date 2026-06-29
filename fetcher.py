@@ -84,8 +84,6 @@ DRAWDOWN_DAYS = {"mdd_1m": 30, "mdd_3m": 91, "mdd_6m": 182, "mdd_1y": 365}
 # Sharpe is only computed for longer windows (short windows are too noisy).
 SHARPE_DAYS = {"sharpe_6m": 182, "sharpe_1y": 365}
 
-TRADING_DAYS = 252
-
 
 def _window_by_date(df: pd.DataFrame, days_back: int) -> Optional[pd.DataFrame]:
     """Rows from the anchor through the latest NAV, for a trailing date window.
@@ -116,6 +114,33 @@ def _max_drawdown(nav: pd.Series) -> Optional[float]:
     return float(-dd.min())
 
 
+def _annualized(r: pd.Series, span_days: int, rf: float):
+    """(annual_return, annual_vol, sharpe) from a daily-return series.
+
+    Everything is derived from the window itself — no fixed trading-day constant
+    — so it adapts to A-shares, QDII/US funds, HK, etc. automatically:
+      • return: the actual compounded return over the window, annualized by its
+        real calendar span (a full year keeps its real return, no inflation);
+      • volatility: daily σ × √(observations per year), where observations-per-
+        year is *measured* from how many NAV points actually fell in the window
+        rather than assumed to be 252.
+    None if degenerate.
+    """
+    r = r.dropna()
+    n = len(r)
+    if n < 2:
+        return None
+    std_daily = r.std(ddof=1)
+    if std_daily == 0 or np.isnan(std_daily):
+        return None
+    span = max(span_days, 1)
+    total_growth = float((1.0 + r).prod())          # e.g. 4.38 = +338%
+    ann_return = total_growth ** (365.0 / span) - 1.0
+    obs_per_year = n * 365.0 / span                  # measured, not the 252 convention
+    ann_vol = std_daily * np.sqrt(obs_per_year)
+    return ann_return, ann_vol, (ann_return - rf) / ann_vol
+
+
 def _period_sharpe(df: pd.DataFrame, days_back: int, rf: float) -> Optional[float]:
     """Annualized Sharpe over the trailing `days_back` calendar-day window.
 
@@ -128,13 +153,9 @@ def _period_sharpe(df: pd.DataFrame, days_back: int, rf: float) -> Optional[floa
     r = window["r"].iloc[1:].dropna()
     if len(r) < int(days_back / 365 * 200):
         return None
-    mean_daily = r.mean()
-    std_daily = r.std(ddof=1)
-    if std_daily == 0 or np.isnan(std_daily):
-        return None
-    ann_return = (1 + mean_daily) ** TRADING_DAYS - 1
-    ann_vol = std_daily * np.sqrt(TRADING_DAYS)
-    return float((ann_return - rf) / ann_vol)
+    span = (window["date"].iloc[-1] - window["date"].iloc[0]).days
+    res = _annualized(r, span, rf)
+    return float(res[2]) if res else None
 
 
 def _period_mdd(df: pd.DataFrame, days_back: int) -> Optional[float]:
@@ -354,15 +375,11 @@ def _metrics_from_nav(nav_df: pd.DataFrame, rf: float) -> Optional[dict]:
         return None
 
     n = len(returns)
-    mean_daily = returns.mean()
-    std_daily = returns.std(ddof=1)
-
-    if std_daily == 0 or np.isnan(std_daily):
+    span = (df["date"].iloc[-1] - df["date"].iloc[0]).days
+    res = _annualized(returns, span, rf)
+    if res is None:
         return None
-
-    ann_return = (1 + mean_daily) ** TRADING_DAYS - 1
-    ann_vol = std_daily * np.sqrt(TRADING_DAYS)
-    sharpe = (ann_return - rf) / ann_vol
+    ann_return, ann_vol, sharpe = res
 
     # Per-period Sharpe and max drawdown over trailing calendar-day windows,
     # date-aligned with EastMoney's 近X 收益率. A fund younger than a window
