@@ -25,11 +25,13 @@ with st.sidebar:
     rf_rate = st.number_input(
         "无风险利率（年化 %）",
         min_value=0.0, max_value=10.0, value=1.13, step=0.01,
+        help="夏普比率分母用的无风险利率。改动后点「♻️ 仅重算」即可生效（不联网，约十几秒）。",
     ) / 100
 
     st.markdown("---")
+    update_btn = st.button("🔄 更新数据（拉当日净值+重算）", type="primary")
+    recompute_btn = st.button("♻️ 仅重算（改无风险利率后用）")
     clear_cache_btn = st.button("🧹 清空所有缓存并重算")
-    calc_btn = st.button("⚡ 计算夏普比率与回撤", type="primary")
 
     st.markdown("---")
     st.caption("数据来源：天天基金（AKShare）")
@@ -42,12 +44,47 @@ def load_fund_list():
 
 # Clear-cache button: wipe the in-memory list memo, the SQLite list/NAV/Sharpe
 # tables, and any Sharpe results held in this session, then reload fresh. The
-# list re-fetches immediately below; Sharpe/回撤 recompute on the next ⚡ run.
+# list re-fetches immediately below; metrics are rebuilt by 「🔄 更新数据」.
 if clear_cache_btn:
     fetcher.clear_all_caches()
     load_fund_list.clear()
     st.session_state.sharpe_results = {}
-    st.success("已清空所有缓存,基金列表已重新加载。请点击「⚡ 计算夏普比率与回撤」按新口径重算。")
+    st.success("已清空所有缓存,基金列表已重新加载。请点击「🔄 更新数据（增量+重算）」重新生成指标。")
+
+# Update button: run the same daily pipeline as update_daily.py in-process,
+# streaming progress into a bar. Refreshes the list cache and reloads the
+# precomputed metrics so the table reflects the new data without a manual rerun.
+if update_btn:
+    _bar = st.progress(0.0, text="开始更新…")
+
+    def _on_progress(phase: str, done: int, total: int):
+        frac = (done / total) if total else 1.0
+        _bar.progress(frac, text=f"{phase}… {done}/{total}")
+
+    with st.spinner("正在更新数据（增量下载当日净值 + 全量重算）…"):
+        summary = fetcher.run_pipeline(progress=_on_progress, rf=rf_rate)
+    load_fund_list.clear()
+    st.session_state.sharpe_results = fetcher.load_all_precomputed()
+    _bar.progress(1.0, text="完成")
+    st.success(
+        f"更新完成 · 基金 {summary['funds']:,} · 回填 {summary['backfilled']} · "
+        f"追加 {summary['appended']:,} · 重算 {summary['recomputed']:,}"
+    )
+
+# Recompute-only: rf only feeds the Sharpe formula, so changing it needs no new
+# data — just recompute from stored NAV (no network, ~15s) instead of the full
+# pipeline. This is the right button after tweaking the risk-free rate.
+if recompute_btn:
+    _bar = st.progress(0.0, text="重算中…")
+    saved = fetcher.recompute_all(
+        rf=rf_rate,
+        progress_callback=lambda d, t: _bar.progress(
+            (d / t) if t else 1.0, text=f"重算指标… {d}/{t}"
+        ),
+    )
+    st.session_state.sharpe_results = fetcher.load_all_precomputed()
+    _bar.progress(1.0, text="完成")
+    st.success(f"已按无风险利率 {rf_rate*100:.2f}% 重算 {saved:,} 只基金（未联网）")
 
 with st.spinner("加载基金列表中…"):
     fund_df = load_fund_list()
@@ -101,9 +138,8 @@ if ret_col in filtered.columns:
     filtered = filtered[filtered[ret_col] >= min_ret]
 
 # ── Session state for Sharpe results ─────────────────────────────────────────
-# Auto-load whatever the daily batch (update_daily.py) precomputed, so the table
-# shows Sharpe/drawdown immediately without anyone clicking ⚡. The ⚡ button
-# stays as an on-demand fallback for funds the batch hasn't covered yet.
+# Load whatever the pipeline precomputed (daily batch or the 🔄 button), so the
+# table shows Sharpe/drawdown immediately on open — no per-session computation.
 if "sharpe_results" not in st.session_state:
     st.session_state.sharpe_results = fetcher.load_all_precomputed()
 
@@ -113,42 +149,10 @@ if _last_update:
     _fresh = "🟢" if _age_h < 30 else "🟠"
     st.caption(
         f"{_fresh} 指标数据更新于 {time.strftime('%Y-%m-%d %H:%M', time.localtime(_last_update))}"
-        f"（{_age_h:.0f} 小时前，由每日跑批 update_daily.py 生成）"
+        f"（{_age_h:.0f} 小时前）"
     )
 else:
-    st.caption("⚠️ 还没有预算指标。请先运行 `python3 update_daily.py` 跑批，或点击下方「⚡ 计算」。")
-
-# ── Batch Sharpe calculation ──────────────────────────────────────────────────
-if calc_btn:
-    codes = filtered["code"].dropna().unique().tolist() if "code" in filtered.columns else []
-    total = len(codes)
-
-    if total == 0:
-        st.warning("没有可计算的基金。")
-    else:
-        st.info(
-            f"将对 **{total:,}** 只基金计算夏普比率与各区间最大回撤，首次运行需较长时间，结果会实时缓存。"
-        )
-        progress_bar = st.progress(0, text="准备中…")
-        status_text = st.empty()
-        start_t = time.time()
-
-        def on_progress(done: int, total_n: int):
-            pct = done / total_n
-            elapsed = time.time() - start_t
-            eta = (elapsed / done * (total_n - done)) if done > 0 else 0
-            progress_bar.progress(pct, text=f"{done}/{total_n}  · 已用 {elapsed:.0f}s  · 预计剩余 {eta:.0f}s")
-            status_text.caption(f"缓存命中 + 已计算：{done} / {total_n}")
-
-        results = fetcher.batch_compute_sharpe(
-            codes,
-            rf=rf_rate,
-            progress_callback=on_progress,
-        )
-        st.session_state.sharpe_results = results
-        progress_bar.progress(1.0, text=f"完成！共 {len(results):,} 只基金有效。")
-        status_text.empty()
-        st.success(f"计算完成，有效夏普比率：{len(results):,} 只，耗时 {time.time()-start_t:.1f}s")
+    st.caption("⚠️ 还没有指标数据。请点击「🔄 更新数据（增量+重算）」，或运行 `python3 update_daily.py`。")
 
 # ── Merge Sharpe/drawdown into display table ─────────────────────────────────
 display = filtered.copy()
@@ -158,15 +162,15 @@ if st.session_state.sharpe_results:
     ).reset_index().rename(columns={"index": "code"})
     display = display.merge(sharpe_df, on="code", how="left")
 
-# Drawdown filter (only meaningful once drawdowns have been computed; funds
-# without a computed drawdown are kept so they aren't hidden before calc).
+# Drawdown filter. Funds without a computed drawdown (e.g. younger than the
+# window) are kept rather than hidden.
 if max_dd < 100 and mdd_col in display.columns:
     dd_pct = pd.to_numeric(display[mdd_col], errors="coerce") * 100
     display = display[dd_pct.isna() | (dd_pct <= max_dd)]
 
 st.caption(f"共 {len(display):,} 只基金（总量 {len(fund_df):,}）")
 if max_dd < 100 and mdd_col not in display.columns:
-    st.caption("⚠️ 回撤率筛选需先点击「⚡ 计算夏普比率与回撤」生成回撤数据。")
+    st.caption("⚠️ 暂无回撤数据。请点击「🔄 更新数据（增量+重算）」生成。")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_table, tab_detail = st.tabs(["📋 基金列表", "🔍 基金详情"])

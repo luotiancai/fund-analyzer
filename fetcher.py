@@ -147,10 +147,12 @@ def _period_mdd(df: pd.DataFrame, days_back: int) -> Optional[float]:
 
 # ── Fund list ────────────────────────────────────────────────────────────────
 
+# The fund list is a single cached snapshot (always read/written whole), so it
+# lives in one fixed row (id=1) and is upserted in place.
 def _load_fund_list_cache() -> Optional[pd.DataFrame]:
     conn = _conn()
     row = conn.execute(
-        "SELECT data, saved_at FROM fund_list ORDER BY id DESC LIMIT 1"
+        "SELECT data, saved_at FROM fund_list WHERE id = 1"
     ).fetchone()
     conn.close()
     if row and (time.time() - row["saved_at"]) < FUND_LIST_TTL:
@@ -160,9 +162,8 @@ def _load_fund_list_cache() -> Optional[pd.DataFrame]:
 
 def _save_fund_list_cache(df: pd.DataFrame):
     conn = _conn()
-    conn.execute("DELETE FROM fund_list")
     conn.execute(
-        "INSERT INTO fund_list (data, saved_at) VALUES (?, ?)",
+        "INSERT OR REPLACE INTO fund_list (id, data, saved_at) VALUES (1, ?, ?)",
         (df.to_json(orient="records", force_ascii=False), time.time()),
     )
     conn.commit()
@@ -314,38 +315,6 @@ def fetch_nav(code: str) -> Optional[pd.DataFrame]:
 
 # ── Sharpe calculation ────────────────────────────────────────────────────────
 
-def _load_sharpe_cache(codes: list) -> dict:
-    if not codes:
-        return {}
-    conn = _conn()
-    placeholders = ",".join("?" * len(codes))
-    rows = conn.execute(
-        f"SELECT code, ann_return, volatility, sharpe, data_points, "
-        f"mdd_1m, mdd_3m, mdd_6m, mdd_1y, sharpe_6m, sharpe_1y, saved_at "
-        f"FROM fund_sharpe WHERE code IN ({placeholders})",
-        codes,
-    ).fetchall()
-    conn.close()
-    result = {}
-    for r in rows:
-        # Skip stale rows, and rows predating the per-period columns so they
-        # get recomputed (sharpe_1y is populated once those exist).
-        if (time.time() - r["saved_at"]) < NAV_TTL and r["sharpe_1y"] is not None:
-            result[r["code"]] = {
-                "ann_return": r["ann_return"],
-                "volatility": r["volatility"],
-                "sharpe": r["sharpe"],
-                "data_points": r["data_points"],
-                "mdd_1m": r["mdd_1m"],
-                "mdd_3m": r["mdd_3m"],
-                "mdd_6m": r["mdd_6m"],
-                "mdd_1y": r["mdd_1y"],
-                "sharpe_6m": r["sharpe_6m"],
-                "sharpe_1y": r["sharpe_1y"],
-            }
-    return result
-
-
 def _save_sharpe(code: str, ann_return: float, volatility: float, sharpe: float,
                  n: int, mdd: dict, psharpe: dict):
     conn = _conn()
@@ -425,42 +394,6 @@ def compute_sharpe_for_fund(code: str, rf: float = RISK_FREE_RATE) -> Optional[d
     if m is not None:
         _save_metrics(code, m)
     return m
-
-
-def batch_compute_sharpe(
-    codes: list,
-    rf: float = RISK_FREE_RATE,
-    progress_callback: Optional[Callable] = None,
-    workers: int = MAX_WORKERS,
-) -> dict:
-    """Compute Sharpe for a list of fund codes using cache + thread pool."""
-    cached = _load_sharpe_cache(codes)
-    to_fetch = [c for c in codes if c not in cached]
-    results = dict(cached)
-
-    total = len(codes)
-    done_count = len(cached)
-
-    if not to_fetch:
-        if progress_callback:
-            progress_callback(total, total)
-        return results
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(compute_sharpe_for_fund, c, rf): c for c in to_fetch}
-        for future in as_completed(futures):
-            code = futures[future]
-            try:
-                res = future.result()
-                if res:
-                    results[code] = res
-            except Exception as e:
-                logger.debug("Sharpe compute error %s: %s", code, e)
-            done_count += 1
-            if progress_callback:
-                progress_callback(done_count, total)
-
-    return results
 
 
 # ── Daily-batch pipeline ──────────────────────────────────────────────────────
@@ -598,3 +531,64 @@ def last_update_time() -> Optional[float]:
     row = conn.execute("SELECT MAX(saved_at) AS t FROM fund_sharpe").fetchone()
     conn.close()
     return row["t"] if row and row["t"] else None
+
+
+def _backfill_codes(codes: list, workers: int = MAX_WORKERS,
+                    progress: Optional[Callable] = None) -> int:
+    """Download full ~1y NAV history for `codes` (threaded). Returns success count."""
+    total, done, ok = len(codes), 0, 0
+    if not codes:
+        return 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(fetch_nav, c): c for c in codes}
+        for fut in as_completed(futures):
+            done += 1
+            try:
+                if fut.result() is not None:
+                    ok += 1
+            except Exception:
+                pass
+            if progress and (done % 50 == 0 or done == total):
+                progress(done, total)
+    return ok
+
+
+def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
+                 rf: float = RISK_FREE_RATE, workers: int = MAX_WORKERS) -> dict:
+    """Full daily pipeline shared by the CLI script and the in-app button:
+    ① refresh fund list → ② backfill funds missing history → ③ append today's
+    NAV point → ④ recompute Sharpe/drawdown for all.
+
+    `progress(phase, done, total)` is invoked throughout for a UI bar / logging.
+    Returns a summary dict.
+    """
+    def _p(phase, done, total):
+        if progress:
+            progress(phase, done, total)
+
+    _p("拉取基金列表", 0, 1)
+    list_df = fetch_fund_list(force_refresh=True)
+    all_codes = list_df["code"].dropna().unique().tolist()
+    _p("拉取基金列表", 1, 1)
+
+    backfilled = 0
+    if do_backfill:
+        todo = [c for c in all_codes if c not in list_nav_codes()]
+        backfilled = _backfill_codes(
+            todo, workers, lambda d, t: _p("回填缺失历史", d, t)
+        )
+
+    _p("追加当日净值", 0, 1)
+    res = append_latest_nav(list_df)
+    _p("追加当日净值", 1, 1)
+    if res["gapped"]:
+        _backfill_codes(res["gapped"], workers, lambda d, t: _p("补净值缺口", d, t))
+
+    saved = recompute_all(rf=rf, progress_callback=lambda d, t: _p("重算指标", d, t))
+
+    return {
+        "funds": len(all_codes),
+        "backfilled": backfilled,
+        "appended": res["updated"],
+        "recomputed": saved,
+    }

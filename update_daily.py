@@ -2,14 +2,14 @@
 """Daily batch: keep NAV history fresh and recompute Sharpe/drawdown for all funds.
 
 The Streamlit app only *reads* the precomputed metrics, so all the slow network
-work lives here and runs out of band.
+work lives here and runs out of band. The same pipeline is also exposed as the
+in-app「🔄 更新数据」button via fetcher.run_pipeline().
 
-Steps
+Pipeline (fetcher.run_pipeline):
   ① 拉取基金列表(1 次批量调用,带回全部基金的最新净值点)
-  ② 历史回填:对还没有净值历史的基金,逐只下载近一年序列(慢,一次性)
+  ② 历史回填:对还没有净值历史的基金逐只下载近一年序列(慢,基本一次性)
   ③ 增量追加:把当日最新净值点追加到已有历史的基金(快,无逐只请求)
-       缺口过大的基金转入全量重拉
-  ④ 重算:用存好的净值,对全部基金重算夏普 + 最大回撤(纯 CPU,几秒)
+  ④ 重算:用存好的净值对全部基金重算夏普 + 最大回撤(纯 CPU,几秒)
 
 用法
   手动:   python3 update_daily.py
@@ -20,7 +20,6 @@ Steps
 import argparse
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import fetcher
 
@@ -31,22 +30,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("update_daily")
 
+# Throttle per-phase logging so a 20k-fund phase doesn't spam one line per 50.
+_last_log = {}
 
-def _backfill(codes, workers=fetcher.MAX_WORKERS):
-    """Download full ~1y NAV history for `codes` (threaded)."""
-    total, done, ok = len(codes), 0, 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(fetcher.fetch_nav, c): c for c in codes}
-        for fut in as_completed(futures):
-            done += 1
-            try:
-                if fut.result() is not None:
-                    ok += 1
-            except Exception:
-                pass
-            if done % 200 == 0 or done == total:
-                log.info("   回填 %d/%d(成功 %d)", done, total, ok)
-    return ok
+
+def _log_progress(phase, done, total):
+    if done == total or time.time() - _last_log.get(phase, 0) > 2:
+        log.info("   %s %d/%d", phase, done, total)
+        _last_log[phase] = time.time()
 
 
 def main():
@@ -58,30 +49,15 @@ def main():
     t0 = time.time()
     fetcher.init_db()
 
-    if not args.recompute_only:
-        log.info("① 拉取基金列表(批量)…")
-        list_df = fetcher.fetch_fund_list(force_refresh=True)
-        all_codes = list_df["code"].dropna().unique().tolist()
-        log.info("   共 %d 只基金", len(all_codes))
-
-        have = fetcher.list_nav_codes()
-        to_backfill = [c for c in all_codes if c not in have]
-        log.info("② 历史回填:%d 只缺历史", len(to_backfill))
-        if to_backfill:
-            _backfill(to_backfill)
-
-        log.info("③ 增量追加当日净值…")
-        res = fetcher.append_latest_nav(list_df)
-        log.info("   追加 %d,跳过 %d,缺口需重拉 %d",
-                 res["updated"], res["skipped"], len(res["gapped"]))
-        if res["gapped"]:
-            _backfill(res["gapped"])
-
-    log.info("④ 重算夏普 + 回撤…")
-    saved = fetcher.recompute_all(
-        progress_callback=lambda d, t: log.info("   重算 %d/%d", d, t)
-    )
-    log.info("   写入 %d 只指标", saved)
+    if args.recompute_only:
+        log.info("仅重算:用已存净值重算夏普 + 回撤…")
+        saved = fetcher.recompute_all(progress_callback=lambda d, t: _log_progress("重算", d, t))
+        log.info("   写入 %d 只指标", saved)
+    else:
+        summary = fetcher.run_pipeline(progress=_log_progress)
+        log.info("基金 %d · 回填 %d · 追加 %d · 重算 %d",
+                 summary["funds"], summary["backfilled"],
+                 summary["appended"], summary["recomputed"])
 
     log.info("✅ 完成,总耗时 %.1f 分钟", (time.time() - t0) / 60)
 
