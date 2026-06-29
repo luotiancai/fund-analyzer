@@ -22,15 +22,13 @@ fetcher.init_db()
 with st.sidebar:
     st.title("⚙️ 控制面板")
 
-    rf_rate = st.number_input(
-        "无风险利率（年化 %）",
-        min_value=0.0, max_value=10.0, value=1.13, step=0.01,
-        help="夏普比率分母用的无风险利率。改动后点「♻️ 仅重算」即可生效（不联网，约十几秒）。",
-    ) / 100
+    rf_rate = fetcher.get_risk_free_rate()
+    st.metric("无风险利率", f"{rf_rate*100:.2f}%")
+    st.caption("1年期国债收益率，自动取、每月刷新")
 
     st.markdown("---")
     update_btn = st.button("🔄 更新数据（拉当日净值+重算）", type="primary")
-    recompute_btn = st.button("♻️ 仅重算（改无风险利率后用）")
+    recompute_btn = st.button("♻️ 仅重算（不重新下载）")
     clear_cache_btn = st.button("🧹 清空所有缓存并重算")
 
     st.markdown("---")
@@ -68,7 +66,8 @@ if update_btn:
     _bar.progress(1.0, text="完成")
     st.success(
         f"更新完成 · 基金 {summary['funds']:,} · 回填 {summary['backfilled']} · "
-        f"追加 {summary['appended']:,} · 重算 {summary['recomputed']:,}"
+        f"追加 {summary['appended']:,} · 重算 {summary['recomputed']:,} · "
+        f"无风险利率 {summary['rf']*100:.2f}%"
     )
 
 # Recompute-only: rf only feeds the Sharpe formula, so changing it needs no new

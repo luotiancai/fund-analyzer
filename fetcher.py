@@ -18,7 +18,8 @@ CACHE_DB = "fund_cache.db"
 FUND_LIST_TTL = 3600    # 1 hour
 NAV_TTL = 86400         # 24 hours
 MAX_WORKERS = 8
-RISK_FREE_RATE = 0.0113  # 1-year China gov bond yield as of 2026-06
+RISK_FREE_RATE = 0.0113  # fallback 1-year China gov bond yield (see get_risk_free_rate)
+RF_TTL = 30 * 86400      # auto-refresh the risk-free rate ~monthly
 
 
 # ── DB helpers ───────────────────────────────────────────────────────────────
@@ -50,6 +51,11 @@ def init_db():
             data_points INTEGER,
             saved_at    REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key      TEXT PRIMARY KEY,
+            value    REAL,
+            saved_at REAL NOT NULL
+        );
     """)
     # Add per-period max-drawdown and Sharpe columns (migration for existing DBs).
     for col in ("mdd_1m", "mdd_3m", "mdd_6m", "mdd_1y", "sharpe_6m", "sharpe_1y"):
@@ -59,6 +65,55 @@ def init_db():
             pass  # column already exists
     conn.commit()
     conn.close()
+
+
+# ── Risk-free rate ───────────────────────────────────────────────────────────
+# The 1-year China government bond yield, fetched automatically and cached for a
+# month, so nobody has to keep a number up to date by hand.
+
+def _get_meta(key: str):
+    conn = _conn()
+    row = conn.execute("SELECT value, saved_at FROM app_meta WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return (row["value"], row["saved_at"]) if row else (None, None)
+
+
+def _set_meta(key: str, value: float):
+    conn = _conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO app_meta (key, value, saved_at) VALUES (?, ?, ?)",
+        (key, value, time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _fetch_treasury_1y() -> Optional[float]:
+    """Latest 1-year China government bond yield as a decimal (e.g. 0.0113)."""
+    end = datetime.now().strftime("%Y%m%d")
+    start = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+    df = ak.bond_china_yield(start_date=start, end_date=end)
+    df = df[df["曲线名称"] == "中债国债收益率曲线"].sort_values("日期")
+    val = pd.to_numeric(df["1年"], errors="coerce").dropna()
+    return float(val.iloc[-1]) / 100.0 if not val.empty else None
+
+
+def get_risk_free_rate(force_refresh: bool = False) -> float:
+    """1-year China treasury yield as the risk-free rate, cached ~monthly.
+
+    Falls back to the last cached value, then RISK_FREE_RATE, if the fetch fails.
+    """
+    value, saved_at = _get_meta("rf_rate")
+    if not force_refresh and value is not None and (time.time() - saved_at) < RF_TTL:
+        return value
+    try:
+        rf = _fetch_treasury_1y()
+        if rf is not None and 0 < rf < 0.2:   # sanity bound
+            _set_meta("rf_rate", rf)
+            return rf
+    except Exception as e:
+        logger.debug("risk-free rate fetch failed: %s", e)
+    return value if value is not None else RISK_FREE_RATE
 
 
 def clear_all_caches():
@@ -490,13 +545,16 @@ def append_latest_nav(list_df: pd.DataFrame) -> dict:
     return {"updated": updated, "skipped": skipped, "gapped": gapped}
 
 
-def recompute_all(rf: float = RISK_FREE_RATE,
+def recompute_all(rf: Optional[float] = None,
                   progress_callback: Optional[Callable] = None) -> int:
     """Recompute Sharpe + drawdown for every stored fund from its stored NAV.
 
-    No network — pure CPU over cached NAV. All reads/writes share one connection
-    and a single commit, so 20k funds finish in seconds, not minutes.
+    No network for NAV — pure CPU over cached NAV. `rf` defaults to the
+    auto-fetched (monthly-cached) risk-free rate. All reads/writes share one
+    connection and a single commit, so 20k funds finish in seconds.
     """
+    if rf is None:
+        rf = get_risk_free_rate()
     conn = _conn()
     codes = [r["code"] for r in conn.execute("SELECT code FROM fund_nav").fetchall()]
     total, done, saved = len(codes), 0, 0
@@ -571,14 +629,18 @@ def _backfill_codes(codes: list, workers: int = MAX_WORKERS,
 
 
 def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
-                 rf: float = RISK_FREE_RATE, workers: int = MAX_WORKERS) -> dict:
+                 rf: Optional[float] = None, workers: int = MAX_WORKERS) -> dict:
     """Full daily pipeline shared by the CLI script and the in-app button:
     ① refresh fund list → ② backfill funds missing history → ③ append today's
     NAV point → ④ recompute Sharpe/drawdown for all.
 
+    `rf` defaults to the auto-fetched (monthly-cached) risk-free rate.
     `progress(phase, done, total)` is invoked throughout for a UI bar / logging.
     Returns a summary dict.
     """
+    if rf is None:
+        rf = get_risk_free_rate()
+
     def _p(phase, done, total):
         if progress:
             progress(phase, done, total)
@@ -608,4 +670,5 @@ def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
         "backfilled": backfilled,
         "appended": res["updated"],
         "recomputed": saved,
+        "rf": rf,
     }
