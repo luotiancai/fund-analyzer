@@ -101,8 +101,22 @@ if ret_col in filtered.columns:
     filtered = filtered[filtered[ret_col] >= min_ret]
 
 # ── Session state for Sharpe results ─────────────────────────────────────────
+# Auto-load whatever the daily batch (update_daily.py) precomputed, so the table
+# shows Sharpe/drawdown immediately without anyone clicking ⚡. The ⚡ button
+# stays as an on-demand fallback for funds the batch hasn't covered yet.
 if "sharpe_results" not in st.session_state:
-    st.session_state.sharpe_results = {}
+    st.session_state.sharpe_results = fetcher.load_all_precomputed()
+
+_last_update = fetcher.last_update_time()
+if _last_update:
+    _age_h = (time.time() - _last_update) / 3600
+    _fresh = "🟢" if _age_h < 30 else "🟠"
+    st.caption(
+        f"{_fresh} 指标数据更新于 {time.strftime('%Y-%m-%d %H:%M', time.localtime(_last_update))}"
+        f"（{_age_h:.0f} 小时前，由每日跑批 update_daily.py 生成）"
+    )
+else:
+    st.caption("⚠️ 还没有预算指标。请先运行 `python3 update_daily.py` 跑批，或点击下方「⚡ 计算」。")
 
 # ── Batch Sharpe calculation ──────────────────────────────────────────────────
 if calc_btn:

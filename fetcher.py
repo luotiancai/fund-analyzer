@@ -218,6 +218,22 @@ def fetch_fund_list(force_refresh: bool = False) -> pd.DataFrame:
 
 # ── NAV history ──────────────────────────────────────────────────────────────
 
+def _nav_from_json(blob: str) -> pd.DataFrame:
+    """Rebuild a NAV DataFrame from stored JSON, restoring the `date` column.
+
+    df.to_json serializes datetimes as epoch-millisecond ints, which
+    pd.to_datetime would otherwise misread as nanoseconds (everything → 1970).
+    Newer rows are stored ISO-formatted; handle both shapes.
+    """
+    df = pd.DataFrame(json.loads(blob))
+    if not df.empty and "date" in df.columns:
+        if pd.api.types.is_numeric_dtype(df["date"]):
+            df["date"] = pd.to_datetime(df["date"], unit="ms")
+        else:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    return df
+
+
 def _load_nav_cache(code: str) -> Optional[pd.DataFrame]:
     conn = _conn()
     row = conn.execute(
@@ -225,7 +241,7 @@ def _load_nav_cache(code: str) -> Optional[pd.DataFrame]:
     ).fetchone()
     conn.close()
     if row and (time.time() - row["saved_at"]) < NAV_TTL:
-        return pd.DataFrame(json.loads(row["data"]))
+        return _nav_from_json(row["data"])
     return None
 
 
@@ -233,7 +249,8 @@ def _save_nav_cache(code: str, df: pd.DataFrame):
     conn = _conn()
     conn.execute(
         "INSERT OR REPLACE INTO fund_nav (code, data, saved_at) VALUES (?, ?, ?)",
-        (code, df.to_json(orient="records", force_ascii=False), time.time()),
+        (code, df.to_json(orient="records", force_ascii=False, date_format="iso"),
+         time.time()),
     )
     conn.commit()
     conn.close()
@@ -346,12 +363,9 @@ def _save_sharpe(code: str, ann_return: float, volatility: float, sharpe: float,
     conn.close()
 
 
-def compute_sharpe_for_fund(code: str, rf: float = RISK_FREE_RATE) -> Optional[dict]:
-    """Fetch NAV, compute annualized return / volatility / Sharpe."""
-    nav_df = fetch_nav(code)
-    if nav_df is None:
-        return None
-
+def _metrics_from_nav(nav_df: pd.DataFrame, rf: float) -> Optional[dict]:
+    """Compute annualized return / volatility / Sharpe + per-period Sharpe and
+    max-drawdown from an already-fetched NAV DataFrame. Pure (no I/O)."""
     df = nav_df.copy()
     df["date"] = pd.to_datetime(df["date"])
     df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
@@ -388,11 +402,29 @@ def compute_sharpe_for_fund(code: str, rf: float = RISK_FREE_RATE) -> Optional[d
     psharpe = {key: _period_sharpe(df, days, rf) for key, days in SHARPE_DAYS.items()}
     mdd = {key: _period_mdd(df, days) for key, days in DRAWDOWN_DAYS.items()}
 
-    _save_sharpe(code, ann_return, ann_vol, sharpe, n, mdd, psharpe)
     return {
         "ann_return": ann_return, "volatility": ann_vol, "sharpe": sharpe,
         "data_points": n, **mdd, **psharpe,
     }
+
+
+def _save_metrics(code: str, m: dict):
+    _save_sharpe(
+        code, m["ann_return"], m["volatility"], m["sharpe"], m["data_points"],
+        {k: m[k] for k in ("mdd_1m", "mdd_3m", "mdd_6m", "mdd_1y")},
+        {k: m[k] for k in ("sharpe_6m", "sharpe_1y")},
+    )
+
+
+def compute_sharpe_for_fund(code: str, rf: float = RISK_FREE_RATE) -> Optional[dict]:
+    """Fetch NAV (network/cache), compute metrics, persist, and return them."""
+    nav_df = fetch_nav(code)
+    if nav_df is None:
+        return None
+    m = _metrics_from_nav(nav_df, rf)
+    if m is not None:
+        _save_metrics(code, m)
+    return m
 
 
 def batch_compute_sharpe(
@@ -429,3 +461,140 @@ def batch_compute_sharpe(
                 progress_callback(done_count, total)
 
     return results
+
+
+# ── Daily-batch pipeline ──────────────────────────────────────────────────────
+# Used by update_daily.py: backfill once, then each day append the latest NAV
+# point (from the bulk fund-list call) and recompute Sharpe/drawdown for all.
+
+NAV_HISTORY_DAYS = 400  # rolling window kept per fund (covers the 1y look-back)
+
+
+def list_nav_codes() -> set:
+    """Codes that already have a stored NAV history."""
+    conn = _conn()
+    rows = conn.execute("SELECT code FROM fund_nav").fetchall()
+    conn.close()
+    return {r["code"] for r in rows}
+
+
+def append_latest_nav(list_df: pd.DataFrame) -> dict:
+    """Append today's NAV point to every stored fund from the bulk fund list.
+
+    `list_df` is fetch_fund_list() output (columns: code, nav_date, nav, acc_nav,
+    daily_ret). Appends one row per fund when the list's date is newer than the
+    stored last date, trims to NAV_HISTORY_DAYS, and writes everything in one
+    transaction. Funds whose gap to the latest date exceeds a week are returned
+    in `gapped` for the caller to fully re-backfill (the bulk call only carries
+    the single latest point, so it can't fill multi-day gaps).
+    """
+    latest = list_df.dropna(subset=["code"]).drop_duplicates("code").set_index("code")
+    cutoff = datetime.now() - timedelta(days=NAV_HISTORY_DAYS)
+    now = time.time()
+
+    conn = _conn()
+    codes = [r["code"] for r in conn.execute("SELECT code FROM fund_nav").fetchall()]
+    updated, skipped, gapped = 0, 0, []
+    for code in codes:
+        if code not in latest.index:
+            skipped += 1
+            continue
+        row = latest.loc[code]
+        new_date = pd.to_datetime(row["nav_date"], errors="coerce")
+        nav = pd.to_numeric(row["nav"], errors="coerce")
+        if pd.isna(new_date) or pd.isna(nav):
+            skipped += 1
+            continue
+
+        cur = conn.execute("SELECT data FROM fund_nav WHERE code=?", (code,)).fetchone()
+        hist = _nav_from_json(cur["data"])
+        if hist.empty:
+            gapped.append(code)
+            continue
+        last_date = hist["date"].max()
+
+        if new_date <= last_date:
+            skipped += 1                         # already have this day
+            continue
+        if (new_date - last_date).days > 7:
+            gapped.append(code)                  # missed too many days; refetch
+            continue
+
+        acc = pd.to_numeric(row.get("acc_nav"), errors="coerce")
+        new_row = {
+            "date": new_date,
+            "nav": float(nav),
+            "daily_ret_pct": pd.to_numeric(row.get("daily_ret"), errors="coerce"),
+            "acc_nav": float(acc) if not pd.isna(acc) else float(nav),
+        }
+        hist = pd.concat([hist, pd.DataFrame([new_row])], ignore_index=True)
+        hist = hist[hist["date"] >= cutoff].sort_values("date").reset_index(drop=True)
+        conn.execute(
+            "UPDATE fund_nav SET data=?, saved_at=? WHERE code=?",
+            (hist.to_json(orient="records", force_ascii=False), now, code),
+        )
+        updated += 1
+
+    conn.commit()
+    conn.close()
+    return {"updated": updated, "skipped": skipped, "gapped": gapped}
+
+
+def recompute_all(rf: float = RISK_FREE_RATE,
+                  progress_callback: Optional[Callable] = None) -> int:
+    """Recompute Sharpe + drawdown for every stored fund from its stored NAV.
+
+    No network — pure CPU over cached NAV. All reads/writes share one connection
+    and a single commit, so 20k funds finish in seconds, not minutes.
+    """
+    conn = _conn()
+    codes = [r["code"] for r in conn.execute("SELECT code FROM fund_nav").fetchall()]
+    total, done, saved = len(codes), 0, 0
+    for code in codes:
+        row = conn.execute("SELECT data FROM fund_nav WHERE code=?", (code,)).fetchone()
+        done += 1
+        try:
+            nav_df = _nav_from_json(row["data"]) if row else None
+            m = _metrics_from_nav(nav_df, rf) if nav_df is not None and not nav_df.empty else None
+        except Exception as e:
+            logger.debug("recompute parse error %s: %s", code, e)
+            m = None
+        if m is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO fund_sharpe "
+                "(code, ann_return, volatility, sharpe, data_points, "
+                " mdd_1m, mdd_3m, mdd_6m, mdd_1y, sharpe_6m, sharpe_1y, saved_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (code, m["ann_return"], m["volatility"], m["sharpe"], m["data_points"],
+                 m["mdd_1m"], m["mdd_3m"], m["mdd_6m"], m["mdd_1y"],
+                 m["sharpe_6m"], m["sharpe_1y"], time.time()),
+            )
+            saved += 1
+        if progress_callback and (done % 500 == 0 or done == total):
+            progress_callback(done, total)
+    conn.commit()
+    conn.close()
+    return saved
+
+
+def load_all_precomputed() -> dict:
+    """Every precomputed Sharpe/drawdown row, keyed by code, ignoring TTL.
+
+    Lets the app show metrics instantly on load; freshness is the daily
+    pipeline's responsibility (surfaced via last_update_time()).
+    """
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT code, ann_return, volatility, sharpe, data_points, "
+        "mdd_1m, mdd_3m, mdd_6m, mdd_1y, sharpe_6m, sharpe_1y FROM fund_sharpe"
+    ).fetchall()
+    conn.close()
+    return {r["code"]: {k: r[k] for k in r.keys() if k != "code"} for r in rows}
+
+
+def last_update_time() -> Optional[float]:
+    """Unix time of the most recent precomputed metric, or None if empty."""
+    conn = _conn()
+    row = conn.execute("SELECT MAX(saved_at) AS t FROM fund_sharpe").fetchone()
+    conn.close()
+    return row["t"] if row and row["t"] else None
