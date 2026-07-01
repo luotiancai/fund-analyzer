@@ -256,4 +256,12 @@ with tab_detail:
                 s3.metric("夏普比率", f"{result['sharpe']:.4f}")
                 s4.metric("交易日数据点", result["data_points"])
 
-            st.dataframe(nav_df.reset_index(drop=True), use_container_width=True, height=300)
+            nav_table = nav_df.sort_values("date", ascending=False).reset_index(drop=True)
+            st.dataframe(
+                nav_table,
+                use_container_width=True,
+                height=300,
+                column_config={
+                    "date": st.column_config.DateColumn("净值日期", format="YYYY-MM-DD"),
+                },
+            )
