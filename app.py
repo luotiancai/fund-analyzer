@@ -257,11 +257,10 @@ with tab_detail:
                 s4.metric("交易日数据点", result["data_points"])
 
             nav_table = nav_df.sort_values("date", ascending=False).reset_index(drop=True)
+            nav_table["date"] = pd.to_datetime(nav_table["date"]).dt.strftime("%Y-%m-%d")
+            nav_table = nav_table.rename(columns={"date": "净值日期"})
             st.dataframe(
                 nav_table,
                 use_container_width=True,
                 height=300,
-                column_config={
-                    "date": st.column_config.DateColumn("净值日期", format="YYYY-MM-DD"),
-                },
             )
