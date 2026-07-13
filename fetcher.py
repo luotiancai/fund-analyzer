@@ -23,6 +23,9 @@ NAV_START = "2025-01-01"  # NAV history is kept from this date onward
 MAX_WORKERS = 8
 RISK_FREE_RATE = 0.0113  # fallback 1-year China gov bond yield (see get_risk_free_rate)
 RF_TTL = 30 * 86400      # auto-refresh the risk-free rate ~monthly
+HOLDINGS_START_YEAR = 2025     # top holdings are shown from 2025Q1 onward
+HOLDINGS_TTL = 7 * 86400       # current year re-checked weekly for new quarterly reports
+HOLDINGS_TTL_PAST = 30 * 86400 # past years' disclosures barely change
 
 
 # ── DB helpers ───────────────────────────────────────────────────────────────
@@ -76,6 +79,15 @@ def init_db():
             value    REAL,
             saved_at REAL NOT NULL
         );
+        -- Quarterly top-10 holdings (stocks + bonds) per fund, one year of
+        -- quarters per row, stored as normalized JSON records.
+        CREATE TABLE IF NOT EXISTS fund_holdings (
+            code     TEXT NOT NULL,
+            year     TEXT NOT NULL,
+            data     TEXT NOT NULL,
+            saved_at REAL NOT NULL,
+            PRIMARY KEY (code, year)
+        ) WITHOUT ROWID;
     """)
     # Add per-period max-drawdown and Sharpe columns (migration for existing DBs).
     for col in ("mdd_1m", "mdd_3m", "mdd_6m", "mdd_1y", "sharpe_6m", "sharpe_1y"):
@@ -163,6 +175,7 @@ def clear_all_caches():
     conn.execute("DELETE FROM fund_nav_daily")
     conn.execute("DELETE FROM fund_nav_meta")
     conn.execute("DELETE FROM fund_sharpe")
+    conn.execute("DELETE FROM fund_holdings")
     conn.commit()
     conn.close()
 
@@ -579,6 +592,97 @@ def compute_sharpe_for_fund(code: str, rf: float = RISK_FREE_RATE) -> Optional[d
     if m is not None:
         _save_metrics(code, m)
     return m
+
+
+# ── Quarterly top holdings ───────────────────────────────────────────────────
+# EastMoney F10 discloses each fund's top-10 stock/bond holdings per quarter.
+# Fetched one year at a time (the API's granularity) and cached per (code, year).
+
+_HOLDINGS_COLS = ["quarter", "kind", "代码", "名称", "占净值比例", "持股数", "持仓市值"]
+
+
+def _fetch_holdings_year(code: str, year: str) -> Optional[pd.DataFrame]:
+    """One year's quarterly top holdings (stocks + bonds), normalized.
+
+    Returns an empty DataFrame when the fund disclosed nothing that year, or
+    None when both requests failed (network error — caller keeps stale cache).
+    """
+    frames, failures = [], 0
+    for kind, fn, code_col, name_col in (
+        ("股票", ak.fund_portfolio_hold_em, "股票代码", "股票名称"),
+        ("债券", ak.fund_portfolio_bond_hold_em, "债券代码", "债券名称"),
+    ):
+        try:
+            raw = fn(symbol=code, date=year)
+        except Exception as e:
+            logger.debug("holdings fetch failed %s %s %s: %s", code, year, kind, e)
+            failures += 1
+            continue
+        if raw is None or raw.empty:
+            continue
+        # 季度 looks like "2025年1季度股票投资明细" → "2025Q1"
+        q = raw["季度"].astype(str).str.extract(r"(\d{4})年(\d)季度")
+        df = pd.DataFrame({
+            "quarter": q[0] + "Q" + q[1],
+            "kind": kind,
+            "代码": raw[code_col].astype(str),
+            "名称": raw[name_col].astype(str),
+            "占净值比例": pd.to_numeric(raw["占净值比例"], errors="coerce"),
+            "持股数": pd.to_numeric(raw["持股数"], errors="coerce")
+                if "持股数" in raw.columns else np.nan,
+            "持仓市值": pd.to_numeric(raw["持仓市值"], errors="coerce"),
+        })
+        frames.append(df.dropna(subset=["quarter"]))
+    if failures == 2:
+        return None
+    if not frames:
+        return pd.DataFrame(columns=_HOLDINGS_COLS)
+    return pd.concat(frames, ignore_index=True)
+
+
+def fetch_holdings(code: str, force_refresh: bool = False) -> Optional[pd.DataFrame]:
+    """Quarterly top holdings from 2025Q1 (HOLDINGS_START_YEAR) to the latest
+    disclosed quarter, cache-first.
+
+    Columns: quarter ("2025Q1"), kind (股票/债券), 代码, 名称, 占净值比例(%),
+    持股数(万股, stocks only), 持仓市值(万元). Sorted newest quarter first,
+    biggest position first within a quarter. Returns None only when nothing
+    could be fetched and no cache exists.
+    """
+    years = [str(y) for y in range(HOLDINGS_START_YEAR, datetime.now().year + 1)]
+    frames, any_data = [], False
+    conn = _conn()
+    for year in years:
+        row = conn.execute(
+            "SELECT data, saved_at FROM fund_holdings WHERE code=? AND year=?",
+            (code, year)).fetchone()
+        ttl = HOLDINGS_TTL if year == str(datetime.now().year) else HOLDINGS_TTL_PAST
+        if row and not force_refresh and (time.time() - row["saved_at"]) < ttl:
+            df = pd.DataFrame(json.loads(row["data"]), columns=_HOLDINGS_COLS)
+        else:
+            df = _fetch_holdings_year(code, year)
+            if df is not None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO fund_holdings "
+                    "(code, year, data, saved_at) VALUES (?, ?, ?, ?)",
+                    (code, year, df.to_json(orient="records", force_ascii=False),
+                     time.time()))
+                conn.commit()
+            elif row:   # fetch failed → serve the stale cache rather than nothing
+                df = pd.DataFrame(json.loads(row["data"]), columns=_HOLDINGS_COLS)
+        if df is not None:
+            any_data = True
+            if not df.empty:
+                frames.append(df)
+    conn.close()
+    if not any_data:
+        return None
+    if not frames:
+        return pd.DataFrame(columns=_HOLDINGS_COLS)
+    out = pd.concat(frames, ignore_index=True)
+    return out.sort_values(
+        ["quarter", "kind", "占净值比例"], ascending=[False, True, False]
+    ).reset_index(drop=True)
 
 
 # ── Daily-batch pipeline ──────────────────────────────────────────────────────

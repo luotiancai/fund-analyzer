@@ -41,6 +41,13 @@ with st.sidebar:
 def load_fund_list():
     return fetcher.fetch_fund_list(force_refresh=False)
 
+
+# Per-fund quarterly holdings; fetcher caches in SQLite, this just skips the
+# DB/network round-trip on Streamlit reruns within a session hour.
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_holdings(code: str):
+    return fetcher.fetch_holdings(code)
+
 # Clear-cache button: wipe the in-memory list memo, the SQLite list/NAV/Sharpe
 # tables, and any Sharpe results held in this session, then reload fresh. The
 # list re-fetches immediately below; metrics are rebuilt by 「🔄 更新数据」.
@@ -111,32 +118,44 @@ for _c in ("ret_1m", "ret_3m", "ret_6m", "ret_1y"):
         fund_df[_c] = pd.to_numeric(fund_df[_c], errors="coerce")
 
 all_types = sorted(fund_df["type"].dropna().unique().tolist()) if "type" in fund_df.columns else []
-col_f1, col_f2, col_f3, col_f4, col_f5 = st.columns([3, 1, 1, 1, 1.2])
-with col_f1:
-    selected_types = st.multiselect(
-        "基金类型筛选（不选则显示全部）",
-        options=all_types,
-        default=[],
-        placeholder="全部类型",
-    )
-with col_f2:
-    period_label = st.selectbox("时间区间", options=list(PERIODS.keys()), index=3)
-with col_f3:
-    min_ret = st.number_input(f"{period_label}最低收益率 %", value=0.0, step=1.0)
-with col_f4:
-    max_dd = st.number_input(
-        f"{period_label}最大回撤率 %", value=15.0, min_value=0.0, step=1.0,
-    )
-with col_f5:
-    asof_date = st.date_input(
-        "截至日期（不选=今天）",
-        value=None,
-        min_value=dt.date(2026, 1, 1),
-        max_value=dt.date.today(),
-        help="按该日及之前的净值历史重算收益/回撤/夏普，还原当天的筛选结果。"
-             "本地净值从 2025-01-01 起，因此最早可选 2026-01-01，"
-             "保证近1年窗口有完整数据。",
-    )
+# Filters live in a form: changing a widget does NOT rerun/refilter — everything
+# applies at once when 「开始筛选」 is pressed (expensive as-of recomputes stay
+# off until then). Until the first submit, the defaults below are in effect.
+with st.form("filter_form"):
+    col_f1, col_f2, col_f3, col_f4, col_f5 = st.columns([3, 1, 1, 1, 1.2])
+    with col_f1:
+        selected_types = st.multiselect(
+            "基金类型筛选（不选则显示全部）",
+            options=all_types,
+            default=[],
+            placeholder="全部类型",
+        )
+    with col_f2:
+        period_label = st.selectbox("时间区间", options=list(PERIODS.keys()), index=3)
+    with col_f3:
+        min_ret = st.number_input("所选区间最低收益率 %", value=20.0, step=1.0)
+    with col_f4:
+        max_dd = st.number_input(
+            "所选区间最大回撤率 %", value=15.0, min_value=0.0, step=1.0,
+        )
+    with col_f5:
+        asof_date = st.date_input(
+            "截至日期（不选=今天）",
+            value=None,
+            min_value=dt.date(2026, 1, 1),
+            max_value=dt.date.today(),
+            help="按该日及之前的净值历史重算收益/回撤/夏普，还原当天的筛选结果。"
+                 "本地净值从 2025-01-01 起，因此最早可选 2026-01-01，"
+                 "保证近1年窗口有完整数据。",
+        )
+    submitted = st.form_submit_button("🔍 开始筛选", type="primary")
+
+# Nothing is filtered/merged/rendered until the user explicitly runs a filter —
+# a fresh page load stops at the (cached) fund list. The flag persists in the
+# session so later reruns (tab switches, detail lookups) keep the last result.
+if submitted:
+    st.session_state.filter_applied = True
+filter_ready = st.session_state.get("filter_applied", False)
 
 ret_col, mdd_col, sharpe_col = PERIODS[period_label]
 
@@ -147,39 +166,17 @@ ret_col, mdd_col, sharpe_col = PERIODS[period_label]
 asof_mode = asof_date is not None and asof_date < dt.date.today()
 
 
-@st.cache_data(ttl=86400, show_spinner="正在按所选日期重算全市场指标（首次约1分钟）…")
-def load_asof_metrics(asof_iso: str, rf: float) -> dict:
-    return fetcher.compute_metrics_asof(asof_iso, rf)
+# Manual cross-session snapshot cache: a plain dict held by st.cache_resource.
+# Not st.cache_data — the progress bar is updated from inside the computation,
+# and cache_data would record that element write and crash replaying it on
+# later cache hits (CacheReplayClosureError). Here the bar runs in ordinary
+# script code and only while real work is happening; hits return instantly.
+@st.cache_resource(show_spinner=False)
+def _asof_cache() -> dict:
+    return {}
 
 
-if asof_mode:
-    _asof_iso = asof_date.strftime("%Y-%m-%d")
-    _asof_metrics = load_asof_metrics(_asof_iso, rf_rate)
-    _mdf = pd.DataFrame.from_dict(_asof_metrics, orient="index") \
-        .reset_index().rename(columns={"index": "code"})
-    work_df = fund_df[["code", "name", "type"]].merge(_mdf, on="code", how="inner")
-    st.caption(
-        f"📅 快照模式：按 {_asof_iso} 及之前的净值计算收益/夏普/回撤"
-        f"（覆盖 {len(work_df):,} 只基金）"
-    )
-else:
-    work_df = fund_df
-
-filtered = work_df.copy()
-if selected_types:
-    filtered = filtered[filtered["type"].isin(selected_types)]
-if ret_col in filtered.columns:
-    # Only keep funds that actually have a return for the selected period
-    # (e.g. newly-launched funds have no 近1年 value); NaN is dropped.
-    filtered = filtered[filtered[ret_col] >= min_ret]
-
-# ── Session state for Sharpe results ─────────────────────────────────────────
-# Load whatever the pipeline precomputed (daily batch or the 🔄 button), so the
-# table shows Sharpe/drawdown immediately on open — no per-session computation.
-if "sharpe_results" not in st.session_state:
-    st.session_state.sharpe_results = fetcher.load_all_precomputed()
-
-if not asof_mode:
+if not (filter_ready and asof_mode):
     _last_update = fetcher.last_update_time()
     if _last_update:
         _age_h = (time.time() - _last_update) / 3600
@@ -191,67 +188,113 @@ if not asof_mode:
     else:
         st.caption("⚠️ 还没有指标数据。请点击「🔄 更新数据（增量+重算）」，或运行 `python3 update_daily.py`。")
 
-# ── Merge Sharpe/drawdown into display table ─────────────────────────────────
-# (In as-of mode work_df already carries the snapshot metrics columns.)
-display = filtered.copy()
-if not asof_mode and st.session_state.sharpe_results:
-    sharpe_df = pd.DataFrame.from_dict(
-        st.session_state.sharpe_results, orient="index"
-    ).reset_index().rename(columns={"index": "code"})
-    display = display.merge(sharpe_df, on="code", how="left")
+display = None
+if filter_ready:
+    if asof_mode:
+        _asof_iso = asof_date.strftime("%Y-%m-%d")
+        _cache = _asof_cache()
+        _key = (_asof_iso, round(rf_rate, 6))
+        if _key not in _cache:
+            _bar = st.progress(0.0, text=f"📅 正在按 {_asof_iso} 重算全市场指标（约1分钟）…")
+            _cache[_key] = fetcher.compute_metrics_asof(
+                _asof_iso, rf_rate,
+                progress_callback=lambda d, t: _bar.progress(
+                    (d / t) if t else 1.0,
+                    text=f"📅 正在按 {_asof_iso} 重算全市场指标… {d:,}/{t:,}",
+                ),
+            )
+            while len(_cache) > 4:   # keep only the newest few snapshots (~MBs each)
+                _cache.pop(next(iter(_cache)))
+            _bar.empty()
+        _asof_metrics = _cache[_key]
+        _mdf = pd.DataFrame.from_dict(_asof_metrics, orient="index") \
+            .reset_index().rename(columns={"index": "code"})
+        work_df = fund_df[["code", "name", "type"]].merge(_mdf, on="code", how="inner")
+        st.caption(
+            f"📅 快照模式：按 {_asof_iso} 及之前的净值计算收益/夏普/回撤"
+            f"（覆盖 {len(work_df):,} 只基金）"
+        )
+    else:
+        work_df = fund_df
 
-# Drawdown filter. Funds without a computed drawdown (e.g. younger than the
-# window) are kept rather than hidden.
-if max_dd < 100 and mdd_col in display.columns:
-    dd_pct = pd.to_numeric(display[mdd_col], errors="coerce") * 100
-    display = display[dd_pct.isna() | (dd_pct <= max_dd)]
+    filtered = work_df.copy()
+    if selected_types:
+        filtered = filtered[filtered["type"].isin(selected_types)]
+    if ret_col in filtered.columns:
+        # Only keep funds that actually have a return for the selected period
+        # (e.g. newly-launched funds have no 近1年 value); NaN is dropped.
+        filtered = filtered[filtered[ret_col] >= min_ret]
 
-st.caption(f"共 {len(display):,} 只基金（总量 {len(fund_df):,}）")
-if max_dd < 100 and mdd_col not in display.columns:
-    st.caption("⚠️ 暂无回撤数据。请点击「🔄 更新数据（增量+重算）」生成。")
+    # ── Session state for Sharpe results ──────────────────────────────────────
+    # Load whatever the pipeline precomputed (daily batch or the 🔄 button);
+    # loaded lazily on the first filter run, not on page open.
+    if "sharpe_results" not in st.session_state:
+        st.session_state.sharpe_results = fetcher.load_all_precomputed()
+
+    # ── Merge Sharpe/drawdown into display table ──────────────────────────────
+    # (In as-of mode work_df already carries the snapshot metrics columns.)
+    display = filtered.copy()
+    if not asof_mode and st.session_state.sharpe_results:
+        sharpe_df = pd.DataFrame.from_dict(
+            st.session_state.sharpe_results, orient="index"
+        ).reset_index().rename(columns={"index": "code"})
+        display = display.merge(sharpe_df, on="code", how="left")
+
+    # Drawdown filter. Funds without a computed drawdown (e.g. younger than the
+    # window) are kept rather than hidden.
+    if max_dd < 100 and mdd_col in display.columns:
+        dd_pct = pd.to_numeric(display[mdd_col], errors="coerce") * 100
+        display = display[dd_pct.isna() | (dd_pct <= max_dd)]
+
+    st.caption(f"共 {len(display):,} 只基金（总量 {len(fund_df):,}）")
+    if max_dd < 100 and mdd_col not in display.columns:
+        st.caption("⚠️ 暂无回撤数据。请点击「🔄 更新数据（增量+重算）」生成。")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_table, tab_detail = st.tabs(["📋 基金列表", "🔍 基金详情"])
 
 # ─── Tab 1: Table ────────────────────────────────────────────────────────────
 with tab_table:
-    ret_label = f"{period_label}收益率(%)"
-    dd_label = f"{period_label}最大回撤(%)"
+    if display is None:
+        st.info("👆 设置筛选条件后，点击「🔍 开始筛选」生成基金列表。")
+    else:
+        ret_label = f"{period_label}收益率(%)"
+        dd_label = f"{period_label}最大回撤(%)"
 
-    table = pd.DataFrame()
-    table["基金代码"] = display.get("code")
-    table["基金名称"] = display.get("name")
-    table["类型"] = display.get("type")
-    if ret_col in display.columns:
-        table[ret_label] = pd.to_numeric(display[ret_col], errors="coerce").round(2)
+        table = pd.DataFrame()
+        table["基金代码"] = display.get("code")
+        table["基金名称"] = display.get("name")
+        table["类型"] = display.get("type")
+        if ret_col in display.columns:
+            table[ret_label] = pd.to_numeric(display[ret_col], errors="coerce").round(2)
 
-    sharpe_label = f"{period_label}夏普比率"
-    if sharpe_col and sharpe_col in display.columns:
-        table[sharpe_label] = pd.to_numeric(display[sharpe_col], errors="coerce").round(4)
-    if mdd_col in display.columns:
-        table[dd_label] = (pd.to_numeric(display[mdd_col], errors="coerce") * 100).round(2)
+        sharpe_label = f"{period_label}夏普比率"
+        if sharpe_col and sharpe_col in display.columns:
+            table[sharpe_label] = pd.to_numeric(display[sharpe_col], errors="coerce").round(4)
+        if mdd_col in display.columns:
+            table[dd_label] = (pd.to_numeric(display[mdd_col], errors="coerce") * 100).round(2)
 
-    # Default order (highest first); click any column header to re-sort.
-    default_sort = next(
-        (c for c in [sharpe_label, ret_label] if c in table.columns), None
-    )
-    if default_sort:
-        table = table.sort_values(default_sort, ascending=False, na_position="last")
+        # Default order (highest first); click any column header to re-sort.
+        default_sort = next(
+            (c for c in [sharpe_label, ret_label] if c in table.columns), None
+        )
+        if default_sort:
+            table = table.sort_values(default_sort, ascending=False, na_position="last")
 
-    st.caption("点击表头可排序")
-    st.dataframe(
-        table.reset_index(drop=True),
-        use_container_width=True,
-        height=560,
-    )
+        st.caption("点击表头可排序")
+        st.dataframe(
+            table.reset_index(drop=True),
+            use_container_width=True,
+            height=560,
+        )
 
-    csv = table.to_csv(index=False, encoding="utf-8-sig")
-    st.download_button(
-        label="⬇️ 下载 CSV",
-        data=csv,
-        file_name="fund_sharpe.csv",
-        mime="text/csv",
-    )
+        csv = table.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button(
+            label="⬇️ 下载 CSV",
+            data=csv,
+            file_name="fund_sharpe.csv",
+            mime="text/csv",
+        )
 
 # ─── Tab 2: Fund detail ───────────────────────────────────────────────────────
 with tab_detail:
@@ -295,11 +338,46 @@ with tab_detail:
                 s3.metric("夏普比率", f"{result['sharpe']:.4f}")
                 s4.metric("交易日数据点", result["data_points"])
 
+            # Quarterly top-10 holdings, 2025Q1 → latest disclosed quarter.
+            st.markdown("---")
+            st.subheader(f"📦 重仓持仓（{fetcher.HOLDINGS_START_YEAR}Q1 至最新）")
+            with st.spinner("加载持仓数据…"):
+                hold_df = load_holdings(code_input.strip().zfill(6))
+            if hold_df is None:
+                st.warning("持仓数据获取失败，请稍后重试。")
+            elif hold_df.empty:
+                st.info("该基金暂无披露的重仓持仓（货币基金、新基金常见）。")
+            else:
+                quarters = sorted(hold_df["quarter"].unique(), reverse=True)
+                for q_tab, q in zip(st.tabs(quarters), quarters):
+                    with q_tab:
+                        qdf = hold_df[hold_df["quarter"] == q]
+                        for kind, label in (("股票", "重仓股票"), ("债券", "重仓债券")):
+                            # Annual/semi-annual reports disclose ALL holdings;
+                            # 重仓 means the top 10 by weight, so cap at 10.
+                            part = qdf[qdf["kind"] == kind].head(10)
+                            if part.empty:
+                                continue
+                            st.markdown(f"**{label}（前十）**")
+                            cols = {
+                                "代码": part["代码"],
+                                "名称": part["名称"],
+                                "占净值比例(%)": part["占净值比例"],
+                            }
+                            if kind == "股票":
+                                cols["持股数(万股)"] = part["持股数"]
+                            cols["持仓市值(万元)"] = part["持仓市值"]
+                            st.dataframe(
+                                pd.DataFrame(cols).reset_index(drop=True),
+                                use_container_width=True,
+                            )
+            st.markdown("---")
+            st.subheader("📄 净值历史")
             nav_table = nav_df.sort_values("date", ascending=False).reset_index(drop=True)
             nav_table["date"] = pd.to_datetime(nav_table["date"]).dt.strftime("%Y-%m-%d")
             nav_table = nav_table.rename(columns={"date": "净值日期"})
             st.dataframe(
                 nav_table,
                 use_container_width=True,
-                height=300,
+                height=560,
             )
