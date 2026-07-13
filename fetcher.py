@@ -1,5 +1,6 @@
 """AKShare data fetching with SQLite caching."""
 
+import os
 import sqlite3
 import json
 import re
@@ -16,7 +17,38 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-CACHE_DB = "fund_cache.db"
+# The DB lives on the WSL-native filesystem (ext4), NOT the project dir: the
+# project sits on /mnt/c where every SQLite I/O crosses the 9p protocol —
+# 10-100x slower, which made each Streamlit rerun spend ~10s just opening and
+# reading the cache. Override with FUND_ANALYZER_DATA if needed.
+_DATA_DIR = os.environ.get("FUND_ANALYZER_DATA") or os.path.join(
+    os.path.expanduser("~"), ".local", "share", "fund-analyzer")
+os.makedirs(_DATA_DIR, exist_ok=True)
+CACHE_DB = os.path.join(_DATA_DIR, "fund_cache.db")
+_LEGACY_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "fund_cache.db")
+
+
+def _migrate_db_location():
+    """One-time move of an existing fund_cache.db out of the project dir.
+
+    Uses the SQLite backup API (not a file copy) so pending WAL content is
+    carried over intact; the legacy file is then removed.
+    """
+    if os.path.exists(CACHE_DB) or not os.path.exists(_LEGACY_DB):
+        return
+    logger.warning("migrating fund_cache.db to %s (one-time, ~373MB)", _DATA_DIR)
+    src = sqlite3.connect(_LEGACY_DB)
+    dst = sqlite3.connect(CACHE_DB)
+    with dst:
+        src.backup(dst)
+    dst.close()
+    src.close()
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.remove(_LEGACY_DB + suffix)
+        except OSError:
+            pass
 FUND_LIST_TTL = 3600    # 1 hour
 NAV_TTL = 86400         # 24 hours
 NAV_START = "2025-01-01"  # NAV history is kept from this date onward
@@ -39,6 +71,7 @@ def _conn():
 
 
 def init_db():
+    _migrate_db_location()
     conn = _conn()
     # WAL lets the app keep reading while the pipeline writes (and vice versa).
     conn.execute("PRAGMA journal_mode=WAL")

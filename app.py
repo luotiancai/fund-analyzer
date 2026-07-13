@@ -17,20 +17,32 @@ st.set_page_config(
     layout="wide",
 )
 
-fetcher.init_db()
+# init_db / risk-free rate run once per server (resp. hourly), not on every
+# rerun — both hit SQLite on /mnt/c (slow Windows-disk I/O under WSL), which
+# used to tax every single click.
+@st.cache_resource
+def _init_db_once():
+    fetcher.init_db()
+    return True
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_rf() -> float:
+    return fetcher.get_risk_free_rate()
+
+
+_init_db_once()
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚙️ 控制面板")
 
-    rf_rate = fetcher.get_risk_free_rate()
+    rf_rate = _get_rf()
     st.metric("无风险利率", f"{rf_rate*100:.2f}%")
     st.caption("1年期国债收益率，自动取、每月刷新")
 
     st.markdown("---")
     update_btn = st.button("🔄 更新数据（拉当日净值+重算）", type="primary")
-    recompute_btn = st.button("♻️ 仅重算（不重新下载）")
-    clear_cache_btn = st.button("🧹 清空所有缓存并重算")
 
     st.markdown("---")
     st.caption("数据来源：天天基金（AKShare）")
@@ -42,20 +54,36 @@ def load_fund_list():
     return fetcher.fetch_fund_list(force_refresh=False)
 
 
-# Per-fund quarterly holdings; fetcher caches in SQLite, this just skips the
-# DB/network round-trip on Streamlit reruns within a session hour.
+# Per-fund detail data. fetcher caches in SQLite, but these wrappers matter on
+# reruns: every click anywhere (e.g. 「开始筛选」) re-executes the detail tab,
+# and without them each rerun re-read NAV, re-fetched holdings and — worst —
+# recomputed + re-WROTE the fund's Sharpe row on the slow /mnt/c disk.
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_holdings(code: str):
     return fetcher.fetch_holdings(code)
 
-# Clear-cache button: wipe the in-memory list memo, the SQLite list/NAV/Sharpe
-# tables, and any Sharpe results held in this session, then reload fresh. The
-# list re-fetches immediately below; metrics are rebuilt by 「🔄 更新数据」.
-if clear_cache_btn:
-    fetcher.clear_all_caches()
-    load_fund_list.clear()
-    st.session_state.sharpe_results = {}
-    st.success("已清空所有缓存,基金列表已重新加载。请点击「🔄 更新数据（增量+重算）」重新生成指标。")
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_nav(code: str):
+    return fetcher.fetch_nav(code)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_fund_metrics(code: str, rf: float):
+    return fetcher.compute_sharpe_for_fund(code, rf=rf)
+
+
+# Precomputed Sharpe/drawdown as a merge-ready DataFrame, built once and shared
+# across sessions/reruns (reading ~20k SQLite rows + dict→DataFrame on every
+# filter click is what made 筛选 feel slow). `cache_key` is last_update_time(),
+# so a pipeline run naturally invalidates it; the buttons also clear it.
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_metrics_df(cache_key):
+    data = fetcher.load_all_precomputed()
+    if not data:
+        return None
+    return pd.DataFrame.from_dict(data, orient="index") \
+        .reset_index().rename(columns={"index": "code"})
 
 # Update button: run the same daily pipeline as update_daily.py in-process,
 # streaming progress into a bar. Refreshes the list cache and reloads the
@@ -70,7 +98,7 @@ if update_btn:
     with st.spinner("正在更新数据（增量补净值 + 重算指标）…"):
         summary = fetcher.run_pipeline(progress=_on_progress, rf=rf_rate)
     load_fund_list.clear()
-    st.session_state.sharpe_results = fetcher.load_all_precomputed()
+    load_metrics_df.clear()
     _bar.progress(1.0, text="完成")
     st.success(
         f"更新完成 · 基金 {summary['funds']:,} · 回填 {summary['backfilled']} · "
@@ -78,21 +106,6 @@ if update_btn:
         + (f"（失败 {summary['failed']:,}）" if summary["failed"] else "")
         + f" · 重算 {summary['recomputed']:,} · 无风险利率 {summary['rf']*100:.2f}%"
     )
-
-# Recompute-only: rf only feeds the Sharpe formula, so changing it needs no new
-# data — just recompute from stored NAV (no network, ~15s) instead of the full
-# pipeline. This is the right button after tweaking the risk-free rate.
-if recompute_btn:
-    _bar = st.progress(0.0, text="重算中…")
-    saved = fetcher.recompute_all(
-        rf=rf_rate,
-        progress_callback=lambda d, t: _bar.progress(
-            (d / t) if t else 1.0, text=f"重算指标… {d}/{t}"
-        ),
-    )
-    st.session_state.sharpe_results = fetcher.load_all_precomputed()
-    _bar.progress(1.0, text="完成")
-    st.success(f"已按无风险利率 {rf_rate*100:.2f}% 重算 {saved:,} 只基金（未联网）")
 
 with st.spinner("加载基金列表中…"):
     fund_df = load_fund_list()
@@ -217,34 +230,52 @@ if filter_ready:
     else:
         work_df = fund_df
 
-    filtered = work_df.copy()
-    if selected_types:
-        filtered = filtered[filtered["type"].isin(selected_types)]
-    if ret_col in filtered.columns:
-        # Only keep funds that actually have a return for the selected period
-        # (e.g. newly-launched funds have no 近1年 value); NaN is dropped.
-        filtered = filtered[filtered[ret_col] >= min_ret]
+    with st.spinner("⏳ 正在筛选…"):
+        filtered = work_df.copy()
+        if selected_types:
+            filtered = filtered[filtered["type"].isin(selected_types)]
+        if ret_col in filtered.columns:
+            # Only keep funds that actually have a return for the selected period
+            # (e.g. newly-launched funds have no 近1年 value); NaN is dropped.
+            filtered = filtered[filtered[ret_col] >= min_ret]
 
-    # ── Session state for Sharpe results ──────────────────────────────────────
-    # Load whatever the pipeline precomputed (daily batch or the 🔄 button);
-    # loaded lazily on the first filter run, not on page open.
-    if "sharpe_results" not in st.session_state:
-        st.session_state.sharpe_results = fetcher.load_all_precomputed()
+        # ── Merge Sharpe/drawdown into display table ──────────────────────────
+        # (In as-of mode work_df already carries the snapshot metrics columns.)
+        display = filtered.copy()
+        if not asof_mode:
+            sharpe_df = load_metrics_df(fetcher.last_update_time())
+            if sharpe_df is not None:
+                display = display.merge(sharpe_df, on="code", how="left")
 
-    # ── Merge Sharpe/drawdown into display table ──────────────────────────────
-    # (In as-of mode work_df already carries the snapshot metrics columns.)
-    display = filtered.copy()
-    if not asof_mode and st.session_state.sharpe_results:
-        sharpe_df = pd.DataFrame.from_dict(
-            st.session_state.sharpe_results, orient="index"
-        ).reset_index().rename(columns={"index": "code"})
-        display = display.merge(sharpe_df, on="code", how="left")
+        # Drawdown filter. Funds without a computed drawdown (e.g. younger than
+        # the window) are kept rather than hidden.
+        if max_dd < 100 and mdd_col in display.columns:
+            dd_pct = pd.to_numeric(display[mdd_col], errors="coerce") * 100
+            display = display[dd_pct.isna() | (dd_pct <= max_dd)]
 
-    # Drawdown filter. Funds without a computed drawdown (e.g. younger than the
-    # window) are kept rather than hidden.
-    if max_dd < 100 and mdd_col in display.columns:
-        dd_pct = pd.to_numeric(display[mdd_col], errors="coerce") * 100
-        display = display[dd_pct.isna() | (dd_pct <= max_dd)]
+        # Build the presentation table inside the spinner too, so the loading
+        # animation covers everything between the click and the rendered rows.
+        ret_label = f"{period_label}收益率(%)"
+        dd_label = f"{period_label}最大回撤(%)"
+        sharpe_label = f"{period_label}夏普比率"
+        table = pd.DataFrame()
+        table["基金代码"] = display.get("code")
+        table["基金名称"] = display.get("name")
+        table["类型"] = display.get("type")
+        if ret_col in display.columns:
+            table[ret_label] = pd.to_numeric(display[ret_col], errors="coerce").round(2)
+        if sharpe_col and sharpe_col in display.columns:
+            table[sharpe_label] = pd.to_numeric(display[sharpe_col], errors="coerce").round(4)
+        if mdd_col in display.columns:
+            table[dd_label] = (pd.to_numeric(display[mdd_col], errors="coerce") * 100).round(2)
+
+        # Default order (highest first); click any column header to re-sort.
+        default_sort = next(
+            (c for c in [sharpe_label, ret_label] if c in table.columns), None
+        )
+        if default_sort:
+            table = table.sort_values(default_sort, ascending=False, na_position="last")
+        table = table.reset_index(drop=True)
 
     st.caption(f"共 {len(display):,} 只基金（总量 {len(fund_df):,}）")
     if max_dd < 100 and mdd_col not in display.columns:
@@ -258,32 +289,9 @@ with tab_table:
     if display is None:
         st.info("👆 设置筛选条件后，点击「🔍 开始筛选」生成基金列表。")
     else:
-        ret_label = f"{period_label}收益率(%)"
-        dd_label = f"{period_label}最大回撤(%)"
-
-        table = pd.DataFrame()
-        table["基金代码"] = display.get("code")
-        table["基金名称"] = display.get("name")
-        table["类型"] = display.get("type")
-        if ret_col in display.columns:
-            table[ret_label] = pd.to_numeric(display[ret_col], errors="coerce").round(2)
-
-        sharpe_label = f"{period_label}夏普比率"
-        if sharpe_col and sharpe_col in display.columns:
-            table[sharpe_label] = pd.to_numeric(display[sharpe_col], errors="coerce").round(4)
-        if mdd_col in display.columns:
-            table[dd_label] = (pd.to_numeric(display[mdd_col], errors="coerce") * 100).round(2)
-
-        # Default order (highest first); click any column header to re-sort.
-        default_sort = next(
-            (c for c in [sharpe_label, ret_label] if c in table.columns), None
-        )
-        if default_sort:
-            table = table.sort_values(default_sort, ascending=False, na_position="last")
-
         st.caption("点击表头可排序")
         st.dataframe(
-            table.reset_index(drop=True),
+            table,
             use_container_width=True,
             height=560,
         )
@@ -301,7 +309,7 @@ with tab_detail:
     code_input = st.text_input("输入基金代码（6位数字）", placeholder="例如 000001")
     if code_input:
         with st.spinner(f"加载 {code_input} 净值历史…"):
-            nav_df = fetcher.fetch_nav(code_input.strip().zfill(6))
+            nav_df = load_nav(code_input.strip().zfill(6))
 
         if nav_df is None:
             st.error("无法获取该基金净值数据，请检查代码是否正确。")
@@ -330,7 +338,7 @@ with tab_detail:
                 st.plotly_chart(fig_nav, use_container_width=True)
 
             # Compute Sharpe on the spot
-            result = fetcher.compute_sharpe_for_fund(code_input.strip().zfill(6), rf=rf_rate)
+            result = load_fund_metrics(code_input.strip().zfill(6), rf_rate)
             if result:
                 s1, s2, s3, s4 = st.columns(4)
                 s1.metric("年化收益", f"{result['ann_return']*100:.2f}%")
