@@ -13,3 +13,4 @@ env/
 # Streamlit / OS
 .streamlit/secrets.toml
 .DS_Store
+fund_cache.db-*

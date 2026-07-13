@@ -7,8 +7,9 @@ in-app「🔄 更新数据」button via fetcher.run_pipeline().
 
 Pipeline (fetcher.run_pipeline):
   ① 拉取基金列表(1 次批量调用,带回全部基金的最新净值点)
-  ② 历史回填:对还没有净值历史的基金逐只下载近一年序列(慢,基本一次性)
-  ③ 增量追加:把当日最新净值点追加到已有历史的基金(快,无逐只请求)
+  ② 历史回填:对还没有净值历史的基金,每只 1 次请求下载 2025-01-01 至今的序列(基本一次性)
+  ③ 增量补净值:只差一个交易日的基金直接追加基金列表带回的当日净值点(零请求);
+     缺口更大的用天天基金历史净值接口按日期段拉取(每只一次几 KB 的请求)
   ④ 重算:用存好的净值对全部基金重算夏普 + 最大回撤(纯 CPU,几秒)
 
 用法
@@ -55,9 +56,9 @@ def main():
         log.info("   写入 %d 只指标", saved)
     else:
         summary = fetcher.run_pipeline(progress=_log_progress)
-        log.info("基金 %d · 回填 %d · 追加 %d · 重算 %d",
-                 summary["funds"], summary["backfilled"],
-                 summary["appended"], summary["recomputed"])
+        log.info("基金 %d · 回填 %d · 当日追加 %d · 补缺口 %d（失败 %d）· 重算 %d",
+                 summary["funds"], summary["backfilled"], summary["appended"],
+                 summary["patched"], summary["failed"], summary["recomputed"])
 
     log.info("✅ 完成,总耗时 %.1f 分钟", (time.time() - t0) / 60)
 

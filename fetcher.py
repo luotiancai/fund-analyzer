@@ -2,6 +2,7 @@
 
 import sqlite3
 import json
+import re
 import time
 import logging
 import numpy as np
@@ -11,12 +12,14 @@ from typing import Callable, Optional
 
 import akshare as ak
 import pandas as pd
+import requests
 
 logger = logging.getLogger(__name__)
 
 CACHE_DB = "fund_cache.db"
 FUND_LIST_TTL = 3600    # 1 hour
 NAV_TTL = 86400         # 24 hours
+NAV_START = "2025-01-01"  # NAV history is kept from this date onward
 MAX_WORKERS = 8
 RISK_FREE_RATE = 0.0113  # fallback 1-year China gov bond yield (see get_risk_free_rate)
 RF_TTL = 30 * 86400      # auto-refresh the risk-free rate ~monthly
@@ -25,23 +28,40 @@ RF_TTL = 30 * 86400      # auto-refresh the risk-free rate ~monthly
 # ── DB helpers ───────────────────────────────────────────────────────────────
 
 def _conn():
-    conn = sqlite3.connect(CACHE_DB, check_same_thread=False)
+    # timeout guards the threaded backfill: concurrent writers wait for the
+    # lock instead of failing with "database is locked".
+    conn = sqlite3.connect(CACHE_DB, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db():
     conn = _conn()
+    # WAL lets the app keep reading while the pipeline writes (and vice versa).
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS fund_list (
             id       INTEGER PRIMARY KEY,
             data     TEXT    NOT NULL,
             saved_at REAL    NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS fund_nav (
-            code     TEXT PRIMARY KEY,
-            data     TEXT NOT NULL,
-            saved_at REAL NOT NULL
+        -- One row per fund per day: appends are single-row INSERTs instead of
+        -- rewriting a whole per-fund JSON blob (the old fund_nav design, which
+        -- churned ~20KB of freelist pages per fund per update).
+        CREATE TABLE IF NOT EXISTS fund_nav_daily (
+            code          TEXT NOT NULL,
+            date          TEXT NOT NULL,    -- ISO yyyy-mm-dd
+            nav           REAL,
+            daily_ret_pct REAL,
+            acc_nav       REAL,
+            PRIMARY KEY (code, date)
+        ) WITHOUT ROWID;
+        -- Per-fund freshness + newest stored date, so gap detection and TTL
+        -- checks never have to scan fund_nav_daily.
+        CREATE TABLE IF NOT EXISTS fund_nav_meta (
+            code      TEXT PRIMARY KEY,
+            saved_at  REAL NOT NULL,
+            last_date TEXT
         );
         CREATE TABLE IF NOT EXISTS fund_sharpe (
             code        TEXT PRIMARY KEY,
@@ -63,8 +83,23 @@ def init_db():
             conn.execute(f"ALTER TABLE fund_sharpe ADD COLUMN {col} REAL")
         except sqlite3.OperationalError:
             pass  # column already exists
+    _migrate_nav_blobs(conn)
     conn.commit()
     conn.close()
+
+
+def _migrate_nav_blobs(conn):
+    """One-time migration: legacy fund_nav JSON blobs → fund_nav_daily rows."""
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fund_nav'"
+    ).fetchone():
+        return
+    for r in conn.execute("SELECT code, data, saved_at FROM fund_nav").fetchall():
+        df = _nav_from_json(r["data"])
+        if not df.empty and "date" in df.columns:
+            _write_nav_rows(conn, r["code"], df, saved_at=r["saved_at"])
+    conn.execute("DROP TABLE fund_nav")
+    logger.info("migrated legacy fund_nav JSON blobs to fund_nav_daily")
 
 
 # ── Risk-free rate ───────────────────────────────────────────────────────────
@@ -125,7 +160,8 @@ def clear_all_caches():
     """
     conn = _conn()
     conn.execute("DELETE FROM fund_list")
-    conn.execute("DELETE FROM fund_nav")
+    conn.execute("DELETE FROM fund_nav_daily")
+    conn.execute("DELETE FROM fund_nav_meta")
     conn.execute("DELETE FROM fund_sharpe")
     conn.commit()
     conn.close()
@@ -138,6 +174,17 @@ DRAWDOWN_DAYS = {"mdd_1m": 30, "mdd_3m": 91, "mdd_6m": 182, "mdd_1y": 365}
 
 # Sharpe is only computed for longer windows (short windows are too noisy).
 SHARPE_DAYS = {"sharpe_6m": 182, "sharpe_1y": 365}
+
+# Period returns (%), matching the rank list's 近1月/3月/6月/1年 columns; used
+# when metrics are recomputed as of a past date and the list values don't apply.
+RETURN_DAYS = {"ret_1m": 30, "ret_3m": 91, "ret_6m": 182, "ret_1y": 365}
+
+
+# A window anchor may miss by a few days when the ideal start lands in a
+# holiday gap or just before the stored history begins (data starts NAV_START,
+# but 01-01 itself is a holiday). Accept the earliest NAV as anchor when it is
+# at most this many days late; beyond that the fund is genuinely too young.
+ANCHOR_GRACE_DAYS = 10
 
 
 def _window_by_date(df: pd.DataFrame, days_back: int) -> Optional[pd.DataFrame]:
@@ -155,6 +202,9 @@ def _window_by_date(df: pd.DataFrame, days_back: int) -> Optional[pd.DataFrame]:
     start_date = end_date - timedelta(days=days_back)
     older = df[df["date"] <= start_date]
     if older.empty:
+        first = df["date"].iloc[0]
+        if (first - start_date).days <= ANCHOR_GRACE_DAYS:
+            return df
         return None
     return df.loc[older.index[-1]:]
 
@@ -211,6 +261,19 @@ def _period_sharpe(df: pd.DataFrame, days_back: int, rf: float) -> Optional[floa
     span = (window["date"].iloc[-1] - window["date"].iloc[0]).days
     res = _annualized(r, span, rf)
     return float(res[2]) if res else None
+
+
+def _period_return(df: pd.DataFrame, days_back: int) -> Optional[float]:
+    """Compounded % return over the trailing `days_back` calendar-day window
+    (daily growth rates multiplied up, so dividends are handled). None when
+    the fund lacks history old enough to anchor the window."""
+    window = _window_by_date(df, days_back)
+    if window is None:
+        return None
+    r = window["r"].iloc[1:].dropna()
+    if r.empty:
+        return None
+    return float(((1.0 + r).prod() - 1.0) * 100.0)
 
 
 def _period_mdd(df: pd.DataFrame, days_back: int) -> Optional[float]:
@@ -296,11 +359,11 @@ def fetch_fund_list(force_refresh: bool = False) -> pd.DataFrame:
 # ── NAV history ──────────────────────────────────────────────────────────────
 
 def _nav_from_json(blob: str) -> pd.DataFrame:
-    """Rebuild a NAV DataFrame from stored JSON, restoring the `date` column.
+    """Rebuild a NAV DataFrame from a legacy fund_nav JSON blob (migration only).
 
-    df.to_json serializes datetimes as epoch-millisecond ints, which
+    df.to_json serialized datetimes as epoch-millisecond ints, which
     pd.to_datetime would otherwise misread as nanoseconds (everything → 1970).
-    Newer rows are stored ISO-formatted; handle both shapes.
+    Newer rows were stored ISO-formatted; handle both shapes.
     """
     df = pd.DataFrame(json.loads(blob))
     if not df.empty and "date" in df.columns:
@@ -311,82 +374,131 @@ def _nav_from_json(blob: str) -> pd.DataFrame:
     return df
 
 
-def _load_nav_cache(code: str) -> Optional[pd.DataFrame]:
-    conn = _conn()
-    row = conn.execute(
-        "SELECT data, saved_at FROM fund_nav WHERE code = ?", (code,)
-    ).fetchone()
-    conn.close()
-    if row and (time.time() - row["saved_at"]) < NAV_TTL:
-        return _nav_from_json(row["data"])
-    return None
-
-
-def _save_nav_cache(code: str, df: pd.DataFrame):
-    conn = _conn()
+def _write_nav_rows(conn, code: str, df: pd.DataFrame,
+                    saved_at: Optional[float] = None):
+    """Upsert NAV rows for one fund and refresh its meta row. No commit —
+    the caller owns the transaction."""
+    df = df.dropna(subset=["date"])
+    if df.empty:
+        return
+    dates = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+    nav = pd.to_numeric(df["nav"], errors="coerce")
+    ret = pd.to_numeric(df["daily_ret_pct"], errors="coerce") \
+        if "daily_ret_pct" in df.columns else pd.Series(np.nan, index=df.index)
+    acc = pd.to_numeric(df["acc_nav"], errors="coerce").fillna(nav) \
+        if "acc_nav" in df.columns else nav
+    rows = [
+        (code, d,
+         None if pd.isna(n) else float(n),
+         None if pd.isna(r) else float(r),
+         None if pd.isna(a) else float(a))
+        for d, n, r, a in zip(dates, nav, ret, acc)
+    ]
+    conn.executemany(
+        "INSERT OR REPLACE INTO fund_nav_daily "
+        "(code, date, nav, daily_ret_pct, acc_nav) VALUES (?, ?, ?, ?, ?)", rows)
     conn.execute(
-        "INSERT OR REPLACE INTO fund_nav (code, data, saved_at) VALUES (?, ?, ?)",
-        (code, df.to_json(orient="records", force_ascii=False, date_format="iso"),
-         time.time()),
-    )
-    conn.commit()
-    conn.close()
+        "INSERT OR REPLACE INTO fund_nav_meta (code, saved_at, last_date) "
+        "VALUES (?, ?, (SELECT MAX(date) FROM fund_nav_daily WHERE code=?))",
+        (code, saved_at if saved_at is not None else time.time(), code))
+
+
+def _load_nav_df(code: str, conn=None) -> pd.DataFrame:
+    """Stored NAV history for one fund, ascending by date.
+
+    Columns: date (datetime64), nav, daily_ret_pct, acc_nav.
+    """
+    own = conn is None
+    if own:
+        conn = _conn()
+    df = pd.read_sql_query(
+        "SELECT date, nav, daily_ret_pct, acc_nav FROM fund_nav_daily "
+        "WHERE code = ? ORDER BY date", conn, params=(code,))
+    if own:
+        conn.close()
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+_EM_PZD_URL = "https://fund.eastmoney.com/pingzhongdata/{code}.js"
+
+
+def _fetch_nav_full(code: str) -> Optional[pd.DataFrame]:
+    """NAV history since NAV_START in a single request via pingzhongdata.
+
+    The one js blob carries unit NAV, daily growth AND accumulated NAV, so this
+    replaces akshare's fund_open_fund_info_em (which downloads the same blob
+    once per indicator and parses it with a JS engine) — the two series are
+    pulled out with a regex + json.loads instead.
+    Columns: date, nav, daily_ret_pct, acc_nav (ascending). None on failure.
+    """
+    def _dates(ms):
+        # timestamps are midnight Beijing time; naive UTC parse would land on
+        # the previous day, so convert before dropping the timezone
+        s = pd.to_datetime(ms, unit="ms", utc=True)
+        return s.dt.tz_convert("Asia/Shanghai").dt.normalize().dt.tz_localize(None)
+
+    try:
+        r = requests.get(_EM_PZD_URL.format(code=code),
+                         headers=_EM_LSJZ_HEADERS, timeout=20)
+        m = re.search(r"var Data_netWorthTrend\s*=\s*(\[.*?\])\s*;", r.text)
+        if not m:
+            return None
+        unit = pd.DataFrame(json.loads(m.group(1)))
+        if unit.empty:
+            return None
+        df = pd.DataFrame({
+            "date": _dates(unit["x"]),
+            "nav": pd.to_numeric(unit["y"], errors="coerce"),
+            "daily_ret_pct": pd.to_numeric(
+                unit.get("equityReturn"), errors="coerce"),
+        })
+
+        # Accumulated (dividend-reinvested) NAV for drawdown; fall back to unit
+        # NAV where the accumulated series is missing.
+        m = re.search(r"var Data_ACWorthTrend\s*=\s*(\[.*?\])\s*;", r.text)
+        acc_raw = json.loads(m.group(1)) if m else []
+        if acc_raw:
+            acc = pd.DataFrame(acc_raw, columns=["x", "acc_nav"])
+            acc["date"] = _dates(acc["x"])
+            df = df.merge(acc[["date", "acc_nav"]], on="date", how="left")
+        else:
+            df["acc_nav"] = df["nav"]
+        df["acc_nav"] = pd.to_numeric(df["acc_nav"], errors="coerce").fillna(df["nav"])
+
+        df = df[df["date"] >= pd.Timestamp(NAV_START)]
+        return df.sort_values("date").reset_index(drop=True)
+
+    except Exception as e:
+        logger.debug("full NAV fetch failed for %s: %s", code, e)
+        return None
 
 
 def fetch_nav(code: str) -> Optional[pd.DataFrame]:
-    """Return ~1-year NAV history for a single fund.
+    """Return NAV history since NAV_START for a single fund (cache-first).
 
-    Pulls both 单位净值走势 (unit NAV + daily growth) and 累计净值走势 (accumulated
-    NAV). Drawdown is later computed on the accumulated NAV so that dividend
-    distributions — which drop the *unit* NAV on the ex-date — don't register as
-    spurious drawdowns.
+    Serves stored rows while fresh (< NAV_TTL); otherwise downloads the whole
+    history in one pingzhongdata request and stores it row-per-day.
     Columns: date, nav, daily_ret_pct, acc_nav
     """
-    cached = _load_nav_cache(code)
-    if cached is not None and "acc_nav" in cached.columns:
-        return cached
+    conn = _conn()
+    meta = conn.execute(
+        "SELECT saved_at FROM fund_nav_meta WHERE code = ?", (code,)).fetchone()
+    if meta and (time.time() - meta["saved_at"]) < NAV_TTL:
+        df = _load_nav_df(code, conn)
+        conn.close()
+        return df if len(df) >= 20 else None
+    conn.close()
 
-    try:
-        df = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势")
-        if df is None or df.empty:
-            return None
-
-        df = df.rename(columns={
-            "净值日期": "date",
-            "单位净值": "nav",
-            "日增长率": "daily_ret_pct",
-        })
-        df["date"] = pd.to_datetime(df["date"])
-
-        # Accumulated (dividend-reinvested) NAV for drawdown; fall back to unit
-        # NAV if the accumulated series can't be fetched or has gaps.
-        try:
-            acc = ak.fund_open_fund_info_em(symbol=code, indicator="累计净值走势")
-            acc = acc.rename(columns={"净值日期": "date", "累计净值": "acc_nav"})
-            acc["date"] = pd.to_datetime(acc["date"])
-            df = df.merge(acc[["date", "acc_nav"]], on="date", how="left")
-        except Exception:
-            df["acc_nav"] = df["nav"]
-        df["acc_nav"] = pd.to_numeric(df["acc_nav"], errors="coerce").fillna(
-            pd.to_numeric(df["nav"], errors="coerce")
-        )
-
-        df = df.sort_values("date")
-
-        # Filter to last 365 + buffer days; the buffer guarantees a NAV old
-        # enough to anchor the trailing-1-year window even across holiday gaps.
-        cutoff = datetime.now() - timedelta(days=400)
-        df = df[df["date"] >= cutoff].copy().reset_index(drop=True)
-
-        if len(df) < 20:
-            return None
-
-        _save_nav_cache(code, df)
-        return df
-
-    except Exception as e:
-        logger.debug("NAV fetch failed for %s: %s", code, e)
+    df = _fetch_nav_full(code)
+    if df is None or len(df) < 20:
         return None
+    conn = _conn()
+    _write_nav_rows(conn, code, df)
+    conn.commit()
+    conn.close()
+    return df
 
 
 # ── Sharpe calculation ────────────────────────────────────────────────────────
@@ -442,10 +554,11 @@ def _metrics_from_nav(nav_df: pd.DataFrame, rf: float) -> Optional[dict]:
     # Drawdown runs on accumulated NAV so dividends aren't mistaken for drops.
     psharpe = {key: _period_sharpe(df, days, rf) for key, days in SHARPE_DAYS.items()}
     mdd = {key: _period_mdd(df, days) for key, days in DRAWDOWN_DAYS.items()}
+    rets = {key: _period_return(df, days) for key, days in RETURN_DAYS.items()}
 
     return {
         "ann_return": ann_return, "volatility": ann_vol, "sharpe": sharpe,
-        "data_points": n, **mdd, **psharpe,
+        "data_points": n, **mdd, **psharpe, **rets,
     }
 
 
@@ -472,36 +585,196 @@ def compute_sharpe_for_fund(code: str, rf: float = RISK_FREE_RATE) -> Optional[d
 # Used by update_daily.py: backfill once, then each day append the latest NAV
 # point (from the bulk fund-list call) and recompute Sharpe/drawdown for all.
 
-NAV_HISTORY_DAYS = 400  # rolling window kept per fund (covers the 1y look-back)
-
 
 def list_nav_codes() -> set:
     """Codes that already have a stored NAV history."""
     conn = _conn()
-    rows = conn.execute("SELECT code FROM fund_nav").fetchall()
+    rows = conn.execute("SELECT code FROM fund_nav_meta").fetchall()
     conn.close()
     return {r["code"] for r in rows}
 
 
-def append_latest_nav(list_df: pd.DataFrame) -> dict:
-    """Append today's NAV point to every stored fund from the bulk fund list.
+_EM_LSJZ_URL = "https://api.fund.eastmoney.com/f10/lsjz"
+_EM_LSJZ_HEADERS = {"Referer": "https://fundf10.eastmoney.com/"}
 
-    `list_df` is fetch_fund_list() output (columns: code, nav_date, nav, acc_nav,
-    daily_ret). Appends one row per fund when the list's date is newer than the
-    stored last date, trims to NAV_HISTORY_DAYS, and writes everything in one
-    transaction. Funds whose gap to the latest date exceeds a week are returned
-    in `gapped` for the caller to fully re-backfill (the bulk call only carries
-    the single latest point, so it can't fill multi-day gaps).
+
+def _fetch_nav_range(code: str, start: datetime,
+                     end: datetime) -> Optional[pd.DataFrame]:
+    """NAV rows in [start, end] via EastMoney's date-ranged 历史净值 API.
+
+    One paged JSON request (~KB) carries unit NAV, accumulated NAV and daily
+    growth together — unlike ak.fund_open_fund_info_em, which downloads the
+    fund's entire since-inception pingzhongdata blob (~MB) once per indicator.
+    Returns an empty DataFrame when the range has no rows, None on failure.
+    Columns: date, nav, daily_ret_pct, acc_nav (ascending by date).
     """
+    rows, page = [], 1
+    try:
+        while True:
+            resp = requests.get(_EM_LSJZ_URL, headers=_EM_LSJZ_HEADERS, timeout=15,
+                                params={
+                                    "fundCode": code,
+                                    "pageIndex": page,
+                                    "pageSize": 49,
+                                    "startDate": start.strftime("%Y-%m-%d"),
+                                    "endDate": end.strftime("%Y-%m-%d"),
+                                })
+            payload = resp.json()
+            data = payload.get("Data")
+            if not isinstance(data, dict):   # ErrCode -999 etc.
+                return None
+            batch = data.get("LSJZList") or []
+            rows.extend(batch)
+            if not batch or len(rows) >= (payload.get("TotalCount") or 0):
+                break
+            page += 1
+    except Exception as e:
+        logger.debug("ranged NAV fetch failed for %s: %s", code, e)
+        return None
+
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df = pd.DataFrame({
+        "date": pd.to_datetime(df["FSRQ"], errors="coerce"),
+        "nav": pd.to_numeric(df["DWJZ"], errors="coerce"),
+        "daily_ret_pct": pd.to_numeric(df["JZZZL"], errors="coerce"),
+        "acc_nav": pd.to_numeric(df["LJJZ"], errors="coerce"),
+    })
+    df = df.dropna(subset=["date", "nav"])
+    df["acc_nav"] = df["acc_nav"].fillna(df["nav"])
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def _fetch_nav_incremental(code: str, after_date: datetime) -> Optional[pd.DataFrame]:
+    """Fetch NAV rows newer than `after_date` for a single fund.
+
+    Asks the ranged API for just the missing span; falls back to the full
+    single-request download only if the ranged API fails.
+    """
+    start = max(after_date + timedelta(days=1), pd.Timestamp(NAV_START))
+    df = _fetch_nav_range(code, start, datetime.now())
+    if df is None:
+        df = _fetch_nav_full(code)
+    if df is None:
+        return None
+    df = df[df["date"] > after_date].reset_index(drop=True)
+    return df if not df.empty else None
+
+
+def _backfill_incremental(codes: list, workers: int = MAX_WORKERS,
+                          progress: Optional[Callable] = None) -> int:
+    """Incrementally fill NAV gaps for `codes` (threaded).
+
+    For each code, reads the last stored date, fetches only newer rows, and
+    inserts them.  Returns the count of codes that got new data.
+    """
+    total, done, patched = len(codes), 0, 0
+    if not codes:
+        return 0
+
+    def _patch_one(code: str) -> bool:
+        conn = _conn()
+        meta = conn.execute(
+            "SELECT last_date FROM fund_nav_meta WHERE code=?", (code,)).fetchone()
+        conn.close()
+        if not meta or not meta["last_date"]:
+            return False
+
+        new_rows = _fetch_nav_incremental(code, pd.to_datetime(meta["last_date"]))
+        if new_rows is None or new_rows.empty:
+            return False
+
+        conn = _conn()
+        _write_nav_rows(conn, code, new_rows)
+        conn.commit()
+        conn.close()
+        return True
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_patch_one, c): c for c in codes}
+        for fut in as_completed(futures):
+            done += 1
+            try:
+                if fut.result():
+                    patched += 1
+            except Exception:
+                pass
+            if progress and (done % 50 == 0 or done == total):
+                progress(done, total)
+    return patched
+
+
+def _only_weekends_between(a: datetime, b: datetime) -> bool:
+    """True if every calendar day strictly between a and b is a Sat/Sun.
+
+    Used to tell "the fund list's latest NAV is the only missing point"
+    (consecutive trading days, possibly across a weekend) from a real
+    multi-day gap. Holidays make this return False, which safely falls
+    through to the ranged fetch.
+    """
+    d = pd.Timestamp(a).normalize() + timedelta(days=1)
+    end = pd.Timestamp(b).normalize()
+    while d < end:
+        if d.weekday() < 5:
+            return False
+        d += timedelta(days=1)
+    return True
+
+
+def _append_nav_point(conn, code: str, date, nav: float,
+                      acc_nav: Optional[float], ret_pct: Optional[float]) -> bool:
+    """Append one NAV row (from the bulk fund-list call) — a single INSERT,
+    zero network. The caller owns the transaction (no commit here)."""
+    d = pd.Timestamp(date).strftime("%Y-%m-%d")
+    if ret_pct is None:
+        prev = conn.execute(
+            "SELECT nav FROM fund_nav_daily WHERE code=? AND date<? "
+            "ORDER BY date DESC LIMIT 1", (code, d)).fetchone()
+        if prev and prev["nav"]:
+            ret_pct = (nav / prev["nav"] - 1.0) * 100.0
+    conn.execute(
+        "INSERT OR REPLACE INTO fund_nav_daily "
+        "(code, date, nav, daily_ret_pct, acc_nav) VALUES (?, ?, ?, ?, ?)",
+        (code, d, nav, ret_pct, acc_nav if acc_nav is not None else nav))
+    conn.execute(
+        "INSERT OR REPLACE INTO fund_nav_meta (code, saved_at, last_date) "
+        "VALUES (?, ?, ?)", (code, time.time(), d))
+    return True
+
+
+def append_incremental(list_df: pd.DataFrame,
+                       progress: Optional[Callable] = None) -> dict:
+    """Bring every stored NAV history up to the fund list's latest date.
+
+    Two tiers, cheapest first:
+      • gap of exactly one trading day (only weekends in between) — the bulk
+        fund-list call already carries that day's nav/acc_nav/daily_ret, so
+        the point is appended directly, zero extra network;
+      • bigger gap (holidays, many days since last run) — fetch just the
+        missing date span via the ranged 历史净值 API (threaded).
+
+    Gap detection reads fund_nav_meta.last_date — one small table scan.
+    `progress(phase, done, total)` as in run_pipeline. Returns a summary dict
+    with counts (failed = gapped funds whose ranged fetch returned nothing).
+    """
+    def _p(phase, done, total):
+        if progress:
+            progress(phase, done, total)
+
     latest = list_df.dropna(subset=["code"]).drop_duplicates("code").set_index("code")
-    cutoff = datetime.now() - timedelta(days=NAV_HISTORY_DAYS)
-    now = time.time()
 
     conn = _conn()
-    codes = [r["code"] for r in conn.execute("SELECT code FROM fund_nav").fetchall()]
-    updated, skipped, gapped = 0, 0, []
-    for code in codes:
-        if code not in latest.index:
+    stored = {r["code"]: r["last_date"]
+              for r in conn.execute("SELECT code, last_date FROM fund_nav_meta")}
+
+    appended = skipped = 0
+    gapped = []
+    total = len(stored)
+    for i, (code, last_iso) in enumerate(stored.items()):
+        if i % 500 == 0 or i == total - 1:
+            _p("追加当日净值", i + 1, total)
+        if not last_iso or code not in latest.index:
             skipped += 1
             continue
         row = latest.loc[code]
@@ -510,39 +783,31 @@ def append_latest_nav(list_df: pd.DataFrame) -> dict:
         if pd.isna(new_date) or pd.isna(nav):
             skipped += 1
             continue
-
-        cur = conn.execute("SELECT data FROM fund_nav WHERE code=?", (code,)).fetchone()
-        hist = _nav_from_json(cur["data"])
-        if hist.empty:
-            gapped.append(code)
-            continue
-        last_date = hist["date"].max()
-
+        last_date = pd.to_datetime(last_iso)
         if new_date <= last_date:
-            skipped += 1                         # already have this day
-            continue
-        if (new_date - last_date).days > 7:
-            gapped.append(code)                  # missed too many days; refetch
+            skipped += 1                       # already up-to-date
             continue
 
-        acc = pd.to_numeric(row.get("acc_nav"), errors="coerce")
-        new_row = {
-            "date": new_date,
-            "nav": float(nav),
-            "daily_ret_pct": pd.to_numeric(row.get("daily_ret"), errors="coerce"),
-            "acc_nav": float(acc) if not pd.isna(acc) else float(nav),
-        }
-        hist = pd.concat([hist, pd.DataFrame([new_row])], ignore_index=True)
-        hist = hist[hist["date"] >= cutoff].sort_values("date").reset_index(drop=True)
-        conn.execute(
-            "UPDATE fund_nav SET data=?, saved_at=? WHERE code=?",
-            (hist.to_json(orient="records", force_ascii=False), now, code),
-        )
-        updated += 1
-
+        if _only_weekends_between(last_date, new_date):
+            acc = pd.to_numeric(row.get("acc_nav"), errors="coerce")
+            ret = pd.to_numeric(row.get("daily_ret"), errors="coerce")
+            if _append_nav_point(conn, code, new_date, float(nav),
+                                 None if pd.isna(acc) else float(acc),
+                                 None if pd.isna(ret) else float(ret)):
+                appended += 1
+                continue
+        gapped.append(code)                    # real gap → ranged fetch
     conn.commit()
     conn.close()
-    return {"updated": updated, "skipped": skipped, "gapped": gapped}
+
+    patched = 0
+    if gapped:
+        patched = _backfill_incremental(
+            gapped, MAX_WORKERS, lambda d, t: _p("增量补缺口", d, t)
+        )
+
+    return {"appended": appended, "patched": patched, "skipped": skipped,
+            "gap_codes": len(gapped), "failed": len(gapped) - patched}
 
 
 def recompute_all(rf: Optional[float] = None,
@@ -556,14 +821,13 @@ def recompute_all(rf: Optional[float] = None,
     if rf is None:
         rf = get_risk_free_rate()
     conn = _conn()
-    codes = [r["code"] for r in conn.execute("SELECT code FROM fund_nav").fetchall()]
+    codes = [r["code"] for r in conn.execute("SELECT code FROM fund_nav_meta").fetchall()]
     total, done, saved = len(codes), 0, 0
     for code in codes:
-        row = conn.execute("SELECT data FROM fund_nav WHERE code=?", (code,)).fetchone()
         done += 1
         try:
-            nav_df = _nav_from_json(row["data"]) if row else None
-            m = _metrics_from_nav(nav_df, rf) if nav_df is not None and not nav_df.empty else None
+            nav_df = _load_nav_df(code, conn)
+            m = _metrics_from_nav(nav_df, rf) if not nav_df.empty else None
         except Exception as e:
             logger.debug("recompute parse error %s: %s", code, e)
             m = None
@@ -583,6 +847,40 @@ def recompute_all(rf: Optional[float] = None,
     conn.commit()
     conn.close()
     return saved
+
+
+def compute_metrics_asof(asof: str, rf: Optional[float] = None,
+                         progress_callback: Optional[Callable] = None) -> dict:
+    """Every fund's metrics as they stood on a past date, from stored NAV only.
+
+    Truncates each fund's history to rows on/before `asof` (ISO yyyy-mm-dd) and
+    recomputes period returns, Sharpe and drawdown over the same trailing
+    windows — no network, nothing persisted. Funds with under 20 NAV points by
+    that date are omitted. Returns {code: metrics-dict}.
+    """
+    if rf is None:
+        rf = get_risk_free_rate()
+    conn = _conn()
+    codes = [r["code"] for r in conn.execute("SELECT code FROM fund_nav_meta")]
+    out, total = {}, len(codes)
+    for i, code in enumerate(codes):
+        df = pd.read_sql_query(
+            "SELECT date, nav, daily_ret_pct, acc_nav FROM fund_nav_daily "
+            "WHERE code = ? AND date <= ? ORDER BY date",
+            conn, params=(code, asof))
+        if len(df) >= 20:
+            df["date"] = pd.to_datetime(df["date"])
+            try:
+                m = _metrics_from_nav(df, rf)
+            except Exception as e:
+                logger.debug("asof metrics failed %s: %s", code, e)
+                m = None
+            if m is not None:
+                out[code] = m
+        if progress_callback and ((i + 1) % 500 == 0 or i + 1 == total):
+            progress_callback(i + 1, total)
+    conn.close()
+    return out
 
 
 def load_all_precomputed() -> dict:
@@ -631,8 +929,9 @@ def _backfill_codes(codes: list, workers: int = MAX_WORKERS,
 def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
                  rf: Optional[float] = None, workers: int = MAX_WORKERS) -> dict:
     """Full daily pipeline shared by the CLI script and the in-app button:
-    ① refresh fund list → ② backfill funds missing history → ③ append today's
-    NAV point → ④ recompute Sharpe/drawdown for all.
+    ① refresh fund list → ② backfill funds missing history → ③ append the
+    list's latest NAV point / range-fetch bigger gaps → ④ recompute
+    Sharpe/drawdown for all.
 
     `rf` defaults to the auto-fetched (monthly-cached) risk-free rate.
     `progress(phase, done, total)` is invoked throughout for a UI bar / logging.
@@ -652,23 +951,22 @@ def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
 
     backfilled = 0
     if do_backfill:
-        todo = [c for c in all_codes if c not in list_nav_codes()]
+        have = list_nav_codes()
+        todo = [c for c in all_codes if c not in have]
         backfilled = _backfill_codes(
             todo, workers, lambda d, t: _p("回填缺失历史", d, t)
         )
 
-    _p("追加当日净值", 0, 1)
-    res = append_latest_nav(list_df)
-    _p("追加当日净值", 1, 1)
-    if res["gapped"]:
-        _backfill_codes(res["gapped"], workers, lambda d, t: _p("补净值缺口", d, t))
+    res = append_incremental(list_df, progress=_p)
 
     saved = recompute_all(rf=rf, progress_callback=lambda d, t: _p("重算指标", d, t))
 
     return {
         "funds": len(all_codes),
         "backfilled": backfilled,
-        "appended": res["updated"],
+        "appended": res["appended"],
+        "patched": res["patched"],
+        "failed": res["failed"],
         "recomputed": saved,
         "rf": rf,
     }

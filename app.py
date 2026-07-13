@@ -1,5 +1,6 @@
 """Fund Analyzer — Streamlit dashboard."""
 
+import datetime as dt
 import time
 import numpy as np
 import pandas as pd
@@ -59,15 +60,16 @@ if update_btn:
         frac = (done / total) if total else 1.0
         _bar.progress(frac, text=f"{phase}… {done}/{total}")
 
-    with st.spinner("正在更新数据（增量下载当日净值 + 全量重算）…"):
+    with st.spinner("正在更新数据（增量补净值 + 重算指标）…"):
         summary = fetcher.run_pipeline(progress=_on_progress, rf=rf_rate)
     load_fund_list.clear()
     st.session_state.sharpe_results = fetcher.load_all_precomputed()
     _bar.progress(1.0, text="完成")
     st.success(
         f"更新完成 · 基金 {summary['funds']:,} · 回填 {summary['backfilled']} · "
-        f"追加 {summary['appended']:,} · 重算 {summary['recomputed']:,} · "
-        f"无风险利率 {summary['rf']*100:.2f}%"
+        f"当日追加 {summary['appended']:,} · 补缺口 {summary['patched']:,}"
+        + (f"（失败 {summary['failed']:,}）" if summary["failed"] else "")
+        + f" · 重算 {summary['recomputed']:,} · 无风险利率 {summary['rf']*100:.2f}%"
     )
 
 # Recompute-only: rf only feeds the Sharpe formula, so changing it needs no new
@@ -109,7 +111,7 @@ for _c in ("ret_1m", "ret_3m", "ret_6m", "ret_1y"):
         fund_df[_c] = pd.to_numeric(fund_df[_c], errors="coerce")
 
 all_types = sorted(fund_df["type"].dropna().unique().tolist()) if "type" in fund_df.columns else []
-col_f1, col_f2, col_f3, col_f4 = st.columns([3, 1, 1, 1])
+col_f1, col_f2, col_f3, col_f4, col_f5 = st.columns([3, 1, 1, 1, 1.2])
 with col_f1:
     selected_types = st.multiselect(
         "基金类型筛选（不选则显示全部）",
@@ -125,10 +127,45 @@ with col_f4:
     max_dd = st.number_input(
         f"{period_label}最大回撤率 %", value=15.0, min_value=0.0, step=1.0,
     )
+with col_f5:
+    asof_date = st.date_input(
+        "截至日期（不选=今天）",
+        value=None,
+        min_value=dt.date(2026, 1, 1),
+        max_value=dt.date.today(),
+        help="按该日及之前的净值历史重算收益/回撤/夏普，还原当天的筛选结果。"
+             "本地净值从 2025-01-01 起，因此最早可选 2026-01-01，"
+             "保证近1年窗口有完整数据。",
+    )
 
 ret_col, mdd_col, sharpe_col = PERIODS[period_label]
 
-filtered = fund_df.copy()
+# ── As-of snapshot mode ───────────────────────────────────────────────────────
+# A past 截至日期 swaps the live rank-list returns and precomputed metrics for
+# ones recomputed from stored NAV truncated to that date, so the filters below
+# reproduce what the screen would have shown back then. Cached per (date, rf).
+asof_mode = asof_date is not None and asof_date < dt.date.today()
+
+
+@st.cache_data(ttl=86400, show_spinner="正在按所选日期重算全市场指标（首次约1分钟）…")
+def load_asof_metrics(asof_iso: str, rf: float) -> dict:
+    return fetcher.compute_metrics_asof(asof_iso, rf)
+
+
+if asof_mode:
+    _asof_iso = asof_date.strftime("%Y-%m-%d")
+    _asof_metrics = load_asof_metrics(_asof_iso, rf_rate)
+    _mdf = pd.DataFrame.from_dict(_asof_metrics, orient="index") \
+        .reset_index().rename(columns={"index": "code"})
+    work_df = fund_df[["code", "name", "type"]].merge(_mdf, on="code", how="inner")
+    st.caption(
+        f"📅 快照模式：按 {_asof_iso} 及之前的净值计算收益/夏普/回撤"
+        f"（覆盖 {len(work_df):,} 只基金）"
+    )
+else:
+    work_df = fund_df
+
+filtered = work_df.copy()
 if selected_types:
     filtered = filtered[filtered["type"].isin(selected_types)]
 if ret_col in filtered.columns:
@@ -142,20 +179,22 @@ if ret_col in filtered.columns:
 if "sharpe_results" not in st.session_state:
     st.session_state.sharpe_results = fetcher.load_all_precomputed()
 
-_last_update = fetcher.last_update_time()
-if _last_update:
-    _age_h = (time.time() - _last_update) / 3600
-    _fresh = "🟢" if _age_h < 30 else "🟠"
-    st.caption(
-        f"{_fresh} 指标数据更新于 {time.strftime('%Y-%m-%d %H:%M', time.localtime(_last_update))}"
-        f"（{_age_h:.0f} 小时前）"
-    )
-else:
-    st.caption("⚠️ 还没有指标数据。请点击「🔄 更新数据（增量+重算）」，或运行 `python3 update_daily.py`。")
+if not asof_mode:
+    _last_update = fetcher.last_update_time()
+    if _last_update:
+        _age_h = (time.time() - _last_update) / 3600
+        _fresh = "🟢" if _age_h < 30 else "🟠"
+        st.caption(
+            f"{_fresh} 指标数据更新于 {time.strftime('%Y-%m-%d %H:%M', time.localtime(_last_update))}"
+            f"（{_age_h:.0f} 小时前）"
+        )
+    else:
+        st.caption("⚠️ 还没有指标数据。请点击「🔄 更新数据（增量+重算）」，或运行 `python3 update_daily.py`。")
 
 # ── Merge Sharpe/drawdown into display table ─────────────────────────────────
+# (In as-of mode work_df already carries the snapshot metrics columns.)
 display = filtered.copy()
-if st.session_state.sharpe_results:
+if not asof_mode and st.session_state.sharpe_results:
     sharpe_df = pd.DataFrame.from_dict(
         st.session_state.sharpe_results, orient="index"
     ).reset_index().rename(columns={"index": "code"})
@@ -241,7 +280,7 @@ with tab_detail:
                     nav_df,
                     x="date",
                     y="nav",
-                    title="近一年单位净值走势",
+                    title=f"单位净值走势（{fetcher.NAV_START} 至今）",
                     labels={"date": "日期", "nav": "单位净值"},
                     height=380,
                 )
