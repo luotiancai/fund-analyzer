@@ -253,6 +253,22 @@ def sell(code: str, shares: Optional[float] = None) -> Optional[str]:
 
 # ── Reporting ────────────────────────────────────────────────────────────────
 
+def nav_series(code: str, start: str, end: str) -> pd.DataFrame:
+    """NAV + daily-return history for one fund within [start, end] (ascending).
+
+    Columns: date, nav, daily_ret_pct. `end` should be the current simulated
+    date so charts never show the future to the strategy being tested.
+    """
+    conn = fetcher._conn()
+    df = pd.read_sql_query(
+        "SELECT date, nav, daily_ret_pct FROM fund_nav_daily "
+        "WHERE code = ? AND date >= ? AND date <= ? AND nav IS NOT NULL "
+        "ORDER BY date", conn, params=(code, start, end))
+    conn.close()
+    return df
+
+
+
 def holdings_table(asof: str) -> pd.DataFrame:
     """Current positions valued as of `asof`: one row per held fund."""
     pos, _ = holdings_and_cash(asof)

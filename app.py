@@ -508,24 +508,41 @@ with tab_sim:
                 "盈亏(%)": hold["pnl_pct"].round(2),
             }).reset_index(drop=True), use_container_width=True)
 
-        # ── Equity curve ──
-        if len(curve) > 1:
-            fig_eq = px.line(
-                curve, x="date", y="value", title="资金曲线",
-                labels={"date": "日期", "value": "总资产（元）"}, height=320,
-            )
-            fig_eq.update_traces(
-                line=dict(width=2, color="#4269D0"),
-                hovertemplate="%{x}<br>总资产 ¥%{y:,.0f}<extra></extra>",
-            )
-            fig_eq.add_hline(
-                y=simulator.INITIAL_CAPITAL, line_dash="dot",
-                line_color="gray", opacity=0.5,
-            )
-            st.plotly_chart(fig_eq, use_container_width=True)
+        trades = simulator.trades_table(sim_date)
+
+        # ── Held-fund daily-return chart (always shown, one line per holding) ──
+        # History only up to the simulated date — no peeking at the future.
+        if not hold.empty:
+            _frames = []
+            for _c in hold["code"]:
+                _s = simulator.nav_series(_c, simulator.SIM_START, sim_date)
+                _s = _s.dropna(subset=["daily_ret_pct"])
+                if not _s.empty:
+                    _frames.append(
+                        _s.assign(fund=f"{_c} {_code_names.get(_c, '')}"))
+            if _frames:
+                _rets = pd.concat(_frames, ignore_index=True)
+                fig_ret = px.line(
+                    _rets, x="date", y="daily_ret_pct", color="fund",
+                    title=f"持仓基金每日收益率（{simulator.SIM_START} → {sim_date}）",
+                    labels={"date": "日期", "daily_ret_pct": "每日收益率（%）",
+                            "fund": "基金"},
+                    height=380,
+                    color_discrete_sequence=[
+                        "#4269D0", "#EFB118", "#FF725C", "#6CC5B0",
+                        "#3CA951", "#FF8AB7", "#A463F2", "#97BBF5",
+                    ],
+                )
+                fig_ret.update_traces(
+                    line=dict(width=2),
+                    hovertemplate="%{y:+.2f}%<extra>%{fullData.name}</extra>",
+                )
+                fig_ret.add_hline(
+                    y=0, line_dash="dot", line_color="gray", opacity=0.5)
+                fig_ret.update_layout(hovermode="x unified")
+                st.plotly_chart(fig_ret, use_container_width=True)
 
         # ── Trade log ──
-        trades = simulator.trades_table(sim_date)
         with st.expander(f"📜 交易记录（{len(trades)} 笔）"):
             if trades.empty:
                 st.caption("还没有交易。")
