@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import fetcher
+import simulator
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -23,6 +24,7 @@ st.set_page_config(
 @st.cache_resource
 def _init_db_once():
     fetcher.init_db()
+    simulator.init_sim_db()
     return True
 
 
@@ -282,7 +284,7 @@ if filter_ready:
         st.caption("⚠️ 暂无回撤数据。请点击「🔄 更新数据（增量+重算）」生成。")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_table, tab_detail = st.tabs(["📋 基金列表", "🔍 基金详情"])
+tab_table, tab_detail, tab_sim = st.tabs(["📋 基金列表", "🔍 基金详情", "💰 模拟盘"])
 
 # ─── Tab 1: Table ────────────────────────────────────────────────────────────
 with tab_table:
@@ -389,3 +391,151 @@ with tab_detail:
                 use_container_width=True,
                 height=560,
             )
+
+# ─── Tab 3: Paper-trading simulator ──────────────────────────────────────────
+with tab_sim:
+    _code_names = dict(zip(fund_df["code"], fund_df["name"]))
+    sim_date = simulator.get_current_date()
+
+    if sim_date is None:
+        st.warning("本地还没有净值数据，请先点击侧边栏「🔄 更新数据」。")
+    else:
+        st.caption(
+            f"从 {simulator.SIM_START} 开始 · 初始资金 ¥{simulator.INITIAL_CAPITAL:,.0f} · "
+            "按当日单位净值成交，不计手续费 · 回退一天会撤销当天的全部买卖"
+        )
+
+        # Flash message from the previous action (survives st.rerun).
+        _msg = st.session_state.pop("sim_msg", None)
+        if _msg:
+            st.success(_msg)
+
+        # ── Day controls — processed before anything below renders ──
+        c1, c2, _sp, c4 = st.columns([1.2, 1.2, 3.6, 1])
+        if c1.button("▶️ 推进一天", type="primary"):
+            sim_date, _moved = simulator.advance_day()
+            if not _moved:
+                st.toast("已到本地数据的最新日期，无法再推进", icon="⚠️")
+        if c2.button("◀️ 回退一天", help="回到上一个交易日，并撤销当前这天的全部买卖"):
+            sim_date, _moved = simulator.rollback_day()
+            if not _moved:
+                st.toast("已在第一个交易日，无法回退", icon="⚠️")
+        with c4.popover("🗑️ 重置"):
+            st.caption("清空全部模拟交易，回到起点重新开始。")
+            if st.button("确认重置", type="primary", key="sim_reset_confirm"):
+                simulator.reset()
+                st.session_state["sim_msg"] = "模拟盘已重置"
+                st.rerun()
+
+        # ── Valuation ──
+        pos, cash = simulator.holdings_and_cash(sim_date)
+        curve = simulator.equity_curve()
+        total = float(curve["value"].iloc[-1]) if not curve.empty \
+            else simulator.INITIAL_CAPITAL
+        prev_total = float(curve["value"].iloc[-2]) if len(curve) > 1 \
+            else simulator.INITIAL_CAPITAL
+        day_pnl = total - prev_total
+        total_pnl = total - simulator.INITIAL_CAPITAL
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("模拟日期", sim_date)
+        m2.metric("总资产", f"¥{total:,.0f}", delta=f"{day_pnl:+,.0f} 当日")
+        m3.metric("现金", f"¥{cash:,.0f}")
+        m4.metric("总收益", f"¥{total_pnl:+,.0f}")
+        m5.metric("总收益率", f"{total_pnl / simulator.INITIAL_CAPITAL * 100:+.2f}%")
+
+        # ── Trading forms ──
+        st.markdown("---")
+        f_buy, f_sell = st.columns(2)
+        with f_buy, st.form("sim_buy", clear_on_submit=True):
+            st.markdown("**🛒 买入**")
+            buy_code = st.text_input("基金代码", placeholder="6位代码，如 000001")
+            buy_amt = st.number_input(
+                "金额（元）", min_value=0.0, value=100000.0, step=10000.0)
+            if st.form_submit_button("按当日净值买入"):
+                if not buy_code.strip():
+                    st.error("请输入基金代码")
+                else:
+                    _code = buy_code.strip().zfill(6)
+                    _err = simulator.buy(_code, buy_amt)
+                    if _err:
+                        st.error(_err)
+                    else:
+                        st.session_state["sim_msg"] = (
+                            f"已买入 {_code} {_code_names.get(_code, '')} "
+                            f"¥{buy_amt:,.0f}")
+                        st.rerun()
+        with f_sell, st.form("sim_sell", clear_on_submit=True):
+            st.markdown("**📤 卖出**")
+            _held = list(pos.keys())
+            sell_pick = st.selectbox(
+                "持仓基金", options=_held,
+                format_func=lambda c: (
+                    f"{c} {_code_names.get(c, '')}（持有 {pos[c][0]:,.2f} 份）"),
+            ) if _held else st.selectbox("持仓基金", options=["（暂无持仓）"])
+            sell_all = st.checkbox("全部卖出", value=True)
+            sell_shares = st.number_input(
+                "卖出份额（未勾选「全部卖出」时生效）",
+                min_value=0.0, value=0.0, step=1000.0)
+            if st.form_submit_button("按当日净值卖出"):
+                if not _held:
+                    st.error("当前没有持仓")
+                else:
+                    _err = simulator.sell(
+                        sell_pick, None if sell_all else sell_shares)
+                    if _err:
+                        st.error(_err)
+                    else:
+                        st.session_state["sim_msg"] = (
+                            f"已卖出 {sell_pick} {_code_names.get(sell_pick, '')}")
+                        st.rerun()
+
+        # ── Holdings ──
+        hold = simulator.holdings_table(sim_date)
+        st.markdown(f"#### 📦 当前持仓（{len(hold)} 只）")
+        if hold.empty:
+            st.info("暂无持仓，全部为现金。")
+        else:
+            st.dataframe(pd.DataFrame({
+                "代码": hold["code"],
+                "名称": hold["code"].map(_code_names),
+                "份额": hold["shares"].round(2),
+                "成本(¥)": hold["cost"].round(2),
+                "最新净值": hold["nav"],
+                "净值日期": hold["nav_date"],
+                "市值(¥)": hold["value"].round(2),
+                "盈亏(¥)": hold["pnl"].round(2),
+                "盈亏(%)": hold["pnl_pct"].round(2),
+            }).reset_index(drop=True), use_container_width=True)
+
+        # ── Equity curve ──
+        if len(curve) > 1:
+            fig_eq = px.line(
+                curve, x="date", y="value", title="资金曲线",
+                labels={"date": "日期", "value": "总资产（元）"}, height=320,
+            )
+            fig_eq.update_traces(
+                line=dict(width=2, color="#4269D0"),
+                hovertemplate="%{x}<br>总资产 ¥%{y:,.0f}<extra></extra>",
+            )
+            fig_eq.add_hline(
+                y=simulator.INITIAL_CAPITAL, line_dash="dot",
+                line_color="gray", opacity=0.5,
+            )
+            st.plotly_chart(fig_eq, use_container_width=True)
+
+        # ── Trade log ──
+        trades = simulator.trades_table(sim_date)
+        with st.expander(f"📜 交易记录（{len(trades)} 笔）"):
+            if trades.empty:
+                st.caption("还没有交易。")
+            else:
+                st.dataframe(pd.DataFrame({
+                    "日期": trades["date"],
+                    "操作": trades["action"].map({"buy": "买入", "sell": "卖出"}),
+                    "代码": trades["code"],
+                    "名称": trades["code"].map(_code_names),
+                    "份额": trades["shares"].round(2),
+                    "成交净值": trades["nav"],
+                    "金额(¥)": trades["amount"].round(2),
+                }).iloc[::-1].reset_index(drop=True), use_container_width=True)
