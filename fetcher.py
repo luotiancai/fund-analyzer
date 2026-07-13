@@ -1,5 +1,6 @@
 """AKShare data fetching with SQLite caching."""
 
+import io
 import os
 import sqlite3
 import json
@@ -121,6 +122,15 @@ def init_db():
             saved_at REAL NOT NULL,
             PRIMARY KEY (code, year)
         ) WITHOUT ROWID;
+        -- Top-100 rows of each distinct filter run, keyed by a hash of the
+        -- filter params (+ metrics version in live mode), so repeating a
+        -- filter is a read instead of a recompute — across restarts too.
+        CREATE TABLE IF NOT EXISTS filter_results (
+            key      TEXT PRIMARY KEY,
+            params   TEXT NOT NULL,
+            data     TEXT NOT NULL,
+            saved_at REAL NOT NULL
+        );
     """)
     # Add per-period max-drawdown and Sharpe columns (migration for existing DBs).
     for col in ("mdd_1m", "mdd_3m", "mdd_6m", "mdd_1y", "sharpe_6m", "sharpe_1y"):
@@ -625,6 +635,41 @@ def compute_sharpe_for_fund(code: str, rf: float = RISK_FREE_RATE) -> Optional[d
     if m is not None:
         _save_metrics(code, m)
     return m
+
+
+# ── Persistent filter-result cache ───────────────────────────────────────────
+
+def save_filter_result(key: str, meta: dict, df: pd.DataFrame):
+    """Store one filter run's top rows + its params/total under `key`."""
+    conn = _conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO filter_results (key, params, data, saved_at) "
+        "VALUES (?, ?, ?, ?)",
+        (key, json.dumps(meta, ensure_ascii=False),
+         df.to_json(orient="split", force_ascii=False), time.time()))
+    # Keep the table bounded: only the 200 most recent filter runs survive.
+    conn.execute(
+        "DELETE FROM filter_results WHERE key NOT IN "
+        "(SELECT key FROM filter_results ORDER BY saved_at DESC LIMIT 200)")
+    conn.commit()
+    conn.close()
+
+
+def load_filter_result(key: str):
+    """(df, meta, saved_at) for a stored filter run, or None.
+
+    dtype inference is disabled on read so fund codes keep leading zeros.
+    """
+    conn = _conn()
+    row = conn.execute(
+        "SELECT params, data, saved_at FROM filter_results WHERE key = ?",
+        (key,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    df = pd.read_json(io.StringIO(row["data"]), orient="split",
+                      dtype=False, convert_dates=False)
+    return df, json.loads(row["params"]), row["saved_at"]
 
 
 # ── Quarterly top holdings ───────────────────────────────────────────────────

@@ -1,6 +1,8 @@
 """Fund Analyzer — Streamlit dashboard."""
 
 import datetime as dt
+import hashlib
+import json
 import time
 import numpy as np
 import pandas as pd
@@ -204,9 +206,32 @@ if not (filter_ready and asof_mode):
         st.caption("⚠️ 还没有指标数据。请点击「🔄 更新数据（增量+重算）」，或运行 `python3 update_daily.py`。")
 
 display = None
+table = None
+_hit = None
 if filter_ready:
+    # Persistent result cache: the top-100 rows of every distinct filter run
+    # are stored in SQLite, so repeating one (even after a restart — notably
+    # the ~1min as-of snapshots) is a single read instead of a recompute.
+    # Live-mode keys embed the metrics version, so a daily data update
+    # naturally starts a fresh entry; as-of snapshots are immutable history.
+    _asof_iso = asof_date.strftime("%Y-%m-%d") if asof_mode else None
+    _fparams = {
+        "types": sorted(selected_types), "period": period_label,
+        "min_ret": min_ret, "max_dd": max_dd, "asof": _asof_iso,
+        "data_ver": None if asof_mode else fetcher.last_update_time(),
+    }
+    _fkey = hashlib.md5(json.dumps(
+        _fparams, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    _hit = fetcher.load_filter_result(_fkey)
+    if _hit is not None:
+        table, _fmeta, _fsaved = _hit
+        st.caption(
+            f"⚡ 本次筛选命中缓存（{time.strftime('%Y-%m-%d %H:%M', time.localtime(_fsaved))} 计算）"
+            f" · 共 {_fmeta.get('total', 0):,} 条匹配，显示前 {len(table)} 条"
+        )
+
+if filter_ready and _hit is None:
     if asof_mode:
-        _asof_iso = asof_date.strftime("%Y-%m-%d")
         _cache = _asof_cache()
         _key = (_asof_iso, round(rf_rate, 6))
         if _key not in _cache:
@@ -279,7 +304,12 @@ if filter_ready:
             table = table.sort_values(default_sort, ascending=False, na_position="last")
         table = table.reset_index(drop=True)
 
-    st.caption(f"共 {len(display):,} 只基金（总量 {len(fund_df):,}）")
+    _total = len(table)
+    table = table.head(100).reset_index(drop=True)
+    fetcher.save_filter_result(_fkey, {**_fparams, "total": _total}, table)
+    st.caption(
+        f"共 {_total:,} 条匹配（基金总量 {len(fund_df):,}）· 显示并缓存前 {len(table)} 条"
+    )
     if max_dd < 100 and mdd_col not in display.columns:
         st.caption("⚠️ 暂无回撤数据。请点击「🔄 更新数据（增量+重算）」生成。")
 
@@ -288,7 +318,7 @@ tab_table, tab_detail, tab_sim = st.tabs(["📋 基金列表", "🔍 基金详�
 
 # ─── Tab 1: Table ────────────────────────────────────────────────────────────
 with tab_table:
-    if display is None:
+    if table is None:
         st.info("👆 设置筛选条件后，点击「🔍 开始筛选」生成基金列表。")
     else:
         st.caption("点击表头可排序")
@@ -444,115 +474,130 @@ with tab_sim:
         m4.metric("总收益", f"¥{total_pnl:+,.0f}")
         m5.metric("总收益率", f"{total_pnl / simulator.INITIAL_CAPITAL * 100:+.2f}%")
 
-        # ── Trading forms ──
         st.markdown("---")
-        f_buy, f_sell = st.columns(2)
-        with f_buy, st.form("sim_buy", clear_on_submit=True):
-            st.markdown("**🛒 买入**")
-            buy_code = st.text_input("基金代码", placeholder="6位代码，如 000001")
-            buy_amt = st.number_input(
-                "金额（元）", min_value=0.0, value=100000.0, step=10000.0)
-            if st.form_submit_button("按当日净值买入"):
-                if not buy_code.strip():
-                    st.error("请输入基金代码")
-                else:
-                    _code = buy_code.strip().zfill(6)
-                    _err = simulator.buy(_code, buy_amt)
-                    if _err:
-                        st.error(_err)
-                    else:
-                        st.session_state["sim_msg"] = (
-                            f"已买入 {_code} {_code_names.get(_code, '')} "
-                            f"¥{buy_amt:,.0f}")
-                        st.rerun()
-        with f_sell, st.form("sim_sell", clear_on_submit=True):
-            st.markdown("**📤 卖出**")
-            _held = list(pos.keys())
-            sell_pick = st.selectbox(
-                "持仓基金", options=_held,
-                format_func=lambda c: (
-                    f"{c} {_code_names.get(c, '')}（持有 {pos[c][0]:,.2f} 份）"),
-            ) if _held else st.selectbox("持仓基金", options=["（暂无持仓）"])
-            sell_all = st.checkbox("全部卖出", value=True)
-            sell_shares = st.number_input(
-                "卖出份额（未勾选「全部卖出」时生效）",
-                min_value=0.0, value=0.0, step=1000.0)
-            if st.form_submit_button("按当日净值卖出"):
-                if not _held:
-                    st.error("当前没有持仓")
-                else:
-                    _err = simulator.sell(
-                        sell_pick, None if sell_all else sell_shares)
-                    if _err:
-                        st.error(_err)
-                    else:
-                        st.session_state["sim_msg"] = (
-                            f"已卖出 {sell_pick} {_code_names.get(sell_pick, '')}")
-                        st.rerun()
-
-        # ── Holdings ──
         hold = simulator.holdings_table(sim_date)
-        st.markdown(f"#### 📦 当前持仓（{len(hold)} 只）")
-        if hold.empty:
-            st.info("暂无持仓，全部为现金。")
-        else:
-            st.dataframe(pd.DataFrame({
-                "代码": hold["code"],
-                "名称": hold["code"].map(_code_names),
-                "份额": hold["shares"].round(2),
-                "成本(¥)": hold["cost"].round(2),
-                "最新净值": hold["nav"],
-                "净值日期": hold["nav_date"],
-                "市值(¥)": hold["value"].round(2),
-                "盈亏(¥)": hold["pnl"].round(2),
-                "盈亏(%)": hold["pnl_pct"].round(2),
-            }).reset_index(drop=True), use_container_width=True)
-
         trades = simulator.trades_table(sim_date)
 
-        # ── Held-fund daily-return chart (always shown, one line per holding) ──
-        # History only up to the simulated date — no peeking at the future.
-        if not hold.empty:
-            _frames = []
-            for _c in hold["code"]:
-                _s = simulator.nav_series(_c, simulator.SIM_START, sim_date)
-                _s = _s.dropna(subset=["daily_ret_pct"])
-                if not _s.empty:
-                    _frames.append(
-                        _s.assign(fund=f"{_c} {_code_names.get(_c, '')}"))
-            if _frames:
-                _rets = pd.concat(_frames, ignore_index=True)
-                fig_ret = px.line(
-                    _rets, x="date", y="daily_ret_pct", color="fund",
-                    title=f"持仓基金每日收益率（{simulator.SIM_START} → {sim_date}）",
-                    labels={"date": "日期", "daily_ret_pct": "每日收益率（%）",
-                            "fund": "基金"},
-                    height=380,
-                    color_discrete_sequence=[
-                        "#4269D0", "#EFB118", "#FF725C", "#6CC5B0",
-                        "#3CA951", "#FF8AB7", "#A463F2", "#97BBF5",
-                    ],
-                )
-                fig_ret.update_traces(
-                    line=dict(width=2),
-                    hovertemplate="%{y:+.2f}%<extra>%{fullData.name}</extra>",
-                )
-                fig_ret.add_hline(
-                    y=0, line_dash="dot", line_color="gray", opacity=0.5)
-                fig_ret.update_layout(hovermode="x unified")
-                st.plotly_chart(fig_ret, use_container_width=True)
+        # Left: chart → holdings → trade log. Right: compact buy/sell panel.
+        col_main, col_trade = st.columns([2.8, 1], gap="medium")
 
-        # ── Trade log ──
-        with st.expander(f"📜 交易记录（{len(trades)} 笔）"):
-            if trades.empty:
-                st.caption("还没有交易。")
+        with col_trade:
+            with st.form("sim_buy", clear_on_submit=True):
+                st.markdown("**🛒 买入**")
+                buy_code = st.text_input("基金代码", placeholder="如 000001")
+                buy_amt = st.number_input(
+                    "金额（元）", min_value=0.0, value=100000.0, step=10000.0)
+                if st.form_submit_button("买入", use_container_width=True):
+                    if not buy_code.strip():
+                        st.error("请输入基金代码")
+                    else:
+                        _code = buy_code.strip().zfill(6)
+                        _err = simulator.buy(_code, buy_amt)
+                        if _err:
+                            st.error(_err)
+                        else:
+                            st.session_state["sim_msg"] = (
+                                f"已买入 {_code} {_code_names.get(_code, '')} "
+                                f"¥{buy_amt:,.0f}")
+                            st.rerun()
+            with st.form("sim_sell", clear_on_submit=True):
+                st.markdown("**📤 卖出**")
+                _held = list(pos.keys())
+                sell_pick = st.selectbox(
+                    "持仓基金", options=_held,
+                    format_func=lambda c: (
+                        f"{c} {_code_names.get(c, '')}"
+                        f"（{pos[c][0]:,.2f} 份）"),
+                ) if _held else st.selectbox("持仓基金", options=["（暂无持仓）"])
+                sell_all = st.checkbox("全部卖出", value=True)
+                sell_shares = st.number_input(
+                    "卖出份额（未勾选全部时生效）",
+                    min_value=0.0, value=0.0, step=1000.0)
+                if st.form_submit_button("卖出", use_container_width=True):
+                    if not _held:
+                        st.error("当前没有持仓")
+                    else:
+                        _err = simulator.sell(
+                            sell_pick, None if sell_all else sell_shares)
+                        if _err:
+                            st.error(_err)
+                        else:
+                            st.session_state["sim_msg"] = (
+                                f"已卖出 {sell_pick} "
+                                f"{_code_names.get(sell_pick, '')}")
+                            st.rerun()
+            st.caption("按当日单位净值成交")
+
+        with col_main:
+            # ── Held-fund cumulative-return chart (one line per holding) ──
+            # Each line starts at that position's entry day at 0% and compounds
+            # the fund's NAV relative to the entry NAV. History stops at the
+            # simulated date — no peeking at the future.
+            if not hold.empty:
+                _frames = []
+                for _, _h in hold.iterrows():
+                    _c = _h["code"]
+                    if not _h["open_nav"]:
+                        continue
+                    _s = simulator.nav_series(_c, _h["open_date"], sim_date)
+                    if _s.empty:
+                        continue
+                    _frames.append(_s.assign(
+                        cum_ret=(_s["nav"] / _h["open_nav"] - 1.0) * 100.0,
+                        fund=f"{_c} {_code_names.get(_c, '')}",
+                    ))
+                if _frames:
+                    _rets = pd.concat(_frames, ignore_index=True)
+                    fig_ret = px.line(
+                        _rets, x="date", y="cum_ret", color="fund",
+                        title=f"持仓基金累计收益率（自各自买入日起，截至 {sim_date}）",
+                        labels={"date": "日期", "cum_ret": "累计收益率（%）",
+                                "fund": "基金"},
+                        height=380,
+                        color_discrete_sequence=[
+                            "#4269D0", "#EFB118", "#FF725C", "#6CC5B0",
+                            "#3CA951", "#FF8AB7", "#A463F2", "#97BBF5",
+                        ],
+                    )
+                    fig_ret.update_traces(
+                        line=dict(width=2),
+                        hovertemplate="%{y:+.2f}%<extra>%{fullData.name}</extra>",
+                    )
+                    fig_ret.add_hline(
+                        y=0, line_dash="dot", line_color="gray", opacity=0.5)
+                    fig_ret.update_layout(hovermode="x unified")
+                    st.plotly_chart(fig_ret, use_container_width=True)
+
+            # ── Holdings ──
+            st.markdown(f"#### 📦 当前持仓（{len(hold)} 只）")
+            if hold.empty:
+                st.info("暂无持仓，全部为现金。")
             else:
                 st.dataframe(pd.DataFrame({
-                    "日期": trades["date"],
-                    "操作": trades["action"].map({"buy": "买入", "sell": "卖出"}),
-                    "代码": trades["code"],
-                    "名称": trades["code"].map(_code_names),
-                    "份额": trades["shares"].round(2),
-                    "成交净值": trades["nav"],
-                    "金额(¥)": trades["amount"].round(2),
-                }).iloc[::-1].reset_index(drop=True), use_container_width=True)
+                    "代码": hold["code"],
+                    "名称": hold["code"].map(_code_names),
+                    "成本(¥)": hold["cost"].round(2),
+                    "当日收益率(%)": pd.to_numeric(
+                        hold["day_ret"], errors="coerce").round(2),
+                    "净值日期": hold["nav_date"],
+                    "市值(¥)": hold["value"].round(2),
+                    "盈亏(¥)": hold["pnl"].round(2),
+                    "盈亏(%)": hold["pnl_pct"].round(2),
+                }).reset_index(drop=True), use_container_width=True)
+
+            # ── Trade log ──
+            with st.expander(f"📜 交易记录（{len(trades)} 笔）"):
+                if trades.empty:
+                    st.caption("还没有交易。")
+                else:
+                    st.dataframe(pd.DataFrame({
+                        "日期": trades["date"],
+                        "操作": trades["action"].map(
+                            {"buy": "买入", "sell": "卖出"}),
+                        "代码": trades["code"],
+                        "名称": trades["code"].map(_code_names),
+                        "份额": trades["shares"].round(2),
+                        "成交净值": trades["nav"],
+                        "金额(¥)": trades["amount"].round(2),
+                    }).iloc[::-1].reset_index(drop=True),
+                        use_container_width=True)

@@ -168,13 +168,18 @@ def _load_trades(upto: str) -> list:
 
 
 def _replay(trades) -> Tuple[dict, float]:
-    """Replay trades → ({code: [shares, cost]}, cash). Average-cost basis."""
+    """Replay trades → ({code: [shares, cost, open_date, open_nav]}, cash).
+
+    Average-cost basis. open_date/open_nav are from the trade that opened the
+    current position (a full exit clears them; re-buying starts a new lot),
+    so charts can show 累计收益率 since the actual entry point.
+    """
     cash = INITIAL_CAPITAL
     pos: dict = {}
     for t in trades:
         if t["action"] == "buy":
             cash -= t["amount"]
-            p = pos.setdefault(t["code"], [0.0, 0.0])
+            p = pos.setdefault(t["code"], [0.0, 0.0, t["date"], t["nav"]])
             p[0] += t["shares"]
             p[1] += t["amount"]
         else:
@@ -196,7 +201,8 @@ def holdings_and_cash(asof: str) -> Tuple[dict, float]:
 def portfolio_value(asof: str) -> float:
     pos, cash = holdings_and_cash(asof)
     total = cash
-    for code, (shares, cost) in pos.items():
+    for code, p in pos.items():
+        shares, cost = p[0], p[1]
         _, nav = nav_asof(code, asof)
         total += shares * nav if nav is not None else cost
     return total
@@ -272,16 +278,26 @@ def nav_series(code: str, start: str, end: str) -> pd.DataFrame:
 def holdings_table(asof: str) -> pd.DataFrame:
     """Current positions valued as of `asof`: one row per held fund."""
     pos, _ = holdings_and_cash(asof)
+    conn = fetcher._conn()
     rows = []
-    for code, (shares, cost) in pos.items():
-        nav_date, nav = nav_asof(code, asof)
+    for code, p in pos.items():
+        shares, cost, open_date, open_nav = p[0], p[1], p[2], p[3]
+        r = conn.execute(
+            "SELECT date, nav, daily_ret_pct FROM fund_nav_daily "
+            "WHERE code = ? AND date <= ? AND nav IS NOT NULL "
+            "ORDER BY date DESC LIMIT 1", (code, asof)).fetchone()
+        nav_date, nav, day_ret = (
+            (r["date"], r["nav"], r["daily_ret_pct"]) if r else (None, None, None))
         value = shares * nav if nav is not None else cost
         rows.append({
             "code": code, "shares": shares, "cost": cost,
-            "nav": nav, "nav_date": nav_date, "value": value,
+            "open_date": open_date, "open_nav": open_nav,
+            "nav": nav, "nav_date": nav_date, "day_ret": day_ret,
+            "value": value,
             "pnl": value - cost,
             "pnl_pct": (value / cost - 1.0) * 100.0 if cost > 0 else 0.0,
         })
+    conn.close()
     df = pd.DataFrame(rows)
     return df.sort_values("value", ascending=False) if not df.empty else df
 
