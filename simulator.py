@@ -10,7 +10,9 @@ Trades execute at the fund's latest unit NAV on/before the simulated date
 testing, not a broker emulation.
 """
 
+import json
 import logging
+import time
 from typing import Optional, Tuple
 
 import pandas as pd
@@ -38,6 +40,13 @@ def init_sim_db():
             shares REAL NOT NULL,
             nav    REAL NOT NULL,      -- execution unit NAV
             amount REAL NOT NULL       -- buy: cash spent; sell: cash received
+        );
+        CREATE TABLE IF NOT EXISTS sim_archives (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            name         TEXT NOT NULL,
+            saved_at     REAL NOT NULL,
+            current_date TEXT,
+            trades       TEXT NOT NULL  -- JSON dump of sim_trades rows
         );
     """)
     # The trading calendar (MIN/MAX/DISTINCT over date) needs this; one-time build.
@@ -141,6 +150,92 @@ def reset():
     conn = fetcher._conn()
     conn.execute("DELETE FROM sim_trades")
     conn.execute("DELETE FROM sim_meta WHERE key='current_date'")
+    conn.commit()
+    conn.close()
+
+
+# ── Archives (saved simulator runs) ──────────────────────────────────────────
+# A snapshot of the live state (trade log + simulated date). Loading one
+# replaces the live state wholesale, so the run continues exactly where it
+# was archived; derived state is still replayed from the restored trades.
+
+def save_archive(name: str) -> Optional[str]:
+    """Snapshot current trades + date under `name`. Error string or None."""
+    d = get_current_date()
+    conn = fetcher._conn()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT date, code, action, shares, nav, amount "
+        "FROM sim_trades ORDER BY id")]
+    if not rows:
+        conn.close()
+        return "当前没有任何交易，无需存档"
+    conn.execute(
+        "INSERT INTO sim_archives (name, saved_at, current_date, trades) "
+        "VALUES (?, ?, ?, ?)",
+        (name.strip() or f"存档 {time.strftime('%m-%d %H:%M')}",
+         time.time(), d, json.dumps(rows, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+    return None
+
+
+def list_archives() -> pd.DataFrame:
+    """All archives, newest first: id, name, saved_at, current_date, n_trades."""
+    conn = fetcher._conn()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT id, name, saved_at, [current_date], trades FROM sim_archives "
+        "ORDER BY id DESC")]
+    conn.close()
+    for r in rows:
+        r["n_trades"] = len(json.loads(r.pop("trades")))
+    return pd.DataFrame(rows, columns=["id", "name", "saved_at",
+                                       "current_date", "n_trades"])
+
+
+def load_archive(archive_id: int) -> Optional[str]:
+    """Replace the live simulator state with an archive's. Error or None."""
+    conn = fetcher._conn()
+    row = conn.execute(
+        "SELECT [current_date], trades FROM sim_archives WHERE id=?",
+        (archive_id,)).fetchone()
+    if not row:
+        conn.close()
+        return "存档不存在"
+    trades = json.loads(row["trades"])
+    conn.execute("DELETE FROM sim_trades")
+    conn.executemany(
+        "INSERT INTO sim_trades (date, code, action, shares, nav, amount) "
+        "VALUES (:date, :code, :action, :shares, :nav, :amount)", trades)
+    conn.execute(
+        "INSERT OR REPLACE INTO sim_meta (key, value) VALUES ('current_date', ?)",
+        (row["current_date"],))
+    conn.commit()
+    conn.close()
+    return None
+
+
+def copy_archive(archive_id: int) -> Optional[str]:
+    """Duplicate an archive (name + ' 副本') so a strategy can be branched
+    and modified without touching the original. Error string or None."""
+    conn = fetcher._conn()
+    row = conn.execute(
+        "SELECT name, [current_date], trades FROM sim_archives WHERE id=?",
+        (archive_id,)).fetchone()
+    if not row:
+        conn.close()
+        return "存档不存在"
+    conn.execute(
+        "INSERT INTO sim_archives (name, saved_at, current_date, trades) "
+        "VALUES (?, ?, ?, ?)",
+        (f"{row['name']} 副本", time.time(), row["current_date"], row["trades"]))
+    conn.commit()
+    conn.close()
+    return None
+
+
+def delete_archive(archive_id: int):
+    conn = fetcher._conn()
+    conn.execute("DELETE FROM sim_archives WHERE id=?", (archive_id,))
     conn.commit()
     conn.close()
 

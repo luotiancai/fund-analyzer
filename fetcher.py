@@ -122,7 +122,7 @@ def init_db():
             saved_at REAL NOT NULL,
             PRIMARY KEY (code, year)
         ) WITHOUT ROWID;
-        -- Top-100 rows of each distinct filter run, keyed by a hash of the
+        -- Top rows (200) of each distinct filter run, keyed by a hash of the
         -- filter params (+ metrics version in live mode), so repeating a
         -- filter is a read instead of a recompute — across restarts too.
         CREATE TABLE IF NOT EXISTS filter_results (
@@ -734,9 +734,18 @@ def fetch_holdings(code: str, force_refresh: bool = False) -> Optional[pd.DataFr
         row = conn.execute(
             "SELECT data, saved_at FROM fund_holdings WHERE code=? AND year=?",
             (code, year)).fetchone()
+        # Rows written by an older version stored the raw akshare frame
+        # (股票代码/季度 columns); treat those as a cache miss so they are
+        # refetched and rewritten in the normalized format.
+        cached = None
+        if row:
+            recs = json.loads(row["data"])
+            if not recs or "quarter" in recs[0]:
+                cached = pd.DataFrame(recs, columns=_HOLDINGS_COLS)
         ttl = HOLDINGS_TTL if year == str(datetime.now().year) else HOLDINGS_TTL_PAST
-        if row and not force_refresh and (time.time() - row["saved_at"]) < ttl:
-            df = pd.DataFrame(json.loads(row["data"]), columns=_HOLDINGS_COLS)
+        if cached is not None and not force_refresh \
+                and (time.time() - row["saved_at"]) < ttl:
+            df = cached
         else:
             df = _fetch_holdings_year(code, year)
             if df is not None:
@@ -746,8 +755,8 @@ def fetch_holdings(code: str, force_refresh: bool = False) -> Optional[pd.DataFr
                     (code, year, df.to_json(orient="records", force_ascii=False),
                      time.time()))
                 conn.commit()
-            elif row:   # fetch failed → serve the stale cache rather than nothing
-                df = pd.DataFrame(json.loads(row["data"]), columns=_HOLDINGS_COLS)
+            elif cached is not None:   # fetch failed → serve stale cache
+                df = cached
         if df is not None:
             any_data = True
             if not df.empty:
@@ -761,6 +770,59 @@ def fetch_holdings(code: str, force_refresh: bool = False) -> Optional[pd.DataFr
     return out.sort_values(
         ["quarter", "kind", "占净值比例"], ascending=[False, True, False]
     ).reset_index(drop=True)
+
+
+# ── Index daily history (上证指数) ────────────────────────────────────────────
+
+_INDEX_TTL = 12 * 3600
+
+
+def fetch_sse_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
+    """上证指数 daily history from NAV_START, cache-first (12h TTL).
+
+    Columns: date (ISO str), close, pct (daily % change). Serves stale cache
+    when the refresh fails; None only with no cache at all.
+    """
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
+                 "key TEXT PRIMARY KEY, data TEXT, saved_at REAL)")
+    row = conn.execute(
+        "SELECT data, saved_at FROM index_daily_cache WHERE key='sse'"
+    ).fetchone()
+
+    def _from_row(r):
+        return pd.read_json(io.StringIO(r["data"]), orient="split",
+                            dtype=False, convert_dates=False)
+
+    if row and not force_refresh and time.time() - row["saved_at"] < _INDEX_TTL:
+        conn.close()
+        return _from_row(row)
+
+    df = None
+    try:
+        # Sina source (stock_zh_index_daily): the EastMoney push2 host is
+        # blocked by some proxies. No 涨跌幅 column — derive from closes
+        # over the full history, then cut to NAV_START.
+        raw = ak.stock_zh_index_daily(symbol="sh000001")
+        df = pd.DataFrame({
+            "date": pd.to_datetime(raw["date"]).dt.strftime("%Y-%m-%d"),
+            "close": pd.to_numeric(raw["close"], errors="coerce"),
+        }).dropna(subset=["date", "close"])
+        df["pct"] = df["close"].pct_change() * 100.0
+        df = df[df["date"] >= NAV_START].reset_index(drop=True)
+    except Exception as e:
+        logger.debug("SSE index fetch failed: %s", e)
+
+    if df is not None and not df.empty:
+        conn.execute(
+            "INSERT OR REPLACE INTO index_daily_cache (key, data, saved_at) "
+            "VALUES ('sse', ?, ?)",
+            (df.to_json(orient="split", force_ascii=False), time.time()))
+        conn.commit()
+    elif row:   # refresh failed → stale cache beats nothing
+        df = _from_row(row)
+    conn.close()
+    return df
 
 
 # ── Daily-batch pipeline ──────────────────────────────────────────────────────
@@ -1109,11 +1171,13 @@ def _backfill_codes(codes: list, workers: int = MAX_WORKERS,
 
 
 def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
-                 rf: Optional[float] = None, workers: int = MAX_WORKERS) -> dict:
+                 rf: Optional[float] = None, workers: int = MAX_WORKERS,
+                 do_recompute: bool = True) -> dict:
     """Full daily pipeline shared by the CLI script and the in-app button:
     ① refresh fund list → ② backfill funds missing history → ③ append the
     list's latest NAV point / range-fetch bigger gaps → ④ recompute
-    Sharpe/drawdown for all.
+    Sharpe/drawdown for all (skippable via do_recompute=False when metrics
+    are computed lazily at filter time instead).
 
     `rf` defaults to the auto-fetched (monthly-cached) risk-free rate.
     `progress(phase, done, total)` is invoked throughout for a UI bar / logging.
@@ -1141,7 +1205,9 @@ def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
 
     res = append_incremental(list_df, progress=_p)
 
-    saved = recompute_all(rf=rf, progress_callback=lambda d, t: _p("重算指标", d, t))
+    saved = 0
+    if do_recompute:
+        saved = recompute_all(rf=rf, progress_callback=lambda d, t: _p("重算指标", d, t))
 
     return {
         "funds": len(all_codes),
