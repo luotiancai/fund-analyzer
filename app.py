@@ -20,14 +20,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# st.popover 里的 st.date_input：日历浮层的 z-index 低于 popover 本体，
-# 会被盖住（重置弹窗里的起始日期选择器）。把带日历的 BaseWeb 浮层提到最上。
-st.markdown("""<style>
-div[data-baseweb="popover"]:has(div[data-baseweb="calendar"]) {
-    z-index: 99999999 !important;
-}
-</style>""", unsafe_allow_html=True)
-
 # init_db / risk-free rate run once per server (resp. hourly), not on every
 # rerun — both hit SQLite on /mnt/c (slow Windows-disk I/O under WSL), which
 # used to tax every single click.
@@ -660,25 +652,33 @@ with tab_sim:
                         simulator.delete_archive(int(_a["id"]))
                         st.rerun()
         with c4.popover("🗑️ 重置", use_container_width=True):
+            # 日期用纯文本输入：st.date_input 的日历浮层在 popover 里会被
+            # 盖住/误触收起（portal z-index 问题），文本框没有这些破事。
             _min_d = simulator.earliest_nav_day()
             _max_d = simulator.latest_trading_day()
-            _new_start = st.date_input(
+            _start_txt = st.text_input(
                 "起始日期",
-                value=dt.date.fromisoformat(simulator.get_start_date()),
-                min_value=dt.date.fromisoformat(_min_d) if _min_d else None,
-                max_value=dt.date.fromisoformat(_max_d) if _max_d else None,
-                key="sim_start_pick",
-                help="选中非交易日会自动顺延到下一个交易日。")
-            st.caption("清空全部模拟交易，从上面选定的起始日重新开始。")
+                value=simulator.get_start_date(),
+                key="sim_start_pick_txt",
+                help=f"格式 YYYY-MM-DD，范围 {_min_d} ~ {_max_d}；"
+                     "非交易日自动顺延到下一个交易日。")
+            st.caption("清空全部模拟交易，从上面填的起始日重新开始。")
             if st.button("确认重置", type="primary", key="sim_reset_confirm"):
-                _snapped, _err = simulator.set_start_date(_new_start.isoformat())
-                if _err:
-                    st.error(_err)
-                else:
-                    _note = ("" if _snapped == _new_start.isoformat()
-                             else f"（{_new_start} 非交易日，顺延至 {_snapped}）")
-                    st.session_state["sim_msg"] = f"模拟盘已重置，从 {_snapped} 开始{_note}"
-                    st.rerun()
+                try:
+                    _new_start = dt.date.fromisoformat(
+                        _start_txt.strip().replace("/", "-"))
+                except ValueError:
+                    st.error("日期格式不对，请用 YYYY-MM-DD，如 2021-01-05")
+                    _new_start = None
+                if _new_start:
+                    _snapped, _err = simulator.set_start_date(_new_start.isoformat())
+                    if _err:
+                        st.error(_err)
+                    else:
+                        _note = ("" if _snapped == _new_start.isoformat()
+                                 else f"（{_new_start} 非交易日，顺延至 {_snapped}）")
+                        st.session_state["sim_msg"] = f"模拟盘已重置，从 {_snapped} 开始{_note}"
+                        st.rerun()
 
         # ── Valuation ──
         pos, cash = simulator.holdings_and_cash(sim_date)
