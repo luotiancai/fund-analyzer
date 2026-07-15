@@ -922,8 +922,10 @@ with tab_sim:
                         "份额": trades["shares"].round(2),
                         "成交净值": trades["nav"],
                         "金额(¥)": trades["amount"].round(2),
-                        "卖出盈亏(¥)": trades["pnl"].round(2),
-                        "卖出盈亏(%)": trades["pnl_pct"].round(2),
+                        "卖出盈亏(¥)": pd.to_numeric(
+                            trades["pnl"], errors="coerce").round(2),
+                        "卖出盈亏(%)": pd.to_numeric(
+                            trades["pnl_pct"], errors="coerce").round(2),
                     }).iloc[::-1].reset_index(drop=True)
 
                     # 卖出行按已实现盈亏上色：绿=盈利卖出，红=亏损卖出
