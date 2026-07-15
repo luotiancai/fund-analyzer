@@ -20,6 +20,14 @@ st.set_page_config(
     layout="wide",
 )
 
+# st.popover 里的 st.date_input：日历浮层的 z-index 低于 popover 本体，
+# 会被盖住（重置弹窗里的起始日期选择器）。把带日历的 BaseWeb 浮层提到最上。
+st.markdown("""<style>
+div[data-baseweb="popover"]:has(div[data-baseweb="calendar"]) {
+    z-index: 99999999 !important;
+}
+</style>""", unsafe_allow_html=True)
+
 # init_db / risk-free rate run once per server (resp. hourly), not on every
 # rerun — both hit SQLite on /mnt/c (slow Windows-disk I/O under WSL), which
 # used to tax every single click.
