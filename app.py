@@ -922,8 +922,22 @@ with tab_sim:
                         "份额": trades["shares"].round(2),
                         "成交净值": trades["nav"],
                         "金额(¥)": trades["amount"].round(2),
+                        "卖出盈亏(¥)": trades["pnl"].round(2),
+                        "卖出盈亏(%)": trades["pnl_pct"].round(2),
                     }).iloc[::-1].reset_index(drop=True)
-                    st.dataframe(_trades_view, use_container_width=True)
+
+                    # 卖出行按已实现盈亏上色：绿=盈利卖出，红=亏损卖出
+                    # （与持仓表现卡一致：绿好红坏）。
+                    def _sell_row_style(row):
+                        if row["操作"] == "卖出" and pd.notna(row["卖出盈亏(¥)"]):
+                            _c = "#21a366" if row["卖出盈亏(¥)"] >= 0 else "#e0454b"
+                            return [f"color: {_c}; font-weight: 600"] * len(row)
+                        return [""] * len(row)
+
+                    st.dataframe(
+                        _trades_view.style.apply(_sell_row_style, axis=1)
+                        .format(precision=2, na_rep=""),
+                        use_container_width=True)
                     # utf-8-sig BOM so Excel opens the CSV with correct 中文.
                     st.download_button(
                         "⬇️ 导出交易记录 CSV",

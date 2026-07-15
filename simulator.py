@@ -514,8 +514,50 @@ def holdings_table(asof: str) -> pd.DataFrame:
 
 
 def trades_table(upto: str) -> pd.DataFrame:
+    """Trade log with per-sell realized P&L.
+
+    Adds pnl / pnl_pct columns (None on buys): sell proceeds vs the average
+    cost released, replayed with the same average-cost + dividend-adjustment
+    rules as the portfolio, so a sell's P&L matches the holdings table as it
+    stood at that moment.
+    """
     rows = _load_trades(upto)
-    return pd.DataFrame([dict(r) for r in rows])
+    df = pd.DataFrame([dict(r) for r in rows])
+    if df.empty:
+        return df
+
+    stream = [(t["date"], 1, t) for t in rows]
+    for code, evs in _dividend_events(set(df["code"]), upto).items():
+        stream += [(d, 0, (code, m)) for d, m in evs]
+    stream.sort(key=lambda x: (x[0], x[1]))
+
+    pos: dict = {}           # code -> [shares, cost]
+    realized: dict = {}      # trade id -> (pnl, pnl_pct)
+    for _d, kind, item in stream:
+        if kind == 0:
+            p = pos.get(item[0])
+            if p:
+                p[0] *= item[1]
+            continue
+        t = item
+        p = pos.setdefault(t["code"], [0.0, 0.0])
+        if t["action"] == "buy":
+            p[0] += t["shares"]
+            p[1] += t["amount"]
+        else:
+            frac = min(t["shares"] / p[0], 1.0) if p[0] > 0 else 1.0
+            released = p[1] * frac
+            realized[t["id"]] = (
+                t["amount"] - released,
+                (t["amount"] / released - 1.0) * 100.0 if released > 0 else None)
+            p[1] -= released
+            p[0] -= t["shares"]
+            if p[0] <= 1e-9:
+                pos.pop(t["code"])
+
+    df["pnl"] = df["id"].map(lambda i: realized.get(i, (None, None))[0])
+    df["pnl_pct"] = df["id"].map(lambda i: realized.get(i, (None, None))[1])
+    return df
 
 
 def equity_curve() -> pd.DataFrame:
