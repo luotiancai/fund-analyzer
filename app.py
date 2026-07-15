@@ -578,24 +578,41 @@ with tab_sim:
             st.success(_msg)
 
         # ── 操作条（先处理动作，再渲染下方状态）──
-        c1, c2, _sp, c3, c4 = st.columns([1.2, 1.2, 2.4, 1.2, 1])
+        c1, c1m, c2, c2m, _sp, c3, c4 = st.columns(
+            [1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1])
+
+        def _toast_if_sse_drop(_d):
+            # 主要操作信号：落到沪指跌超1%的日子就提示——空仓时没有
+            # 持仓图表可看，这条提示是唯一入口。
+            _sse0 = load_sse_daily()
+            if _sse0 is not None and not _sse0.empty:
+                _row0 = _sse0[_sse0["date"] == _d]
+                if (not _row0.empty and pd.notna(_row0["pct"].iloc[0])
+                        and _row0["pct"].iloc[0] <= -1.0):
+                    st.toast(f"{_d} 沪指下跌 "
+                             f"{_row0['pct'].iloc[0]:.2f}%", icon="🔻")
+
         if c1.button("▶️ 推进一天", type="primary", use_container_width=True):
             sim_date, _moved = simulator.advance_day()
             if not _moved:
                 st.toast("已到本地数据的最新日期，无法再推进", icon="⚠️")
             else:
-                # 主要操作信号：落到沪指跌超1%的日子就提示——空仓时没有
-                # 持仓图表可看，这条提示是唯一入口。
-                _sse0 = load_sse_daily()
-                if _sse0 is not None and not _sse0.empty:
-                    _row0 = _sse0[_sse0["date"] == sim_date]
-                    if (not _row0.empty and pd.notna(_row0["pct"].iloc[0])
-                            and _row0["pct"].iloc[0] <= -1.0):
-                        st.toast(f"{sim_date} 沪指下跌 "
-                                 f"{_row0['pct'].iloc[0]:.2f}%", icon="🔻")
+                _toast_if_sse_drop(sim_date)
+        if c1m.button("⏩ 推进一月", use_container_width=True,
+                      help="跳到一个月后的最近交易日（数据不足一个月则到最新日期）"):
+            sim_date, _moved = simulator.advance_month()
+            if not _moved:
+                st.toast("已到本地数据的最新日期，无法再推进", icon="⚠️")
+            else:
+                _toast_if_sse_drop(sim_date)
         if c2.button("◀️ 回退一天", use_container_width=True,
                      help="回到上一个交易日，并撤销当前这天的全部买卖"):
             sim_date, _moved = simulator.rollback_day()
+            if not _moved:
+                st.toast("已在第一个交易日，无法回退", icon="⚠️")
+        if c2m.button("⏪ 回退一月", use_container_width=True,
+                      help="回到一个月前的最近交易日，并撤销中间所有买卖"):
+            sim_date, _moved = simulator.rollback_month()
             if not _moved:
                 st.toast("已在第一个交易日，无法回退", icon="⚠️")
         with c3.popover("📂 存档管理", use_container_width=True):

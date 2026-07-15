@@ -192,6 +192,47 @@ def rollback_day() -> Tuple[str, bool]:
     return prev, True
 
 
+def advance_month() -> Tuple[str, bool]:
+    """Jump to the first trading day one calendar month ahead — or the latest
+    trading day if the data ends sooner. Returns (date, moved)."""
+    cur = get_current_date()
+    target = (pd.Timestamp(cur) + pd.DateOffset(months=1)).strftime("%Y-%m-%d")
+    conn = fetcher._conn()
+    row = conn.execute(
+        "SELECT MIN(date) AS d FROM fund_nav_daily WHERE date >= ?",
+        (target,)).fetchone()
+    conn.close()
+    new = (row["d"] if row and row["d"] else None) or latest_trading_day()
+    if new and new > cur:
+        _set_current_date(new)
+        return new, True
+    return cur, False
+
+
+def rollback_month() -> Tuple[str, bool]:
+    """Jump back to the last trading day one calendar month earlier — never
+    before the first trading day — discarding every trade after the landing
+    day. Returns (date, moved)."""
+    cur = get_current_date()
+    first = first_trading_day()
+    target = (pd.Timestamp(cur) - pd.DateOffset(months=1)).strftime("%Y-%m-%d")
+    conn = fetcher._conn()
+    row = conn.execute(
+        "SELECT MAX(date) AS d FROM fund_nav_daily WHERE date <= ? AND date >= ?",
+        (target, first)).fetchone()
+    prev = (row["d"] if row and row["d"] else None) or first
+    if not prev or prev >= cur:
+        conn.close()
+        return cur, False
+    conn.execute("DELETE FROM sim_trades WHERE date > ?", (prev,))
+    conn.execute(
+        "INSERT OR REPLACE INTO sim_meta (key, value) VALUES ('current_date', ?)",
+        (prev,))
+    conn.commit()
+    conn.close()
+    return prev, True
+
+
 def reset():
     """Wipe all trades and restart from the first trading day."""
     conn = fetcher._conn()
