@@ -693,6 +693,54 @@ def load_filter_result(key: str):
 
 _HOLDINGS_COLS = ["quarter", "kind", "代码", "名称", "占净值比例", "持股数", "持仓市值"]
 
+_EM_F10_URL = "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+
+
+def _em_f10_holdings_raw(code: str, year: str, typ: str) -> Optional[pd.DataFrame]:
+    """One year's raw holdings tables from EastMoney F10, with a 季度 label
+    column. `typ`: "jjcc" = 股票, "zqcc" = 债券.
+
+    Replaces ak.fund_portfolio_hold_em / fund_portfolio_bond_hold_em, whose
+    requests carry no Referer — the endpoint started answering those with a
+    404 page (which akshare then fails to parse as JSON).
+    Returns None on failure, an empty DataFrame when the year disclosed
+    nothing.
+    """
+    from bs4 import BeautifulSoup
+    from akshare.utils import demjson
+    try:
+        r = requests.get(
+            _EM_F10_URL,
+            params={"type": typ, "code": code, "topline": "10000",
+                    "year": year, "month": "", "rt": "0.9"},
+            headers={"Referer": f"https://fundf10.eastmoney.com/ccmx_{code}.html"},
+            timeout=20)
+        data = demjson.decode(r.text[r.text.find("{"):-1])
+        html = data["content"]
+        soup = BeautifulSoup(html, "lxml")
+        labels = [h.text.split("\xa0\xa0")[1]
+                  for h in soup.find_all("h4", attrs={"class": "t"})]
+        if not labels:
+            return pd.DataFrame()
+        tables = pd.read_html(
+            io.StringIO(html), converters={"股票代码": str, "债券代码": str})
+    except Exception as e:
+        logger.debug("F10 holdings fetch failed %s %s %s: %s", code, year, typ, e)
+        return None
+    frames = []
+    for lbl, t in zip(labels, tables):
+        t = t.copy()
+        # Header cells wrap, e.g. "占净值 比例" / "持股数 （万股）" — normalize.
+        t.columns = [str(c).replace(" ", "") for c in t.columns]
+        t = t.rename(columns={"持股数（万股）": "持股数",
+                              "持仓市值（万元）": "持仓市值",
+                              "持仓市值（万元人民币）": "持仓市值"})
+        if "占净值比例" in t.columns:
+            t["占净值比例"] = t["占净值比例"].astype(str).str.rstrip("%")
+        t["季度"] = lbl
+        frames.append(t)
+    return pd.concat(frames, ignore_index=True)
+
 
 def _fetch_holdings_year(code: str, year: str) -> Optional[pd.DataFrame]:
     """One year's quarterly top holdings (stocks + bonds), normalized.
@@ -701,17 +749,15 @@ def _fetch_holdings_year(code: str, year: str) -> Optional[pd.DataFrame]:
     None when both requests failed (network error — caller keeps stale cache).
     """
     frames, failures = [], 0
-    for kind, fn, code_col, name_col in (
-        ("股票", ak.fund_portfolio_hold_em, "股票代码", "股票名称"),
-        ("债券", ak.fund_portfolio_bond_hold_em, "债券代码", "债券名称"),
+    for kind, typ, code_col, name_col in (
+        ("股票", "jjcc", "股票代码", "股票名称"),
+        ("债券", "zqcc", "债券代码", "债券名称"),
     ):
-        try:
-            raw = fn(symbol=code, date=year)
-        except Exception as e:
-            logger.debug("holdings fetch failed %s %s %s: %s", code, year, kind, e)
+        raw = _em_f10_holdings_raw(code, year, typ)
+        if raw is None:
             failures += 1
             continue
-        if raw is None or raw.empty:
+        if raw.empty:
             continue
         # 季度 looks like "2025年1季度股票投资明细" → "2025Q1"
         q = raw["季度"].astype(str).str.extract(r"(\d{4})年(\d)季度")
