@@ -196,10 +196,10 @@ with tab_table:
             asof_date = st.date_input(
                 "截至日期（不选=今天）",
                 value=None,
-                min_value=dt.date(2026, 1, 1),
+                min_value=dt.date(2021, 1, 1),
                 max_value=dt.date.today(),
                 help="按该日及之前的净值历史重算收益/回撤/夏普，还原当天的筛选结果。"
-                     "本地净值从 2025-01-01 起，因此最早可选 2026-01-01，"
+                     "本地净值（仅C类）从 2020-01-01 起，因此最早可选 2021-01-01，"
                      "保证近1年窗口有完整数据。",
             )
         submitted = st.form_submit_button("🔍 开始筛选", type="primary")
@@ -585,7 +585,7 @@ with tab_sim:
                         st.toast(_err or f"已改名为「{_new_name.strip()}」",
                                  icon="✏️")
                     st.caption(
-                        f"模拟至 {_a['current_date']} · "
+                        f"{_a['start_date']} ~ {_a['current_date']} · "
                         f"{_a['n_trades']} 笔交易 · 存于 "
                         + time.strftime("%m-%d %H:%M",
                                         time.localtime(_a["saved_at"])))
@@ -609,11 +609,25 @@ with tab_sim:
                         simulator.delete_archive(int(_a["id"]))
                         st.rerun()
         with c4.popover("🗑️ 重置", use_container_width=True):
-            st.caption("清空全部模拟交易，回到起点重新开始。")
+            _min_d = simulator.earliest_nav_day()
+            _max_d = simulator.latest_trading_day()
+            _new_start = st.date_input(
+                "起始日期",
+                value=dt.date.fromisoformat(simulator.get_start_date()),
+                min_value=dt.date.fromisoformat(_min_d) if _min_d else None,
+                max_value=dt.date.fromisoformat(_max_d) if _max_d else None,
+                key="sim_start_pick",
+                help="选中非交易日会自动顺延到下一个交易日。")
+            st.caption("清空全部模拟交易，从上面选定的起始日重新开始。")
             if st.button("确认重置", type="primary", key="sim_reset_confirm"):
-                simulator.reset()
-                st.session_state["sim_msg"] = "模拟盘已重置"
-                st.rerun()
+                _snapped, _err = simulator.set_start_date(_new_start.isoformat())
+                if _err:
+                    st.error(_err)
+                else:
+                    _note = ("" if _snapped == _new_start.isoformat()
+                             else f"（{_new_start} 非交易日，顺延至 {_snapped}）")
+                    st.session_state["sim_msg"] = f"模拟盘已重置，从 {_snapped} 开始{_note}"
+                    st.rerun()
 
         # ── Valuation ──
         pos, cash = simulator.holdings_and_cash(sim_date)
@@ -632,8 +646,10 @@ with tab_sim:
         m4.metric("总收益", f"¥{total_pnl:+,.0f}")
         m5.metric("总收益率", f"{total_pnl / simulator.INITIAL_CAPITAL * 100:+.2f}%")
         st.caption(
-            f"从 {simulator.SIM_START} 开始 · 初始资金 ¥{simulator.INITIAL_CAPITAL:,.0f} · "
-            "按当日单位净值成交，不计手续费 · 回退一天会撤销当天的全部买卖")
+            f"从 {simulator.get_start_date()} 开始 · "
+            f"初始资金 ¥{simulator.INITIAL_CAPITAL:,.0f} · "
+            "按当日单位净值成交，不计手续费 · 回退一天会撤销当天的全部买卖 · "
+            "起始日期可在「重置」中修改")
 
         st.divider()
         hold = simulator.holdings_table(sim_date)

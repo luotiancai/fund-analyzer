@@ -21,7 +21,7 @@ import fetcher
 
 logger = logging.getLogger(__name__)
 
-SIM_START = "2026-01-01"
+SIM_START = "2026-01-01"   # default start; the active one lives in sim_meta
 INITIAL_CAPITAL = 1_000_000.0
 
 
@@ -51,8 +51,55 @@ def init_sim_db():
     """)
     # The trading calendar (MIN/MAX/DISTINCT over date) needs this; one-time build.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_nav_date ON fund_nav_daily(date)")
+    # Archives carry their run's start date (migration for existing DBs).
+    try:
+        conn.execute("ALTER TABLE sim_archives ADD COLUMN start_date TEXT")
+    except Exception:
+        pass  # column already exists
     conn.commit()
     conn.close()
+
+
+# ── Start date (user-selectable, persisted in sim_meta) ─────────────────────
+
+def get_start_date() -> str:
+    conn = fetcher._conn()
+    row = conn.execute(
+        "SELECT value FROM sim_meta WHERE key='start_date'").fetchone()
+    conn.close()
+    return row["value"] if row else SIM_START
+
+
+def earliest_nav_day() -> Optional[str]:
+    """First date with any stored NAV — lower bound for the start-date picker."""
+    conn = fetcher._conn()
+    row = conn.execute("SELECT MIN(date) AS d FROM fund_nav_daily").fetchone()
+    conn.close()
+    return row["d"] if row else None
+
+
+def set_start_date(d: str) -> Tuple[Optional[str], Optional[str]]:
+    """Restart the simulator from `d`, snapped to the next trading day.
+
+    Clears all trades and moves the current date to the new start (changing
+    the origin invalidates every replayed value, so a restart is the only
+    consistent semantics). Returns (snapped_date, error).
+    """
+    conn = fetcher._conn()
+    row = conn.execute(
+        "SELECT MIN(date) AS d FROM fund_nav_daily WHERE date >= ?",
+        (d,)).fetchone()
+    snapped = row["d"] if row else None
+    if not snapped:
+        conn.close()
+        return None, "该日期之后没有任何净值数据"
+    conn.execute("DELETE FROM sim_trades")
+    conn.executemany(
+        "INSERT OR REPLACE INTO sim_meta (key, value) VALUES (?, ?)",
+        [("start_date", snapped), ("current_date", snapped)])
+    conn.commit()
+    conn.close()
+    return snapped, None
 
 
 # ── Trading calendar ─────────────────────────────────────────────────────────
@@ -62,7 +109,7 @@ def first_trading_day() -> Optional[str]:
     conn = fetcher._conn()
     row = conn.execute(
         "SELECT MIN(date) AS d FROM fund_nav_daily WHERE date >= ?",
-        (SIM_START,)).fetchone()
+        (get_start_date(),)).fetchone()
     conn.close()
     return row["d"] if row else None
 
@@ -170,10 +217,11 @@ def save_archive(name: str) -> Optional[str]:
         conn.close()
         return "当前没有任何交易，无需存档"
     conn.execute(
-        "INSERT INTO sim_archives (name, saved_at, current_date, trades) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO sim_archives (name, saved_at, current_date, trades, "
+        "start_date) VALUES (?, ?, ?, ?, ?)",
         (name.strip() or f"存档 {time.strftime('%m-%d %H:%M')}",
-         time.time(), d, json.dumps(rows, ensure_ascii=False)))
+         time.time(), d, json.dumps(rows, ensure_ascii=False),
+         get_start_date()))
     conn.commit()
     conn.close()
     return None
@@ -183,20 +231,21 @@ def list_archives() -> pd.DataFrame:
     """All archives, newest first: id, name, saved_at, current_date, n_trades."""
     conn = fetcher._conn()
     rows = [dict(r) for r in conn.execute(
-        "SELECT id, name, saved_at, [current_date], trades FROM sim_archives "
-        "ORDER BY id DESC")]
+        "SELECT id, name, saved_at, [current_date], start_date, trades "
+        "FROM sim_archives ORDER BY id DESC")]
     conn.close()
     for r in rows:
         r["n_trades"] = len(json.loads(r.pop("trades")))
+        r["start_date"] = r["start_date"] or SIM_START
     return pd.DataFrame(rows, columns=["id", "name", "saved_at",
-                                       "current_date", "n_trades"])
+                                       "current_date", "start_date", "n_trades"])
 
 
 def load_archive(archive_id: int) -> Optional[str]:
     """Replace the live simulator state with an archive's. Error or None."""
     conn = fetcher._conn()
     row = conn.execute(
-        "SELECT [current_date], trades FROM sim_archives WHERE id=?",
+        "SELECT [current_date], start_date, trades FROM sim_archives WHERE id=?",
         (archive_id,)).fetchone()
     if not row:
         conn.close()
@@ -206,9 +255,10 @@ def load_archive(archive_id: int) -> Optional[str]:
     conn.executemany(
         "INSERT INTO sim_trades (date, code, action, shares, nav, amount) "
         "VALUES (:date, :code, :action, :shares, :nav, :amount)", trades)
-    conn.execute(
-        "INSERT OR REPLACE INTO sim_meta (key, value) VALUES ('current_date', ?)",
-        (row["current_date"],))
+    conn.executemany(
+        "INSERT OR REPLACE INTO sim_meta (key, value) VALUES (?, ?)",
+        [("current_date", row["current_date"]),
+         ("start_date", row["start_date"] or SIM_START)])
     conn.commit()
     conn.close()
     return None
@@ -232,15 +282,16 @@ def copy_archive(archive_id: int) -> Optional[str]:
     and modified without touching the original. Error string or None."""
     conn = fetcher._conn()
     row = conn.execute(
-        "SELECT name, [current_date], trades FROM sim_archives WHERE id=?",
-        (archive_id,)).fetchone()
+        "SELECT name, [current_date], start_date, trades FROM sim_archives "
+        "WHERE id=?", (archive_id,)).fetchone()
     if not row:
         conn.close()
         return "存档不存在"
     conn.execute(
-        "INSERT INTO sim_archives (name, saved_at, current_date, trades) "
-        "VALUES (?, ?, ?, ?)",
-        (f"{row['name']} 副本", time.time(), row["current_date"], row["trades"]))
+        "INSERT INTO sim_archives (name, saved_at, current_date, trades, "
+        "start_date) VALUES (?, ?, ?, ?, ?)",
+        (f"{row['name']} 副本", time.time(), row["current_date"],
+         row["trades"], row["start_date"]))
     conn.commit()
     conn.close()
     return None
@@ -416,7 +467,7 @@ def trades_table(upto: str) -> pd.DataFrame:
 
 
 def equity_curve() -> pd.DataFrame:
-    """Portfolio value on every trading day from SIM_START to the current
+    """Portfolio value on every trading day from the start date to the current
     simulated date. Columns: date, value."""
     cur = get_current_date()
     first = first_trading_day()

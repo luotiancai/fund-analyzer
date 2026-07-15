@@ -52,7 +52,7 @@ def _migrate_db_location():
             pass
 FUND_LIST_TTL = 3600    # 1 hour
 NAV_TTL = 86400         # 24 hours
-NAV_START = "2025-01-01"  # NAV history is kept from this date onward
+NAV_START = "2020-01-01"  # NAV history is kept from this date onward
 MAX_WORKERS = 8
 RISK_FREE_RATE = 0.0113  # fallback 1-year China gov bond yield (see get_risk_free_rate)
 RF_TTL = 30 * 86400      # auto-refresh the risk-free rate ~monthly
@@ -338,6 +338,20 @@ def _period_mdd(df: pd.DataFrame, days_back: int) -> Optional[float]:
     if window is None:
         return None
     return _max_drawdown(window["acc_nav"])
+
+
+# ── C-class share detection ──────────────────────────────────────────────────
+# Only C-class shares get NAV history stored/backfilled (the user only buys C).
+# A name counts as C-class when C is followed by end-of-string, a parenthesis,
+# 类, or a currency suffix — e.g. 「XX混合C」「XXC(QDII)」「XX(QDII)C人民币」.
+# The C inside abbreviations like CES/MSCI/CAC40 never matches.
+_C_CLASS_RE = re.compile(r"[Cc](类|\(|（|人民币|美元|$)")
+
+
+def is_c_class(name) -> bool:
+    if not name or pd.isna(name):
+        return False
+    return _C_CLASS_RE.search(str(name).strip()) is not None
 
 
 # ── Fund list ────────────────────────────────────────────────────────────────
@@ -1198,7 +1212,12 @@ def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
     backfilled = 0
     if do_backfill:
         have = list_nav_codes()
-        todo = [c for c in all_codes if c not in have]
+        # Only C-class shares get a NAV history; without this filter every
+        # non-C fund cleaned out of the DB would be re-downloaded daily.
+        names = list_df.dropna(subset=["code"]).drop_duplicates("code") \
+            .set_index("code")["name"]
+        todo = [c for c in all_codes
+                if c not in have and is_c_class(names.get(c))]
         backfilled = _backfill_codes(
             todo, workers, lambda d, t: _p("回填缺失历史", d, t)
         )
