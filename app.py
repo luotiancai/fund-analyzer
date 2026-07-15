@@ -384,7 +384,7 @@ with tab_table:
             _h = _h[_h["_qend"] <= _asof_lim]
             if _h.empty:
                 st.info("截至该日期尚无已披露的季度持仓（本地持仓数据从 "
-                        f"{fetcher.HOLDINGS_START_YEAR}Q1 起）。")
+                        f"{fetcher.HOLDINGS_START_Q} 起）。")
                 return
             _q = _h["quarter"].max()
             _hq = _h[_h["quarter"] == _q]
@@ -481,9 +481,9 @@ with tab_detail:
                 s3.metric("夏普比率", f"{result['sharpe']:.4f}")
                 s4.metric("交易日数据点", result["data_points"])
 
-            # Quarterly top-10 holdings, 2025Q1 → latest disclosed quarter.
+            # Quarterly top-10 holdings, HOLDINGS_START_Q → latest disclosed quarter.
             st.markdown("---")
-            st.subheader(f"📦 重仓持仓（{fetcher.HOLDINGS_START_YEAR}Q1 至最新）")
+            st.subheader(f"📦 重仓持仓（{fetcher.HOLDINGS_START_Q} 至最新）")
             with st.spinner("加载持仓数据…"):
                 hold_df = load_holdings(code_input.strip().zfill(6))
             if hold_df is None:

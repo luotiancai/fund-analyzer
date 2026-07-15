@@ -56,7 +56,8 @@ NAV_START = "2020-01-01"  # NAV history is kept from this date onward
 MAX_WORKERS = 8
 RISK_FREE_RATE = 0.0113  # fallback 1-year China gov bond yield (see get_risk_free_rate)
 RF_TTL = 30 * 86400      # auto-refresh the risk-free rate ~monthly
-HOLDINGS_START_YEAR = 2025     # top holdings are shown from 2025Q1 onward
+HOLDINGS_START_YEAR = 2020     # first year fetched for quarterly holdings
+HOLDINGS_START_Q = "2020Q4"    # earliest quarter kept ("YYYYQn" strings compare fine)
 HOLDINGS_TTL = 7 * 86400       # current year re-checked weekly for new quarterly reports
 HOLDINGS_TTL_PAST = 30 * 86400 # past years' disclosures barely change
 
@@ -733,7 +734,7 @@ def _fetch_holdings_year(code: str, year: str) -> Optional[pd.DataFrame]:
 
 
 def fetch_holdings(code: str, force_refresh: bool = False) -> Optional[pd.DataFrame]:
-    """Quarterly top holdings from 2025Q1 (HOLDINGS_START_YEAR) to the latest
+    """Quarterly top holdings from HOLDINGS_START_Q (2020Q4) to the latest
     disclosed quarter, cache-first.
 
     Columns: quarter ("2025Q1"), kind (股票/债券), 代码, 名称, 占净值比例(%),
@@ -781,6 +782,9 @@ def fetch_holdings(code: str, force_refresh: bool = False) -> Optional[pd.DataFr
     if not frames:
         return pd.DataFrame(columns=_HOLDINGS_COLS)
     out = pd.concat(frames, ignore_index=True)
+    # The start year is fetched whole (the API's granularity is a year); only
+    # quarters from HOLDINGS_START_Q onward are surfaced.
+    out = out[out["quarter"] >= HOLDINGS_START_Q]
     return out.sort_values(
         ["quarter", "kind", "占净值比例"], ascending=[False, True, False]
     ).reset_index(drop=True)
