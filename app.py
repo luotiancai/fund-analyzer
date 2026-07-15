@@ -433,6 +433,24 @@ with tab_table:
                         with _col, st.container(border=True):
                             _render_holdings_cell(table.iloc[_ri])
 
+        # ── 模拟盘当前持仓的基金：重仓区常驻展示，无需在表格里勾选 ──
+        _sim_d = simulator.get_current_date()
+        _sim_codes = sorted(simulator.holdings_and_cash(_sim_d)[0]) if _sim_d else []
+        if _sim_codes:
+            _sim_names = dict(zip(fund_df["code"], fund_df["name"]))
+            st.markdown(
+                f"##### 💰 模拟盘持仓基金的最新十大持仓（截至 {_asof_lim}）")
+            _PER_ROW_SIM = 3
+            with st.spinner("加载持仓…"):
+                for _start in range(0, len(_sim_codes), _PER_ROW_SIM):
+                    _chunk = _sim_codes[_start:_start + _PER_ROW_SIM]
+                    _cols = st.columns(_PER_ROW_SIM, gap="medium")
+                    for _col, _c in zip(_cols, _chunk):
+                        with _col, st.container(border=True):
+                            _render_holdings_cell(
+                                {"基金代码": _c,
+                                 "基金名称": _sim_names.get(_c, "")})
+
         csv = table.to_csv(index=False, encoding="utf-8-sig")
         st.download_button(
             label="⬇️ 下载 CSV",
