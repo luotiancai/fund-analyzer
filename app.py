@@ -353,12 +353,64 @@ with tab_table:
     if table is None:
         st.info("👆 设置筛选条件后，点击「🔍 开始筛选」生成基金列表。")
     else:
-        st.caption("点击表头可排序")
-        st.dataframe(
+        st.caption("点击表头可排序 · 行首打勾（可多选）查看基金在截至日期下最新披露的十大持仓")
+        _sel = st.dataframe(
             table,
             use_container_width=True,
             height=560,
+            on_select="rerun",
+            selection_mode="multi-row",
+            key="filter_table_sel",
         )
+
+        # ── Selected funds: latest top-10 holdings as of the filter's 截至日期,
+        # laid out in a grid — fill each row left to right, then wrap. ──
+        _sel_rows = _sel.selection.rows if _sel is not None else []
+        _asof_lim = (asof_date if asof_mode
+                     else dt.date.today()).strftime("%Y-%m-%d")
+
+        def _render_holdings_cell(frow):
+            _fcode = str(frow["基金代码"]).zfill(6)
+            _fname = frow.get("基金名称", "")
+            _hdf = load_holdings(_fcode)
+            st.markdown(f"**📦 {_fcode} {_fname}**")
+            if _hdf is None or _hdf.empty:
+                st.info("该基金暂无披露的重仓持仓（货币基金、新基金常见）。")
+                return
+            _qend = {"1": "-03-31", "2": "-06-30", "3": "-09-30", "4": "-12-31"}
+            _h = _hdf.dropna(subset=["quarter"]).copy()
+            _h["quarter"] = _h["quarter"].astype(str)
+            _h["_qend"] = _h["quarter"].str[:4] + _h["quarter"].str[-1].map(_qend)
+            _h = _h[_h["_qend"] <= _asof_lim]
+            if _h.empty:
+                st.info("截至该日期尚无已披露的季度持仓（本地持仓数据从 "
+                        f"{fetcher.HOLDINGS_START_YEAR}Q1 起）。")
+                return
+            _q = _h["quarter"].max()
+            _hq = _h[_h["quarter"] == _q]
+            st.caption(f"披露季度：{_q}")
+            for _kind, _klabel in (("股票", "重仓股票"), ("债券", "重仓债券")):
+                _part = _hq[_hq["kind"] == _kind].head(10)
+                if _part.empty:
+                    continue
+                st.markdown(f"**{_klabel}（前十）**")
+                st.dataframe(pd.DataFrame({
+                    "代码": _part["代码"],
+                    "名称": _part["名称"],
+                    "占净值比例(%)": _part["占净值比例"],
+                }).reset_index(drop=True), use_container_width=True)
+
+        if _sel_rows:
+            st.markdown(f"##### 已选基金的最新十大持仓（截至 {_asof_lim}）")
+            st.caption("取季度末 ≤ 截至日期的最新披露季度；实际公告通常滞后季度末约两周")
+            _PER_ROW = 3
+            with st.spinner("加载持仓…"):
+                for _start in range(0, len(_sel_rows), _PER_ROW):
+                    _chunk = _sel_rows[_start:_start + _PER_ROW]
+                    _cols = st.columns(_PER_ROW, gap="medium")
+                    for _col, _ri in zip(_cols, _chunk):
+                        with _col, st.container(border=True):
+                            _render_holdings_cell(table.iloc[_ri])
 
         csv = table.to_csv(index=False, encoding="utf-8-sig")
         st.download_button(
@@ -521,8 +573,19 @@ with tab_sim:
                 st.caption("⚠️ 载入会覆盖当前模拟盘的全部交易与日期；"
                            "如需保留当前进度，请先存档。")
                 for _, _a in _archs.iterrows():
-                    st.markdown(
-                        f"**{_a['name']}**  \n模拟至 {_a['current_date']} · "
+                    _aid = int(_a["id"])
+                    # Name is edited in place: change + Enter saves it.
+                    _new_name = st.text_input(
+                        "策略名称", value=_a["name"],
+                        key=f"arch_rename_{_aid}",
+                        label_visibility="collapsed",
+                        help="直接修改名称，回车保存")
+                    if _new_name.strip() and _new_name.strip() != _a["name"]:
+                        _err = simulator.rename_archive(_aid, _new_name)
+                        st.toast(_err or f"已改名为「{_new_name.strip()}」",
+                                 icon="✏️")
+                    st.caption(
+                        f"模拟至 {_a['current_date']} · "
                         f"{_a['n_trades']} 笔交易 · 存于 "
                         + time.strftime("%m-%d %H:%M",
                                         time.localtime(_a["saved_at"])))
@@ -718,62 +781,63 @@ with tab_sim:
                                 f"{_code_names.get(sell_pick, '')}")
                             st.rerun()
 
-            if _dd_rows:
-                st.markdown(
-                    "##### 📊 持仓表现（自买入）",
-                    help="总收益率、最大前进（当前净值相对买入以来最低点"
-                         "的涨幅）、最大回撤均自买入日起算；最后一行为"
-                         "买入时点的近1年最大回撤，作为比较基准：回撤或"
-                         "亏损幅度超过它时红色提示，最大前进超过它时"
-                         "绿色标记。")
-                _RED, _GREEN, _GRAY = "#e0454b", "#21a366", "#8a8f98"
-
-                def _dd_line(label, value, color, bold=False):
-                    return (
-                        "<div style='display:flex;justify-content:"
-                        "space-between;font-size:0.82rem;"
-                        "line-height:1.7;'>"
-                        f"<span style='color:{_GRAY};'>{label}</span>"
-                        f"<span style='color:{color};"
-                        f"font-weight:{600 if bold else 400};"
-                        f"font-variant-numeric:tabular-nums;'>"
-                        f"{value}</span></div>")
-
-                for _name, _ret, _mdd, _mru, _ref in _dd_rows:
-                    _dd_over = _ref is not None and _mdd > _ref
-                    _ret_over = (_ref is not None
-                                 and _ret < 0 and -_ret > _ref)
-                    _mru_over = _ref is not None and _mru > _ref
-                    _alarm = _dd_over or _ret_over
-                    _border = _RED if _alarm else "rgba(128,128,128,.3)"
-                    _rows = (
-                        _dd_line("总收益率", f"{_ret:+.2f}%",
-                                 _RED if _ret < 0 else _GREEN,
-                                 bold=_ret_over)
-                        + _dd_line("最大前进", f"+{_mru:.2f}%",
-                                   _GREEN if _mru_over else "inherit",
-                                   bold=_mru_over)
-                        + _dd_line("最大回撤", f"-{_mdd:.2f}%",
-                                   _RED if _dd_over else "inherit",
-                                   bold=_dd_over)
-                        + _dd_line("买入时近1年回撤",
-                                   (f"-{_ref:.2f}%"
-                                    if _ref is not None else "无数据"),
-                                   _GRAY))
-                    st.markdown(
-                        "<div style='border:1px solid "
-                        f"{_border};border-radius:8px;"
-                        "padding:6px 10px;margin-bottom:8px;'>"
-                        "<div style='font-size:0.84rem;"
-                        "font-weight:600;margin-bottom:2px;'>"
-                        f"{'⚠️ ' if _alarm else ''}{_name}</div>"
-                        f"{_rows}</div>",
-                        unsafe_allow_html=True)
-
         with col_main:
             if fig_ret is not None:
-                st.plotly_chart(fig_ret, use_container_width=True)
-                st.caption("🔻 红色竖带 = 上证指数当日下跌超 1%")
+                _chart_col, _dd_col = st.columns([3, 1.4])
+                with _chart_col:
+                    st.plotly_chart(fig_ret, use_container_width=True)
+                    st.caption("🔻 红色竖带 = 上证指数当日下跌超 1%")
+                with _dd_col:
+                    st.markdown(
+                        "**📊 持仓表现（自买入）**",
+                        help="总收益率、最大前进（当前净值相对买入以来最低点"
+                             "的涨幅）、最大回撤均自买入日起算；最后一行为"
+                             "买入时点的近1年最大回撤，作为比较基准：回撤或"
+                             "亏损幅度超过它时红色提示，最大前进超过它时"
+                             "绿色标记。")
+                    _RED, _GREEN, _GRAY = "#e0454b", "#21a366", "#8a8f98"
+
+                    def _dd_line(label, value, color, bold=False):
+                        return (
+                            "<div style='display:flex;justify-content:"
+                            "space-between;font-size:0.82rem;"
+                            "line-height:1.7;'>"
+                            f"<span style='color:{_GRAY};'>{label}</span>"
+                            f"<span style='color:{color};"
+                            f"font-weight:{600 if bold else 400};"
+                            f"font-variant-numeric:tabular-nums;'>"
+                            f"{value}</span></div>")
+
+                    for _name, _ret, _mdd, _mru, _ref in _dd_rows:
+                        _dd_over = _ref is not None and _mdd > _ref
+                        _ret_over = (_ref is not None
+                                     and _ret < 0 and -_ret > _ref)
+                        _mru_over = _ref is not None and _mru > _ref
+                        _alarm = _dd_over or _ret_over
+                        _border = _RED if _alarm else "rgba(128,128,128,.3)"
+                        _rows = (
+                            _dd_line("总收益率", f"{_ret:+.2f}%",
+                                     _RED if _ret < 0 else _GREEN,
+                                     bold=_ret_over)
+                            + _dd_line("最大前进", f"+{_mru:.2f}%",
+                                       _GREEN if _mru_over else "inherit",
+                                       bold=_mru_over)
+                            + _dd_line("最大回撤", f"-{_mdd:.2f}%",
+                                       _RED if _dd_over else "inherit",
+                                       bold=_dd_over)
+                            + _dd_line("买入时近1年回撤",
+                                       (f"-{_ref:.2f}%"
+                                        if _ref is not None else "无数据"),
+                                       _GRAY))
+                        st.markdown(
+                            "<div style='border:1px solid "
+                            f"{_border};border-radius:8px;"
+                            "padding:6px 10px;margin-bottom:8px;'>"
+                            "<div style='font-size:0.84rem;"
+                            "font-weight:600;margin-bottom:2px;'>"
+                            f"{'⚠️ ' if _alarm else ''}{_name}</div>"
+                            f"{_rows}</div>",
+                            unsafe_allow_html=True)
 
             # ── Holdings ──
             st.markdown(f"#### 📦 当前持仓（{len(hold)} 只）")

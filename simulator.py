@@ -214,6 +214,19 @@ def load_archive(archive_id: int) -> Optional[str]:
     return None
 
 
+def rename_archive(archive_id: int, new_name: str) -> Optional[str]:
+    """Rename an archive. Error string or None."""
+    new_name = (new_name or "").strip()
+    if not new_name:
+        return "名称不能为空"
+    conn = fetcher._conn()
+    cur = conn.execute(
+        "UPDATE sim_archives SET name=? WHERE id=?", (new_name, archive_id))
+    conn.commit()
+    conn.close()
+    return None if cur.rowcount else "存档不存在"
+
+
 def copy_archive(archive_id: int) -> Optional[str]:
     """Duplicate an archive (name + ' 副本') so a strategy can be branched
     and modified without touching the original. Error string or None."""
