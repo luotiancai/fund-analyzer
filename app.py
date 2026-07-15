@@ -421,35 +421,29 @@ with tab_table:
                     "占净值比例(%)": _part["占净值比例"],
                 }).reset_index(drop=True), use_container_width=True)
 
-        if _sel_rows:
-            st.markdown(f"##### 已选基金的最新十大持仓（截至 {_asof_lim}）")
-            st.caption("取季度末 ≤ 截至日期的最新披露季度；实际公告通常滞后季度末约两周")
-            _PER_ROW = 3
-            with st.spinner("加载持仓…"):
-                for _start in range(0, len(_sel_rows), _PER_ROW):
-                    _chunk = _sel_rows[_start:_start + _PER_ROW]
-                    _cols = st.columns(_PER_ROW, gap="medium")
-                    for _col, _ri in zip(_cols, _chunk):
-                        with _col, st.container(border=True):
-                            _render_holdings_cell(table.iloc[_ri])
-
-        # ── 模拟盘当前持仓的基金：重仓区常驻展示，无需在表格里勾选 ──
+        # 模拟盘在持基金常驻网格最前（无需勾选），其后是表格勾选的基金。
         _sim_d = simulator.get_current_date()
         _sim_codes = sorted(simulator.holdings_and_cash(_sim_d)[0]) if _sim_d else []
-        if _sim_codes:
-            _sim_names = dict(zip(fund_df["code"], fund_df["name"]))
-            st.markdown(
-                f"##### 💰 模拟盘持仓基金的最新十大持仓（截至 {_asof_lim}）")
-            _PER_ROW_SIM = 3
+        _sim_names = dict(zip(fund_df["code"], fund_df["name"]))
+        _cells = [{"基金代码": _c, "基金名称": _sim_names.get(_c, "")}
+                  for _c in _sim_codes]
+        for _ri in _sel_rows:
+            _frow = table.iloc[_ri]
+            if str(_frow["基金代码"]).zfill(6) not in _sim_codes:
+                _cells.append(_frow)
+
+        if _cells:
+            st.markdown(f"##### 已选基金的最新十大持仓（截至 {_asof_lim}）")
+            st.caption("模拟盘在持基金常驻最前；取季度末 ≤ 截至日期的最新披露季度，"
+                       "实际公告通常滞后季度末约两周")
+            _PER_ROW = 3
             with st.spinner("加载持仓…"):
-                for _start in range(0, len(_sim_codes), _PER_ROW_SIM):
-                    _chunk = _sim_codes[_start:_start + _PER_ROW_SIM]
-                    _cols = st.columns(_PER_ROW_SIM, gap="medium")
-                    for _col, _c in zip(_cols, _chunk):
+                for _start in range(0, len(_cells), _PER_ROW):
+                    _chunk = _cells[_start:_start + _PER_ROW]
+                    _cols = st.columns(_PER_ROW, gap="medium")
+                    for _col, _cell in zip(_cols, _chunk):
                         with _col, st.container(border=True):
-                            _render_holdings_cell(
-                                {"基金代码": _c,
-                                 "基金名称": _sim_names.get(_c, "")})
+                            _render_holdings_cell(_cell)
 
         csv = table.to_csv(index=False, encoding="utf-8-sig")
         st.download_button(
