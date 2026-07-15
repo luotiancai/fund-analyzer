@@ -571,6 +571,16 @@ with tab_sim:
             sim_date, _moved = simulator.advance_day()
             if not _moved:
                 st.toast("已到本地数据的最新日期，无法再推进", icon="⚠️")
+            else:
+                # 主要操作信号：落到沪指跌超1%的日子就提示——空仓时没有
+                # 持仓图表可看，这条提示是唯一入口。
+                _sse0 = load_sse_daily()
+                if _sse0 is not None and not _sse0.empty:
+                    _row0 = _sse0[_sse0["date"] == sim_date]
+                    if (not _row0.empty and pd.notna(_row0["pct"].iloc[0])
+                            and _row0["pct"].iloc[0] <= -1.0):
+                        st.toast(f"{sim_date} 沪指下跌 "
+                                 f"{_row0['pct'].iloc[0]:.2f}%", icon="🔻")
         if c2.button("◀️ 回退一天", use_container_width=True,
                      help="回到上一个交易日，并撤销当前这天的全部买卖"):
             sim_date, _moved = simulator.rollback_day()
@@ -824,40 +834,7 @@ with tab_sim:
                             st.rerun()
 
         with col_main:
-            if fig_ret is None:
-                # 空仓时改画上证走势 — 红色竖带（跌超1%）是主要操作信号，
-                # 不能因为没有持仓就看不到。
-                _start = simulator.get_start_date()
-                _win = (_sse_all[(_sse_all["date"] >= _start)
-                                 & (_sse_all["date"] <= sim_date)].copy()
-                        if _sse_all is not None and not _sse_all.empty
-                        else None)
-                if _win is not None and not _win.empty:
-                    fig_sse = px.line(
-                        _win, x="date", y="close",
-                        title=f"上证指数（{_start} ~ {sim_date}，当前空仓）",
-                        labels={"date": "日期", "close": "点位"},
-                        height=380,
-                        color_discrete_sequence=["#8a8f98"],
-                    )
-                    fig_sse.update_traces(
-                        line=dict(width=2),
-                        # markers so a freshly-reset sim (a single day of
-                        # history) still shows a visible point
-                        mode="lines+markers" if len(_win) <= 30 else "lines",
-                        hovertemplate="%{y:,.0f}<extra>上证指数</extra>")
-                    fig_sse.update_layout(hovermode="x unified")
-                    _wdates = pd.to_datetime(_win["date"])
-                    _span_d = max((_wdates.max() - _wdates.min()).days, 1)
-                    fig_sse.update_xaxes(
-                        hoverformat="%Y-%m-%d", tickformat="%Y-%m-%d",
-                        dtick=max(1, _span_d // 8) * 86400000)
-                    _add_sse_drop_bands(fig_sse, _sse_all,
-                                        _wdates.min(), _wdates.max())
-                    st.plotly_chart(fig_sse, use_container_width=True)
-                    st.caption("当前空仓，显示上证指数走势 · "
-                               "🔻 红色竖带 = 上证指数当日下跌超 1%")
-            else:
+            if fig_ret is not None:
                 _chart_col, _dd_col = st.columns([3, 1.4])
                 with _chart_col:
                     st.plotly_chart(fig_ret, use_container_width=True)
