@@ -355,6 +355,17 @@ def is_c_class(name) -> bool:
     return _C_CLASS_RE.search(str(name).strip()) is not None
 
 
+# Overseas-equity funds are excluded from storage/backfill entirely: QDII
+# quota limits keep roughly half of them capped at a few hundred yuan per day
+# (median cap ~500 CNY as of 2026-07), so they can't actually be bought in
+# meaningful size and would only pollute screening results.
+OVERSEAS_EQUITY_TYPES = {"指数型-海外股票", "QDII-普通股票", "QDII-混合偏股"}
+
+
+def is_overseas_equity(fund_type) -> bool:
+    return fund_type in OVERSEAS_EQUITY_TYPES
+
+
 # ── Fund list ────────────────────────────────────────────────────────────────
 
 # The fund list is a single cached snapshot (always read/written whole), so it
@@ -1262,12 +1273,16 @@ def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
     backfilled = 0
     if do_backfill:
         have = list_nav_codes()
-        # Only C-class shares get a NAV history; without this filter every
-        # non-C fund cleaned out of the DB would be re-downloaded daily.
-        names = list_df.dropna(subset=["code"]).drop_duplicates("code") \
-            .set_index("code")["name"]
+        # Only C-class, non-overseas-equity shares get a NAV history; without
+        # this filter every fund cleaned out of the DB (non-C, QDII/海外股)
+        # would be re-downloaded daily.
+        meta = list_df.dropna(subset=["code"]).drop_duplicates("code") \
+            .set_index("code")[["name", "type"]]
+        names = meta["name"]
+        types = meta["type"]
         todo = [c for c in all_codes
-                if c not in have and is_c_class(names.get(c))]
+                if c not in have and is_c_class(names.get(c))
+                and not is_overseas_equity(types.get(c))]
         backfilled = _backfill_codes(
             todo, workers, lambda d, t: _p("回填缺失历史", d, t)
         )
