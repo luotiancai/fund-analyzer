@@ -111,6 +111,24 @@ def mdd_1y_at_buy(code: str, buy_date: str):
     return float(((_peak - _adj) / _peak).max() * 100.0)
 
 
+# Red bands on trading days where 上证指数 fell over 1% — the user's main
+# operating signal, drawn on any date-axis figure that covers [dmin, dmax].
+def _add_sse_drop_bands(fig, sse, dmin, dmax):
+    if sse is None or sse.empty:
+        return
+    _d = pd.to_datetime(sse["date"])
+    _drop = sse[(sse["pct"] <= -1.0) & (_d >= dmin) & (_d <= dmax)]
+    for _, _r in _drop.iterrows():
+        _dd = pd.Timestamp(_r["date"])
+        fig.add_vrect(
+            x0=_dd - pd.Timedelta(hours=12), x1=_dd + pd.Timedelta(hours=12),
+            fillcolor="#e0454b", opacity=0.15, line_width=0)
+        fig.add_annotation(
+            x=_dd, y=1.02, yref="paper", yanchor="bottom",
+            text=f"沪指{_r['pct']:.1f}%", showarrow=False, textangle=-40,
+            font=dict(size=10, color="#e0454b"))
+
+
 # Precomputed Sharpe/drawdown as a merge-ready DataFrame, built once and shared
 # across sessions/reruns (reading ~20k SQLite rows + dict→DataFrame on every
 # filter click is what made 筛选 feel slow). `cache_key` is last_update_time(),
@@ -642,12 +660,25 @@ with tab_sim:
         day_pnl = total - prev_total
         total_pnl = total - simulator.INITIAL_CAPITAL
 
-        m1, m2, m3, m4, m5 = st.columns(5)
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("模拟日期", sim_date)
         m2.metric("总资产", f"¥{total:,.0f}", delta=f"{day_pnl:+,.0f} 当日")
         m3.metric("现金", f"¥{cash:,.0f}")
         m4.metric("总收益", f"¥{total_pnl:+,.0f}")
         m5.metric("总收益率", f"{total_pnl / simulator.INITIAL_CAPITAL * 100:+.2f}%")
+        # 沪指 stays visible even with no holdings — it's the operating
+        # signal; without it an empty-portfolio day hides whether 上证 fell.
+        _sse_all = load_sse_daily()
+        if _sse_all is not None and not _sse_all.empty:
+            _upto = _sse_all[_sse_all["date"] <= sim_date]
+            if not _upto.empty:
+                _r = _upto.iloc[-1]
+                m6.metric(
+                    "上证指数" + ("" if _r["date"] == sim_date
+                                  else f"（{_r['date']}）"),
+                    f"{_r['close']:,.0f}",
+                    delta=(f"{_r['pct']:+.2f}% 当日"
+                           if pd.notna(_r["pct"]) else None))
         st.caption(
             f"从 {simulator.get_start_date()} 开始 · "
             f"初始资金 ¥{simulator.INITIAL_CAPITAL:,.0f} · "
@@ -720,26 +751,8 @@ with tab_sim:
                     hoverformat="%Y-%m-%d", tickformat="%Y-%m-%d",
                     dtick=max(1, _span_d // 8) * 86400000)
 
-                # Red bands on trading days where 上证指数 fell over 1% —
-                # the user's main operating signal.
-                _sse = load_sse_daily()
-                if _sse is not None and not _sse.empty:
-                    _drop = _sse[
-                        (_sse["pct"] <= -1.0)
-                        & (pd.to_datetime(_sse["date"]) >= _rdates.min())
-                        & (pd.to_datetime(_sse["date"]) <= _rdates.max())]
-                    for _, _r in _drop.iterrows():
-                        _d = pd.Timestamp(_r["date"])
-                        fig_ret.add_vrect(
-                            x0=_d - pd.Timedelta(hours=12),
-                            x1=_d + pd.Timedelta(hours=12),
-                            fillcolor="#e0454b", opacity=0.15,
-                            line_width=0)
-                        fig_ret.add_annotation(
-                            x=_d, y=1.02, yref="paper", yanchor="bottom",
-                            text=f"沪指{_r['pct']:.1f}%", showarrow=False,
-                            textangle=-40,
-                            font=dict(size=10, color="#e0454b"))
+                _add_sse_drop_bands(fig_ret, load_sse_daily(),
+                                    _rdates.min(), _rdates.max())
 
                 # Max drawdown since each position's buy date, from the same
                 # daily-return growth index the chart uses (so a dividend's
@@ -811,7 +824,40 @@ with tab_sim:
                             st.rerun()
 
         with col_main:
-            if fig_ret is not None:
+            if fig_ret is None:
+                # 空仓时改画上证走势 — 红色竖带（跌超1%）是主要操作信号，
+                # 不能因为没有持仓就看不到。
+                _start = simulator.get_start_date()
+                _win = (_sse_all[(_sse_all["date"] >= _start)
+                                 & (_sse_all["date"] <= sim_date)].copy()
+                        if _sse_all is not None and not _sse_all.empty
+                        else None)
+                if _win is not None and not _win.empty:
+                    fig_sse = px.line(
+                        _win, x="date", y="close",
+                        title=f"上证指数（{_start} ~ {sim_date}，当前空仓）",
+                        labels={"date": "日期", "close": "点位"},
+                        height=380,
+                        color_discrete_sequence=["#8a8f98"],
+                    )
+                    fig_sse.update_traces(
+                        line=dict(width=2),
+                        # markers so a freshly-reset sim (a single day of
+                        # history) still shows a visible point
+                        mode="lines+markers" if len(_win) <= 30 else "lines",
+                        hovertemplate="%{y:,.0f}<extra>上证指数</extra>")
+                    fig_sse.update_layout(hovermode="x unified")
+                    _wdates = pd.to_datetime(_win["date"])
+                    _span_d = max((_wdates.max() - _wdates.min()).days, 1)
+                    fig_sse.update_xaxes(
+                        hoverformat="%Y-%m-%d", tickformat="%Y-%m-%d",
+                        dtick=max(1, _span_d // 8) * 86400000)
+                    _add_sse_drop_bands(fig_sse, _sse_all,
+                                        _wdates.min(), _wdates.max())
+                    st.plotly_chart(fig_sse, use_container_width=True)
+                    st.caption("当前空仓，显示上证指数走势 · "
+                               "🔻 红色竖带 = 上证指数当日下跌超 1%")
+            else:
                 _chart_col, _dd_col = st.columns([3, 1.4])
                 with _chart_col:
                     st.plotly_chart(fig_ret, use_container_width=True)
