@@ -96,7 +96,8 @@ def load_sse_daily():
     return fetcher.fetch_sse_daily()
 
 
-# 1y max drawdown as it stood on the buy date (window: buy_date-365d → buy_date).
+# 1y max drawdown as it stood on the buy date (window: buy_date-365d → buy_date),
+# on the daily-return growth index so dividend NAV resets don't count as drops.
 # Immutable history, so the (code, buy_date) cache never needs invalidating.
 @st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
 def mdd_1y_at_buy(code: str, buy_date: str):
@@ -104,8 +105,10 @@ def mdd_1y_at_buy(code: str, buy_date: str):
     _s = simulator.nav_series(code, _start, buy_date)
     if len(_s) < 2:
         return None
-    _peak = _s["nav"].cummax()
-    return float(((_peak - _s["nav"]) / _peak).max() * 100.0)
+    _adj = (1.0 + pd.to_numeric(_s["daily_ret_pct"], errors="coerce")
+            .fillna(0.0) / 100.0).cumprod()
+    _peak = _adj.cummax()
+    return float(((_peak - _adj) / _peak).max() * 100.0)
 
 
 # Precomputed Sharpe/drawdown as a merge-ready DataFrame, built once and shared
@@ -657,8 +660,10 @@ with tab_sim:
 
         # ── 图表与持仓表现数据（先构建，再进布局）──
         # Each line starts at that position's entry day at 0% and compounds
-        # the fund's NAV relative to the entry NAV. History stops at the
-        # simulated date — no peeking at the future.
+        # the fund's official DAILY RETURNS (dividend-adjusted), not the raw
+        # unit NAV — a payout day resets the unit NAV (looks like a -10%
+        # cliff) while the actual daily return stays ordinary. History stops
+        # at the simulated date — no peeking at the future.
         fig_ret, _dd_rows = None, []
         if not hold.empty:
             _frames = []
@@ -669,8 +674,16 @@ with tab_sim:
                 _s = simulator.nav_series(_c, _h["open_date"], sim_date)
                 if _s.empty:
                     continue
+                # Growth index anchored at 1 on the entry day (the entry
+                # day's own return predates the EOD fill, so it's divided
+                # out); missing returns count as flat.
+                _g = (1.0 + pd.to_numeric(_s["daily_ret_pct"],
+                                          errors="coerce").fillna(0.0)
+                      / 100.0).cumprod()
+                _g = _g / _g.iloc[0]
                 _frames.append(_s.assign(
-                    cum_ret=(_s["nav"] / _h["open_nav"] - 1.0) * 100.0,
+                    adj=_g,
+                    cum_ret=(_g - 1.0) * 100.0,
                     fund=f"{_c} {_code_names.get(_c, '')}",
                 ))
             if _frames:
@@ -728,18 +741,18 @@ with tab_sim:
                             textangle=-40,
                             font=dict(size=10, color="#e0454b"))
 
-                # Max drawdown since each position's buy date, from the
-                # same NAV series the chart uses (peak = running NAV max
-                # within the holding window), plus the fund's 1y max
-                # drawdown as it stood on the buy date for comparison.
+                # Max drawdown since each position's buy date, from the same
+                # daily-return growth index the chart uses (so a dividend's
+                # NAV reset never counts as a drawdown), plus the fund's 1y
+                # max drawdown as it stood on the buy date for comparison.
                 _open_dates = dict(zip(hold["code"], hold["open_date"]))
                 for _f in _frames:
-                    _peak = _f["nav"].cummax()
-                    _mdd = ((_peak - _f["nav"]) / _peak).max() * 100.0
-                    # Run-up: current NAV's rise from the lowest NAV
-                    # since the position was opened.
-                    _low = float(_f["nav"].min())
-                    _mru = (float(_f["nav"].iloc[-1]) / _low - 1.0) * 100.0
+                    _peak = _f["adj"].cummax()
+                    _mdd = ((_peak - _f["adj"]) / _peak).max() * 100.0
+                    # Run-up: current rise from the lowest point since the
+                    # position was opened, on the same growth index.
+                    _low = float(_f["adj"].min())
+                    _mru = (float(_f["adj"].iloc[-1]) / _low - 1.0) * 100.0
                     _ret = float(_f["cum_ret"].iloc[-1])
                     _label = _f["fund"].iloc[0]
                     _c = _label.split()[0]
@@ -806,10 +819,10 @@ with tab_sim:
                 with _dd_col:
                     st.markdown(
                         "**📊 持仓表现（自买入）**",
-                        help="总收益率、最大前进（当前净值相对买入以来最低点"
+                        help="总收益率、当前最大前进（当前净值相对买入以来最低点"
                              "的涨幅）、最大回撤均自买入日起算；最后一行为"
                              "买入时点的近1年最大回撤，作为比较基准：回撤或"
-                             "亏损幅度超过它时红色提示，最大前进超过它时"
+                             "亏损幅度超过它时红色提示，当前最大前进超过它时"
                              "绿色标记。")
                     _RED, _GREEN, _GRAY = "#e0454b", "#21a366", "#8a8f98"
 
@@ -835,7 +848,7 @@ with tab_sim:
                             _dd_line("总收益率", f"{_ret:+.2f}%",
                                      _RED if _ret < 0 else _GREEN,
                                      bold=_ret_over)
-                            + _dd_line("最大前进", f"+{_mru:.2f}%",
+                            + _dd_line("当前最大前进", f"+{_mru:.2f}%",
                                        _GREEN if _mru_over else "inherit",
                                        bold=_mru_over)
                             + _dd_line("最大回撤", f"-{_mdd:.2f}%",

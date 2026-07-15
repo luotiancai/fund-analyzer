@@ -306,6 +306,40 @@ def delete_archive(archive_id: int):
 
 # ── Portfolio state (replayed from the trade log) ────────────────────────────
 
+# A payout/split day is one where the published unit NAV disagrees with
+# prev_nav × (1 + official daily return) by more than rounding noise (unit
+# NAV has 3-4 decimals, the return 2 — noise stays well under 0.1%).
+DIVIDEND_EPS = 0.003
+
+
+def _dividend_events(codes, upto: str) -> dict:
+    """{code: [(date, share_mult), ...]} — dividend/split days, date-ascending.
+
+    On such a day a holder's wealth grows by the official daily return while
+    the unit NAV resets, so shares are multiplied by
+    prev_nav × (1 + r) / nav — the dividend reinvested at that day's NAV
+    (resp. the split ratio). Days with a missing official return are skipped.
+    """
+    out = {}
+    conn = fetcher._conn()
+    for c in codes:
+        df = pd.read_sql_query(
+            "SELECT date, nav, daily_ret_pct FROM fund_nav_daily "
+            "WHERE code=? AND nav IS NOT NULL AND date<=? ORDER BY date",
+            conn, params=(c, upto))
+        if df.empty:
+            continue
+        r = pd.to_numeric(df["daily_ret_pct"], errors="coerce") / 100.0
+        mult = df["nav"].shift(1) * (1.0 + r) / df["nav"]
+        evs = [(df["date"].iloc[i], float(mult.iloc[i]))
+               for i in range(len(df))
+               if pd.notna(mult.iloc[i]) and abs(mult.iloc[i] - 1.0) > DIVIDEND_EPS]
+        if evs:
+            out[c] = evs
+    conn.close()
+    return out
+
+
 def nav_asof(code: str, date: str) -> Tuple[Optional[str], Optional[float]]:
     """Latest (nav_date, nav) on/before `date` — never looks into the future."""
     conn = fetcher._conn()
@@ -326,16 +360,32 @@ def _load_trades(upto: str) -> list:
     return rows
 
 
-def _replay(trades) -> Tuple[dict, float]:
+def _replay(trades, events: Optional[dict] = None) -> Tuple[dict, float]:
     """Replay trades → ({code: [shares, cost, open_date, open_nav]}, cash).
 
     Average-cost basis. open_date/open_nav are from the trade that opened the
     current position (a full exit clears them; re-buying starts a new lot),
     so charts can show 累计收益率 since the actual entry point.
+
+    `events` ({code: [(date, mult)]}, see _dividend_events) are share
+    multipliers from dividend reinvestment / splits, applied in date order
+    while the position is held; a date's events apply before its trades
+    (ex-dividend precedes the same-day EOD fill).
     """
+    stream = [(t["date"], 1, t) for t in trades]
+    for code, evs in (events or {}).items():
+        stream += [(d, 0, (code, m)) for d, m in evs]
+    stream.sort(key=lambda x: (x[0], x[1]))   # stable → trade id order kept
+
     cash = INITIAL_CAPITAL
     pos: dict = {}
-    for t in trades:
+    for _d, _kind, item in stream:
+        if _kind == 0:
+            p = pos.get(item[0])
+            if p:
+                p[0] *= item[1]
+            continue
+        t = item
         if t["action"] == "buy":
             cash -= t["amount"]
             p = pos.setdefault(t["code"], [0.0, 0.0, t["date"], t["nav"]])
@@ -354,7 +404,9 @@ def _replay(trades) -> Tuple[dict, float]:
 
 
 def holdings_and_cash(asof: str) -> Tuple[dict, float]:
-    return _replay(_load_trades(asof))
+    trades = _load_trades(asof)
+    events = _dividend_events({t["code"] for t in trades}, asof)
+    return _replay(trades, events)
 
 
 def portfolio_value(asof: str) -> float:
@@ -490,11 +542,21 @@ def equity_curve() -> pd.DataFrame:
         nav_ff[c] = s.reindex(idx).ffill()
     conn.close()
 
+    # Dividend/split share multipliers, grouped by date (same semantics as
+    # _replay: a date's events apply before its trades).
+    ev_by_date: dict = {}
+    for c, evs in _dividend_events(codes, cur).items():
+        for ed, m in evs:
+            ev_by_date.setdefault(ed, []).append((c, m))
+
     cash = INITIAL_CAPITAL
     pos: dict = {}
     ti = 0
     out = []
     for d in days:
+        for c, m in ev_by_date.get(d, ()):
+            if c in pos:
+                pos[c][0] *= m
         while ti < len(trades) and trades[ti]["date"] <= d:
             t = trades[ti]
             if t["action"] == "buy":
