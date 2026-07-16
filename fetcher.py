@@ -237,6 +237,32 @@ SHARPE_DAYS = {"sharpe_6m": 182, "sharpe_1y": 365}
 RETURN_DAYS = {"ret_1m": 30, "ret_3m": 91, "ret_6m": 182, "ret_1y": 365}
 
 
+def effective_daily_ret(df: pd.DataFrame) -> pd.Series:
+    """每日实际收益率(小数),供收益/回撤/分红检测统一使用。
+
+    优先取官方日增长率(daily_ret_pct);但当它与净值环比矛盾(差>0.3pp)
+    且累计净值也同步变动(说明不是分红/拆分)时,回退为净值环比——修复
+    定开/建仓期基金按周披露净值却把日增长率报成 0 的数据问题(全库约
+    1.7 万行、3 千余只基金,如 008092 的 2020 年初,直接累乘会把当时的
+    股灾算成 0 波动)。真正的分红日(累计净值走势与日增长率一致、单位
+    净值跳水)仍信官方日增长率。缺失值回退净值环比。
+    """
+    nav = pd.to_numeric(df["nav"], errors="coerce")
+    acc = pd.to_numeric(df["acc_nav"], errors="coerce").fillna(nav) \
+        if "acc_nav" in df.columns else nav
+    r = pd.to_numeric(df["daily_ret_pct"], errors="coerce") / 100.0 \
+        if "daily_ret_pct" in df.columns \
+        else pd.Series(np.nan, index=df.index)
+    implied_nav = nav / nav.shift(1) - 1.0
+    implied_acc = acc / acc.shift(1) - 1.0
+    conflict = (r - implied_nav).abs() > 0.003
+    dividendish = (r - implied_acc).abs() <= 0.003
+    out = r.copy()
+    use_implied = (conflict & ~dividendish & implied_nav.notna()) | r.isna()
+    out[use_implied] = implied_nav[use_implied]
+    return out
+
+
 # A window anchor may miss by a few days when the ideal start lands in a
 # holiday gap or just before the stored history begins (data starts NAV_START,
 # but 01-01 itself is a holiday). Accept the earliest NAV as anchor when it is
@@ -613,15 +639,13 @@ def _metrics_from_nav(nav_df: pd.DataFrame, rf: float) -> Optional[dict]:
     df["date"] = pd.to_datetime(df["date"])
     df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
     # daily_ret_pct is percentage; convert to decimal
-    if "daily_ret_pct" in df.columns:
-        df["r"] = pd.to_numeric(df["daily_ret_pct"], errors="coerce") / 100.0
-    else:
-        df["r"] = df["nav"].pct_change()
     if "acc_nav" in df.columns:
         df["acc_nav"] = pd.to_numeric(df["acc_nav"], errors="coerce").fillna(df["nav"])
     else:
         df["acc_nav"] = df["nav"]
     df = df.sort_values("date").reset_index(drop=True)
+    # 官方日增长率经 effective_daily_ret 校正(建仓期假 0 → 净值环比)。
+    df["r"] = effective_daily_ret(df)
 
     returns = df["r"].dropna()
     if len(returns) < 20:

@@ -455,12 +455,14 @@ def _dividend_events(codes, upto: str) -> dict:
     conn = fetcher._conn()
     for c in codes:
         df = pd.read_sql_query(
-            "SELECT date, nav, daily_ret_pct FROM fund_nav_daily "
+            "SELECT date, nav, daily_ret_pct, acc_nav FROM fund_nav_daily "
             "WHERE code=? AND nav IS NOT NULL AND date<=? ORDER BY date",
             conn, params=(c, upto))
         if df.empty:
             continue
-        r = pd.to_numeric(df["daily_ret_pct"], errors="coerce") / 100.0
+        # 校正后的日收益率:建仓期"日增长率=0 但净值在动"的行不再被误判
+        # 为分红/拆分(见 fetcher.effective_daily_ret)。
+        r = fetcher.effective_daily_ret(df)
         mult = df["nav"].shift(1) * (1.0 + r) / df["nav"]
         evs = [(df["date"].iloc[i], float(mult.iloc[i]))
                for i in range(len(df))
@@ -604,15 +606,19 @@ def sell(code: str, shares: Optional[float] = None) -> Optional[str]:
 def nav_series(code: str, start: str, end: str) -> pd.DataFrame:
     """NAV + daily-return history for one fund within [start, end] (ascending).
 
-    Columns: date, nav, daily_ret_pct. `end` should be the current simulated
-    date so charts never show the future to the strategy being tested.
+    Columns: date, nav, daily_ret_pct, acc_nav, ret (=校正后日收益率小数,
+    见 fetcher.effective_daily_ret — 图表/回撤请用它而非 daily_ret_pct).
+    `end` should be the current simulated date so charts never show the
+    future to the strategy being tested.
     """
     conn = fetcher._conn()
     df = pd.read_sql_query(
-        "SELECT date, nav, daily_ret_pct FROM fund_nav_daily "
+        "SELECT date, nav, daily_ret_pct, acc_nav FROM fund_nav_daily "
         "WHERE code = ? AND date >= ? AND date <= ? AND nav IS NOT NULL "
         "ORDER BY date", conn, params=(code, start, end))
     conn.close()
+    if not df.empty:
+        df["ret"] = fetcher.effective_daily_ret(df)
     return df
 
 

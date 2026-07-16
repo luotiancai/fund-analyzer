@@ -98,16 +98,17 @@ def load_sse_daily():
 
 
 # 1y max drawdown as it stood on the buy date (window: buy_date-365d → buy_date),
-# on the daily-return growth index so dividend NAV resets don't count as drops.
-# Immutable history, so the (code, buy_date) cache never needs invalidating.
+# on the corrected daily-return growth index (nav_series 的 ret 列) so dividend
+# NAV resets don't count as drops, while build-up-period fake-zero growth rates
+# don't hide real ones. Immutable history, so the (code, buy_date) cache never
+# needs invalidating.
 @st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
 def mdd_1y_at_buy(code: str, buy_date: str):
     _start = (pd.Timestamp(buy_date) - pd.Timedelta(days=365)).strftime("%Y-%m-%d")
     _s = simulator.nav_series(code, _start, buy_date)
     if len(_s) < 2:
         return None
-    _adj = (1.0 + pd.to_numeric(_s["daily_ret_pct"], errors="coerce")
-            .fillna(0.0) / 100.0).cumprod()
+    _adj = (1.0 + _s["ret"].fillna(0.0)).cumprod()
     _peak = _adj.cummax()
     return float(((_peak - _adj) / _peak).max() * 100.0)
 
@@ -209,10 +210,10 @@ with tab_table:
         with col_f2:
             period_label = st.selectbox("时间区间", options=list(PERIODS.keys()), index=3)
         with col_f3:
-            min_ret = st.number_input("所选区间最低收益率 %", value=20.0, step=1.0)
+            min_ret = st.number_input("所选区间最低收益率 %", value=50.0, step=1.0)
         with col_f4:
             max_dd = st.number_input(
-                "所选区间最大回撤率 %", value=15.0, min_value=0.0, step=1.0,
+                "所选区间最大回撤率 %", value=100.0, min_value=0.0, step=1.0,
             )
         with col_f5:
             asof_date = st.date_input(
@@ -781,10 +782,9 @@ with tab_sim:
                     continue
                 # Growth index anchored at 1 on the entry day (the entry
                 # day's own return predates the EOD fill, so it's divided
-                # out); missing returns count as flat.
-                _g = (1.0 + pd.to_numeric(_s["daily_ret_pct"],
-                                          errors="coerce").fillna(0.0)
-                      / 100.0).cumprod()
+                # out); missing returns count as flat. `ret` is the corrected
+                # daily return (see fetcher.effective_daily_ret).
+                _g = (1.0 + _s["ret"].fillna(0.0)).cumprod()
                 _g = _g / _g.iloc[0]
                 _frames.append(_s.assign(
                     adj=_g,
