@@ -62,7 +62,8 @@ with st.sidebar:
 
     st.divider()
     st.caption("数据来源：天天基金（AKShare）")
-    st.caption("夏普比率 = (年化收益 − 无风险利率) / 年化波动率")
+    st.caption("近6月/近1年夏普为支付宝口径：周收益几何年化 / (周波动 × √52)，"
+               "与蚂蚁财富展示值一致")
 
 update_btn = st.session_state.pop("_run_update", False)
 
