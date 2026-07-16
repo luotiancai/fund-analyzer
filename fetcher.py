@@ -303,40 +303,25 @@ def _annualized(r: pd.Series, span_days: int, rf: float):
     return ann_return, ann_vol, (ann_return - rf) / ann_vol
 
 
-# 支付宝夏普口径的无风险利率:一年期定存基准利率(2015年至今 1.5%)。
-ALIPAY_RF = 0.015
-
-
 def _period_sharpe(df: pd.DataFrame, days_back: int, rf: float) -> Optional[float]:
-    """Annualized Sharpe over the trailing window, 支付宝(蚂蚁财富)口径.
-
-    Weekly (Friday-sampled) returns of the dividend-adjusted growth index:
-    (geometric-annualized weekly return − rf) / (weekly population std × √52).
-    Calibrated against 7 funds' displayed 近1年夏普 on 2026-07-16
-    (015159→6.05 … 006503→5.49): rf=ALIPAY_RF with ddof=0 minimizes the fit
-    (MAE 0.059, mean bias −0.011); residual ±0.05 (one QDII-like outlier
-    −0.15) tracks their in-house NAV feed, not the formula. The prior
-    daily-frequency convention ran ~0.3 lower across the board.
+    """Annualized Sharpe over the trailing `days_back` calendar-day window —
+    the textbook convention: daily returns, geometric-annualized excess return
+    over annualized daily volatility (see _annualized). rf is the real 1y
+    China treasury yield. (支付宝 shows ~0.3 higher: it samples weekly and
+    uses rf≈定存基准 — deliberately not replicated here.)
 
     Returns None when the fund lacks enough history to cover the window.
     """
     window = _window_by_date(df, days_back)
     if window is None:
         return None
-    # Drop the anchor's own return: it happened the day before the window
-    # opens. The growth index then starts at 1 on the anchor date.
-    adj = (1.0 + window["r"].iloc[1:].fillna(0.0)).cumprod()
-    s = pd.Series(adj.values, index=window["date"].iloc[1:])
-    # Empty holiday weeks resample to NaN; pct_change over them yields NaN
-    # (that week and the next) which are dropped — matching the calibration.
-    w = s.resample("W-FRI").last().pct_change().dropna()
-    if len(w) < int(days_back / 365 * 52 * 0.75) or len(w) < 2:
+    # Drop the anchor's own return: it happened the day before the window opens.
+    r = window["r"].iloc[1:].dropna()
+    if len(r) < int(days_back / 365 * 200):
         return None
-    std = w.std(ddof=0)
-    if std == 0 or np.isnan(std):
-        return None
-    ann_ret = float((1.0 + w).prod()) ** (52.0 / len(w)) - 1.0
-    return float((ann_ret - rf) / (std * np.sqrt(52.0)))
+    span = (window["date"].iloc[-1] - window["date"].iloc[0]).days
+    res = _annualized(r, span, rf)
+    return float(res[2]) if res else None
 
 
 def _period_return(df: pd.DataFrame, days_back: int) -> Optional[float]:
@@ -653,9 +638,7 @@ def _metrics_from_nav(nav_df: pd.DataFrame, rf: float) -> Optional[dict]:
     # date-aligned with EastMoney's 近X 收益率. A fund younger than a window
     # gets None for it (no anchor) rather than a misleadingly short reading.
     # Drawdown runs on accumulated NAV so dividends aren't mistaken for drops.
-    # rf 用一年定存基准利率匹配支付宝显示值（见 _period_sharpe 校准说明）。
-    psharpe = {key: _period_sharpe(df, days, ALIPAY_RF)
-               for key, days in SHARPE_DAYS.items()}
+    psharpe = {key: _period_sharpe(df, days, rf) for key, days in SHARPE_DAYS.items()}
     mdd = {key: _period_mdd(df, days) for key, days in DRAWDOWN_DAYS.items()}
     rets = {key: _period_return(df, days) for key, days in RETURN_DAYS.items()}
 
