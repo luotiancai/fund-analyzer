@@ -106,6 +106,8 @@ def load_sse_daily():
 def mdd_1y_at_buy(code: str, buy_date: str):
     _start = (pd.Timestamp(buy_date) - pd.Timedelta(days=365)).strftime("%Y-%m-%d")
     _s = simulator.nav_series(code, _start, buy_date)
+    # 买入决策发生在当日盘中，当日净值尚未公布 — 参考窗口止于前一交易日。
+    _s = _s[_s["date"] < buy_date]
     if len(_s) < 2:
         return None
     _adj = (1.0 + _s["ret"].fillna(0.0)).cumprod()
@@ -213,7 +215,7 @@ with tab_table:
             min_ret = st.number_input("所选区间最低收益率 %", value=50.0, step=1.0)
         with col_f4:
             max_dd = st.number_input(
-                "所选区间最大回撤率 %", value=100.0, min_value=0.0, step=1.0,
+                "所选区间最大回撤率 %", value=15.0, min_value=0.0, step=1.0,
             )
         with col_f5:
             asof_date = st.date_input(
@@ -221,9 +223,10 @@ with tab_table:
                 value=None,
                 min_value=dt.date(2021, 1, 1),
                 max_value=dt.date.today(),
-                help="按该日及之前的净值历史重算收益/回撤/夏普，还原当天的筛选结果。"
-                     "本地净值（仅C类）从 2020-01-01 起，因此最早可选 2021-01-01，"
-                     "保证近1年窗口有完整数据。",
+                help="还原你在该日进行筛选时能看到的结果：只用该日之前"
+                     "（不含当日，当日净值当时尚未公布）的净值历史重算"
+                     "收益/回撤/夏普。本地净值（仅C类）从 2020-01-01 起，"
+                     "因此最早可选 2021-01-01，保证近1年窗口有完整数据。",
             )
         submitted = st.form_submit_button("🔍 开始筛选", type="primary")
 
@@ -311,7 +314,8 @@ with tab_table:
                 .reset_index().rename(columns={"index": "code"})
             work_df = fund_df[["code", "name", "type"]].merge(_mdf, on="code", how="inner")
             st.caption(
-                f"📅 快照模式：按 {_asof_iso} 及之前的净值计算收益/夏普/回撤"
+                f"📅 快照模式：按 {_asof_iso} 之前（不含当日）的净值计算"
+                f"收益/夏普/回撤，即当天筛选时实际可见的数据"
                 f"（覆盖 {len(work_df):,} 只基金）"
             )
         else:

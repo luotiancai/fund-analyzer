@@ -1198,12 +1198,14 @@ def recompute_all(rf: Optional[float] = None,
 
 def compute_metrics_asof(asof: str, rf: Optional[float] = None,
                          progress_callback: Optional[Callable] = None) -> dict:
-    """Every fund's metrics as they stood on a past date, from stored NAV only.
+    """Every fund's metrics as an observer ON `asof` could have seen them.
 
-    Truncates each fund's history to rows on/before `asof` (ISO yyyy-mm-dd) and
-    recomputes period returns, Sharpe and drawdown over the same trailing
-    windows — no network, nothing persisted. Funds with under 20 NAV points by
-    that date are omitted. Returns {code: metrics-dict}.
+    Truncates each fund's history to rows STRICTLY BEFORE `asof` (ISO
+    yyyy-mm-dd): on day D the day's own NAV is published only after close, so
+    a screen run on D can only be based on data through D-1. Recomputes
+    period returns, Sharpe and drawdown over the same trailing windows — no
+    network, nothing persisted. Funds with under 20 NAV points by that date
+    are omitted. Returns {code: metrics-dict}.
     """
     if rf is None:
         rf = get_risk_free_rate()
@@ -1213,7 +1215,7 @@ def compute_metrics_asof(asof: str, rf: Optional[float] = None,
     for i, code in enumerate(codes):
         df = pd.read_sql_query(
             "SELECT date, nav, daily_ret_pct, acc_nav FROM fund_nav_daily "
-            "WHERE code = ? AND date <= ? ORDER BY date",
+            "WHERE code = ? AND date < ? ORDER BY date",
             conn, params=(code, asof))
         if len(df) >= 20:
             df["date"] = pd.to_datetime(df["date"])
