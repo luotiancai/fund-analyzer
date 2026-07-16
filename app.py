@@ -627,6 +627,32 @@ with tab_sim:
                     st.session_state["sim_msg"] = (
                         f"已存档「{_arch_name.strip() or '未命名'}」")
                     st.rerun()
+            st.divider()
+            _up = st.file_uploader(
+                "导入交易记录 CSV", type=["csv"], key="trades_csv_up",
+                help="接受「⬇️ 导出交易记录 CSV」导出的文件；"
+                     "导入会覆盖当前模拟盘（建议先存档），"
+                     "起始日期取首笔交易日，模拟日期定位到末笔交易日。")
+            if _up is not None and st.button(
+                    "📥 导入并覆盖当前模拟盘", key="trades_csv_go",
+                    use_container_width=True):
+                try:
+                    _csv_df = pd.read_csv(_up, encoding="utf-8-sig",
+                                          dtype={"代码": str})
+                except Exception:
+                    _csv_df = None
+                if _csv_df is None:
+                    st.error("无法读取 CSV 文件")
+                else:
+                    _sumr, _err = simulator.import_trades_csv(_csv_df)
+                    if _err:
+                        st.error(_err)
+                    else:
+                        st.session_state["sim_msg"] = (
+                            f"已导入 {_sumr['n']} 笔交易"
+                            f"（{_sumr['first']} ~ {_sumr['last']}），"
+                            f"模拟日期已定位到 {_sumr['last']}")
+                        st.rerun()
             _archs = simulator.list_archives()
             if not _archs.empty:
                 st.divider()

@@ -242,6 +242,96 @@ def reset():
     conn.close()
 
 
+# ── Trade-log CSV import ─────────────────────────────────────────────────────
+
+def import_trades_csv(df: pd.DataFrame) -> Tuple[Optional[dict], Optional[str]]:
+    """Replace the live simulator state with trades from an exported CSV.
+
+    Accepts the trade-log export format (日期/操作/代码/份额/成交净值/金额(¥)
+    columns; 名称 and 盈亏 columns are ignored). Rows are re-ordered
+    chronologically (exports are newest-first) and replayed for validation —
+    negative cash or overselling rejects the whole import. On success the
+    start date becomes the first trade's day and the simulated date the last
+    trade's day. Returns (summary, error) — exactly one is set.
+    """
+    cols = {str(c).strip(): c for c in df.columns}
+
+    def _col(prefix):
+        for name, c in cols.items():
+            if name.startswith(prefix):
+                return c
+        return None
+
+    need = {p: _col(p) for p in ("日期", "操作", "代码", "份额", "成交净值", "金额")}
+    missing = [p for p, c in need.items() if c is None]
+    if missing:
+        return None, f"CSV 缺少列：{'、'.join(missing)}"
+
+    out = pd.DataFrame({
+        "date": pd.to_datetime(df[need["日期"]], errors="coerce"),
+        "action": df[need["操作"]].astype(str).str.strip()
+            .map({"买入": "buy", "卖出": "sell", "buy": "buy", "sell": "sell"}),
+        "code": df[need["代码"]].astype(str).str.strip()
+            .str.replace(r"\.0$", "", regex=True).str.zfill(6),
+        "shares": pd.to_numeric(df[need["份额"]], errors="coerce"),
+        "nav": pd.to_numeric(df[need["成交净值"]], errors="coerce"),
+        "amount": pd.to_numeric(df[need["金额"]], errors="coerce"),
+    }).dropna(how="all")
+    if out.empty:
+        return None, "CSV 中没有交易数据"
+
+    bad = out[out[["date", "action", "shares", "nav", "amount"]].isna().any(axis=1)
+              | (out["shares"] <= 0) | (out["nav"] <= 0) | (out["amount"] <= 0)]
+    if not bad.empty:
+        return None, f"第 {int(bad.index[0]) + 2} 行数据无效（日期/操作/数值有误）"
+
+    out["date"] = out["date"].dt.strftime("%Y-%m-%d")
+    # Exports are newest-first; flip back before the stable date sort so the
+    # intra-day trade order of a pristine export is preserved.
+    if not out["date"].is_monotonic_increasing:
+        out = out.iloc[::-1]
+    out = out.sort_values("date", kind="stable").reset_index(drop=True)
+
+    # Validation replay (average cost + dividend adjustments, same as live).
+    trades = out.to_dict("records")
+    stream = [(t["date"], 1, t) for t in trades]
+    for code, evs in _dividend_events(set(out["code"]), out["date"].iloc[-1]).items():
+        stream += [(d, 0, (code, m)) for d, m in evs]
+    stream.sort(key=lambda x: (x[0], x[1]))
+    cash, pos = INITIAL_CAPITAL, {}
+    for _d, kind, item in stream:
+        if kind == 0:
+            if item[0] in pos:
+                pos[item[0]] *= item[1]
+            continue
+        t = item
+        if t["action"] == "buy":
+            cash -= t["amount"]
+            if cash < -0.01:
+                return None, f"{t['date']} 买入 {t['code']} 后现金为负，超出初始资金"
+            pos[t["code"]] = pos.get(t["code"], 0.0) + t["shares"]
+        else:
+            held = pos.get(t["code"], 0.0)
+            if t["shares"] > held * 1.001 + 1e-6:
+                return None, (f"{t['date']} 卖出 {t['code']} {t['shares']:,.2f} 份，"
+                              f"超过当时持有的 {held:,.2f} 份")
+            cash += t["amount"]
+            pos[t["code"]] = held - t["shares"]
+
+    conn = fetcher._conn()
+    conn.execute("DELETE FROM sim_trades")
+    conn.executemany(
+        "INSERT INTO sim_trades (date, code, action, shares, nav, amount) "
+        "VALUES (:date, :code, :action, :shares, :nav, :amount)", trades)
+    first, last = out["date"].iloc[0], out["date"].iloc[-1]
+    conn.executemany(
+        "INSERT OR REPLACE INTO sim_meta (key, value) VALUES (?, ?)",
+        [("start_date", first), ("current_date", last)])
+    conn.commit()
+    conn.close()
+    return {"n": len(trades), "first": first, "last": last}, None
+
+
 # ── Archives (saved simulator runs) ──────────────────────────────────────────
 # A snapshot of the live state (trade log + simulated date). Loading one
 # replaces the live state wholesale, so the run continues exactly where it
