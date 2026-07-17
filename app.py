@@ -519,36 +519,61 @@ with tab_table:
         _asof_lim = (asof_date if asof_mode
                      else dt.date.today()).strftime("%Y-%m-%d")
 
-        def _render_holdings_cell(frow):
-            _fcode = str(frow["基金代码"]).zfill(6)
-            _fname = frow.get("基金名称", "")
-            _hdf = load_holdings(_fcode)
-            st.markdown(f"**📦 {_fcode} {_fname}**")
+        def _latest_holdings(fcode):
+            """基金在截至日期下最新披露季度的持仓:(季度, DataFrame) 或
+            (None, 提示文案)。"""
+            _hdf = load_holdings(fcode)
             if _hdf is None or _hdf.empty:
-                st.info("该基金暂无披露的重仓持仓（货币基金、新基金常见）。")
-                return
+                return None, "该基金暂无披露的重仓持仓（货币基金、新基金常见）。"
             _qend = {"1": "-03-31", "2": "-06-30", "3": "-09-30", "4": "-12-31"}
             _h = _hdf.dropna(subset=["quarter"]).copy()
             _h["quarter"] = _h["quarter"].astype(str)
             _h["_qend"] = _h["quarter"].str[:4] + _h["quarter"].str[-1].map(_qend)
             _h = _h[_h["_qend"] <= _asof_lim]
             if _h.empty:
-                st.info("截至该日期尚无已披露的季度持仓（本地持仓数据从 "
-                        f"{fetcher.HOLDINGS_START_Q} 起）。")
-                return
+                return None, ("截至该日期尚无已披露的季度持仓（本地持仓数据从 "
+                              f"{fetcher.HOLDINGS_START_Q} 起）。")
             _q = _h["quarter"].max()
-            _hq = _h[_h["quarter"] == _q]
-            st.caption(f"披露季度：{_q}")
+            return _q, _h[_h["quarter"] == _q]
+
+        def _cell_top10(hq):
+            """卡片实际展示的标的代码集合(股票+债券各前十)。"""
+            return {
+                str(c) for _kind in ("股票", "债券")
+                for c in hq[hq["kind"] == _kind].head(10)["代码"]
+            }
+
+        # 共同持仓底色:同一标的在所有卡片里同色,便于横向对照。浅色底 +
+        # 深色字,深浅主题下都可读;颜色按(出现基金数降序, 代码)分配,
+        # 结果稳定;共同标的多于色板时循环复用(代码/名称仍可区分)。
+        _SHARED_BG = ["#ffe0b2", "#c8e6c9", "#bbdefb", "#f8bbd0",
+                      "#e1bee7", "#fff9c4", "#b2dfdb", "#ffcdd2"]
+
+        def _render_holdings_cell(frow, q, hq, shared_colors):
+            _fcode = str(frow["基金代码"]).zfill(6)
+            st.markdown(f"**📦 {_fcode} {frow.get('基金名称', '')}**")
+            if q is None:
+                st.info(hq)   # hq 此时是提示文案
+                return
+            st.caption(f"披露季度：{q}")
             for _kind, _klabel in (("股票", "重仓股票"), ("债券", "重仓债券")):
-                _part = _hq[_hq["kind"] == _kind].head(10)
+                _part = hq[hq["kind"] == _kind].head(10)
                 if _part.empty:
                     continue
                 st.markdown(f"**{_klabel}（前十）**")
-                st.dataframe(pd.DataFrame({
-                    "代码": _part["代码"],
+                _tbl = pd.DataFrame({
+                    "代码": _part["代码"].astype(str),
                     "名称": _part["名称"],
                     "占净值比例(%)": _part["占净值比例"],
-                }).reset_index(drop=True), use_container_width=True)
+                }).reset_index(drop=True)
+
+                def _shared_row_style(row):
+                    _bg = shared_colors.get(str(row["代码"]))
+                    return ([f"background-color: {_bg}; color: #1a1a1a"]
+                            * len(row) if _bg else [""] * len(row))
+
+                st.dataframe(_tbl.style.apply(_shared_row_style, axis=1),
+                             use_container_width=True)
 
         # 模拟盘在持基金常驻网格最前（无需勾选），其后是表格勾选的基金。
         _sim_d = simulator.get_current_date()
@@ -565,14 +590,38 @@ with tab_table:
             st.markdown(f"##### 已选基金的最新十大持仓（截至 {_asof_lim}）")
             st.caption("模拟盘在持基金常驻最前；取季度末 ≤ 截至日期的最新披露季度，"
                        "实际公告通常滞后季度末约两周")
-            _PER_ROW = 3
+
+            # 两遍渲染:先取全部卡片的持仓,统计出现在 ≥2 只基金里的标的并
+            # 分配底色,再带着颜色映射渲染。
             with st.spinner("加载持仓…"):
-                for _start in range(0, len(_cells), _PER_ROW):
-                    _chunk = _cells[_start:_start + _PER_ROW]
+                _cell_data = []
+                for _cell in _cells:
+                    _q, _hq = _latest_holdings(str(_cell["基金代码"]).zfill(6))
+                    _cell_data.append((_cell, _q, _hq))
+
+                _code_hits = {}
+                for _, _q, _hq in _cell_data:
+                    if _q is None:
+                        continue
+                    for _c in _cell_top10(_hq):
+                        _code_hits[_c] = _code_hits.get(_c, 0) + 1
+                _shared = sorted(
+                    (c for c, n in _code_hits.items() if n >= 2),
+                    key=lambda c: (-_code_hits[c], c))
+                _shared_colors = {
+                    c: _SHARED_BG[i % len(_SHARED_BG)]
+                    for i, c in enumerate(_shared)}
+                if _shared_colors:
+                    st.caption("🎨 相同底色 = 多只基金共同持有的标的"
+                               f"（共 {len(_shared_colors)} 只）")
+
+                _PER_ROW = 3
+                for _start in range(0, len(_cell_data), _PER_ROW):
+                    _chunk = _cell_data[_start:_start + _PER_ROW]
                     _cols = st.columns(_PER_ROW, gap="medium")
-                    for _col, _cell in zip(_cols, _chunk):
+                    for _col, (_cell, _q, _hq) in zip(_cols, _chunk):
                         with _col, st.container(border=True):
-                            _render_holdings_cell(_cell)
+                            _render_holdings_cell(_cell, _q, _hq, _shared_colors)
 
         csv = table.to_csv(index=False, encoding="utf-8-sig")
         st.download_button(
