@@ -202,7 +202,8 @@ for _c in ("ret_1m", "ret_3m", "ret_6m", "ret_1y"):
         fund_df[_c] = pd.to_numeric(fund_df[_c], errors="coerce")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_table, tab_detail, tab_sim = st.tabs(["📋 基金列表", "🔍 基金详情", "💰 模拟盘"])
+tab_table, tab_detail, tab_sim, tab_sse = st.tabs(
+    ["📋 基金列表", "🔍 基金详情", "💰 模拟盘", "📈 上证指数"])
 
 # ─── Tab 1: Table ────────────────────────────────────────────────────────────
 with tab_table:
@@ -1085,3 +1086,84 @@ with tab_sim:
                         file_name=f"模拟盘交易记录_{sim_date}.csv",
                         mime="text/csv",
                     )
+
+# ─── Tab 4: SSE index ────────────────────────────────────────────────────────
+with tab_sse:
+    sse_df = load_sse_daily()
+    if sse_df is None or sse_df.empty:
+        st.warning("上证指数数据获取失败，请稍后重试。")
+    else:
+        sse_all = sse_df.copy()
+        sse_all["date"] = pd.to_datetime(sse_all["date"])
+        sse_all = sse_all.sort_values("date").reset_index(drop=True)
+
+        _sse_ranges = {"近1月": 30, "近3月": 91, "近6月": 182,
+                       "近1年": 365, "近3年": 365 * 3, "全部": None}
+        _c_rng, _c_bands = st.columns([4, 1])
+        with _c_rng:
+            _rng = st.radio("时间区间", list(_sse_ranges.keys()), index=3,
+                            horizontal=True, key="sse_range")
+        with _c_bands:
+            _show_bands = st.checkbox("标记跌超1%的交易日", value=True,
+                                      key="sse_bands",
+                                      help="长区间下标记较密，可关闭")
+
+        # Window slice keeps the anchor row (last close on/before the window
+        # start) so the period change is measured against the true base point —
+        # same convention as _window_by_date.
+        _days = _sse_ranges[_rng]
+        if _days is None:
+            view = sse_all
+        else:
+            _start = sse_all["date"].max() - pd.Timedelta(days=_days)
+            _older = sse_all[sse_all["date"] <= _start]
+            view = sse_all.loc[_older.index[-1]:] if not _older.empty else sse_all
+
+        _latest = sse_all.iloc[-1]
+        _chg = (_latest["close"] / view["close"].iloc[0] - 1.0) * 100.0
+        _peak = view["close"].cummax()
+        _mdd = float(((_peak - view["close"]) / _peak).max() * 100.0)
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("最新收盘", f"{_latest['close']:,.2f}",
+                  f"{_latest['pct']:+.2f}%（当日）")
+        k2.metric(f"{_rng}涨跌幅", f"{_chg:+.2f}%")
+        k3.metric(f"{_rng}最大回撤", f"{_mdd:.2f}%")
+        k4.metric("数据日期", _latest["date"].strftime("%Y-%m-%d"))
+
+        fig_sse = px.line(
+            view, x="date", y="close",
+            title=f"上证指数走势（{_rng}）",
+            labels={"date": "日期", "close": "收盘点位"},
+            height=420,
+        )
+        fig_sse.update_traces(
+            customdata=view[["pct"]],
+            hovertemplate="收盘 %{y:,.2f} · 日涨跌 %{customdata[0]:+.2f}%"
+                          "<extra></extra>")
+        if _show_bands:
+            _add_sse_drop_bands(fig_sse, sse_df,
+                                view["date"].min(), view["date"].max())
+        fig_sse.update_layout(
+            hovermode="x unified", hoverdistance=-1, spikedistance=-1)
+        _span_d = max((view["date"].max() - view["date"].min()).days, 1)
+        fig_sse.update_xaxes(
+            showspikes=True, spikemode="across", spikesnap="data",
+            spikedash="dot", spikethickness=1,
+            hoverformat="%Y-%m-%d", tickformat="%Y-%m-%d",
+            dtick=max(1, _span_d // 8) * 86400000)
+        fig_sse.update_yaxes(
+            showspikes=True, spikemode="across", spikesnap="data",
+            spikedash="dot", spikethickness=1)
+        st.plotly_chart(fig_sse, use_container_width=True)
+
+        with st.expander("📄 每日数据（当前区间）"):
+            _sse_table = view.sort_values("date", ascending=False).reset_index(drop=True)
+            st.dataframe(
+                pd.DataFrame({
+                    "日期": _sse_table["date"].dt.strftime("%Y-%m-%d"),
+                    "收盘点位": _sse_table["close"].round(2),
+                    "日涨跌(%)": pd.to_numeric(_sse_table["pct"],
+                                             errors="coerce").round(2),
+                }),
+                use_container_width=True, height=420,
+            )
