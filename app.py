@@ -145,6 +145,14 @@ def load_metrics_df(cache_key):
     return pd.DataFrame.from_dict(data, orient="index") \
         .reset_index().rename(columns={"index": "code"})
 
+
+# Earliest stored NAV date per fund, for the period-matched fund-age exclusion
+# in the filter path. Same invalidation contract as load_metrics_df.
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_first_dates(cache_key):
+    df = fetcher.nav_first_dates()
+    return None if df.empty else df
+
 # Update button: run the same daily pipeline as update_daily.py in-process,
 # streaming progress into a bar. Refreshes the list cache and reloads the
 # precomputed metrics so the table reflects the new data without a manual rerun.
@@ -160,6 +168,7 @@ if update_btn:
                                        do_recompute=False)
     load_fund_list.clear()
     load_metrics_df.clear()
+    load_first_dates.clear()
     _bar.progress(1.0, text="完成")
     st.success(
         f"更新完成 · 基金 {summary['funds']:,} · 回填 {summary['backfilled']} · "
@@ -300,9 +309,10 @@ with tab_table:
         _fparams = {
             "types": sorted(selected_types), "period": period_label,
             "min_ret": min_ret, "max_dd": max_dd, "asof": _asof_iso,
-            # Bumped when the filter rules change (v2: exclude funds <1y old),
-            # so stale cached results from older rules never get served.
-            "rule_ver": 2,
+            # Bumped when the filter rules change (v3: exclude funds younger
+            # than the *selected* period window, strict day count for funds
+            # with local NAV), so stale cached results never get served.
+            "rule_ver": 3,
             # Combines the Sharpe/drawdown recompute timestamp with the fund
             # list's own saved_at: the in-app update button refreshes the list
             # (fresh returns) but skips recompute_all, so last_update_time()
@@ -371,17 +381,28 @@ with tab_table:
                             ).fillna(pd.to_numeric(
                                 filtered[f"{_rc}_list"], errors="coerce"))
 
-            # ── 剔除成立不满一年的基金 ─────────────────────────────────────────
-            # 近1年收益率为空即视为历史不足一年:榜单对不满一年的基金该列留空,
-            # 本地重算的 ret_1y 同样因缺少一年前的锚点而为 None。即使选的是
-            # 近1月/近3月等短区间,这类新基金也一律不进筛选列表。
-            if "ret_1y" in filtered.columns:
-                filtered = filtered[
-                    pd.to_numeric(filtered["ret_1y"], errors="coerce").notna()]
+            # ── 剔除历史不满所选区间的基金(与区间匹配) ──────────────────────
+            # 选近1年剔除不满1年的,选近6月剔除不满6月的,依此类推。有本地净值
+            # 的基金按首日净值日期算真实历史长度——本地重算带 10 天锚点宽限
+            # (ANCHOR_GRACE_DAYS),355 天的基金也能算出「近1年」值,这里按
+            # 严格天数堵住该口子。无本地净值的基金(非C类)由下面的区间收益率
+            # 过滤兜底:榜单对历史不满该区间的基金该列留空,NaN 过不了 >=。
+            _min_days = fetcher.RETURN_DAYS.get(ret_col)
+            _fd = load_first_dates(fetcher.last_update_time()) if _min_days else None
+            if _fd is not None:
+                _ref = pd.Timestamp(asof_date) if asof_mode \
+                    else pd.Timestamp.today().normalize()
+                filtered = filtered.merge(_fd, on="code", how="left")
+                _too_young = (
+                    filtered["first_nav_date"].notna()
+                    & ((_ref - filtered["first_nav_date"]).dt.days < _min_days)
+                )
+                filtered = filtered[~_too_young].drop(columns=["first_nav_date"])
 
             if ret_col in filtered.columns:
-                # Only keep funds that actually have a return for the selected period
-                # (e.g. newly-launched funds have no 近1年 value); NaN is dropped.
+                # Only keep funds that actually have a return for the selected
+                # period; NaN is dropped — this is also what excludes too-young
+                # funds that have no local NAV (rank list leaves the column blank).
                 filtered = filtered[
                     pd.to_numeric(filtered[ret_col], errors="coerce") >= min_ret]
 

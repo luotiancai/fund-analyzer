@@ -948,6 +948,24 @@ def list_nav_codes() -> set:
     return {r["code"] for r in rows}
 
 
+def nav_first_dates() -> pd.DataFrame:
+    """Earliest stored NAV date per fund, as columns (code, first_nav_date).
+
+    Only funds with stored NAV (C-class) appear. Backfill starts at 2020-01-01,
+    so for older funds the value is that floor, not the true inception — it
+    reads as "at least this old", which is all the ≤1y filter windows need.
+    """
+    conn = _conn()
+    try:
+        df = pd.read_sql_query(
+            "SELECT code, MIN(date) AS first_nav_date "
+            "FROM fund_nav_daily GROUP BY code", conn)
+    finally:
+        conn.close()
+    df["first_nav_date"] = pd.to_datetime(df["first_nav_date"], errors="coerce")
+    return df
+
+
 _EM_LSJZ_URL = "https://api.fund.eastmoney.com/f10/lsjz"
 _EM_LSJZ_HEADERS = {"Referer": "https://fundf10.eastmoney.com/"}
 
