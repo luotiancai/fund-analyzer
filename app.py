@@ -208,7 +208,12 @@ tab_table, tab_detail, tab_sim, tab_sse = st.tabs(
 
 # ─── Tab 1: Table ────────────────────────────────────────────────────────────
 with tab_table:
-    all_types = sorted(fund_df["type"].dropna().unique().tolist()) if "type" in fund_df.columns else []
+    # 债券型基金整体排除在筛选之外(用户不做债基):类型选项里不出现,
+    # 结果里也硬性剔除(见下面 filter 路径)。
+    all_types = sorted(
+        t for t in fund_df["type"].dropna().unique().tolist()
+        if not str(t).startswith("债券型")
+    ) if "type" in fund_df.columns else []
     # Filters live in a form: changing a widget does NOT rerun/refilter — everything
     # applies at once when 「开始筛选」 is pressed (expensive as-of recomputes stay
     # off until then). Until the first submit, the defaults below are in effect.
@@ -354,9 +359,9 @@ with tab_table:
             "types": sorted(selected_types), "period": period_label,
             "min_ret": min_ret, "max_dd": max_dd, "asof": _asof_iso,
             # Bumped when the filter rules change (v3: exclude funds younger
-            # than the *selected* period window, strict day count for funds
-            # with local NAV), so stale cached results never get served.
-            "rule_ver": 3,
+            # than the *selected* period window; v4: exclude 债券型), so stale
+            # cached results never get served.
+            "rule_ver": 4,
             # Combines the Sharpe/drawdown recompute timestamp with the fund
             # list's own saved_at: the in-app update button refreshes the list
             # (fresh returns) but skips recompute_all, so last_update_time()
@@ -404,6 +409,10 @@ with tab_table:
 
         with st.spinner("⏳ 正在筛选…"):
             filtered = work_df.copy()
+            # 债券型基金硬性剔除(类型选项里也已不出现)。
+            if "type" in filtered.columns:
+                filtered = filtered[
+                    ~filtered["type"].astype(str).str.startswith("债券型")]
             if selected_types:
                 filtered = filtered[filtered["type"].isin(selected_types)]
 

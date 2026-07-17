@@ -400,6 +400,12 @@ def is_overseas_equity(fund_type) -> bool:
     return fund_type in OVERSEAS_EQUITY_TYPES
 
 
+# 债券型基金同样不入库、不参与筛选(用户不做债基)。类型前缀匹配覆盖全部
+# 子类:长债/中短债/混合一级/混合二级/利率债/信用债。
+def is_bond(fund_type) -> bool:
+    return str(fund_type).startswith("债券型")
+
+
 # ── Fund list ────────────────────────────────────────────────────────────────
 
 # The fund list is a single cached snapshot (always read/written whole), so it
@@ -1412,7 +1418,8 @@ def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
         types = meta["type"]
         todo = [c for c in all_codes
                 if c not in have and is_c_class(names.get(c))
-                and not is_overseas_equity(types.get(c))]
+                and not is_overseas_equity(types.get(c))
+                and not is_bond(types.get(c))]
         backfilled = _backfill_codes(
             todo, workers, lambda d, t: _p("回填缺失历史", d, t)
         )
