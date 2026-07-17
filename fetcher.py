@@ -10,7 +10,7 @@ import logging
 import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import akshare as ak
 import pandas as pd
@@ -134,6 +134,21 @@ def init_db():
             params   TEXT NOT NULL,
             data     TEXT NOT NULL,
             saved_at REAL NOT NULL
+        );
+        -- ETF联接基金 → 目标场内ETF 的映射(重仓穿透用)。target_code 为空
+        -- 串表示解析失败,按 TTL 重试;成功的映射视为永久。
+        CREATE TABLE IF NOT EXISTS etf_target_map (
+            code        TEXT PRIMARY KEY,
+            target_code TEXT NOT NULL,
+            target_name TEXT NOT NULL,
+            saved_at    REAL NOT NULL
+        );
+        -- 基金跟踪指数代码缓存(mobapi FundMNBasicInformation.INDEXCODE),
+        -- 供联接基金与候选 ETF 做指数一致性验证。
+        CREATE TABLE IF NOT EXISTS fund_index_code (
+            code       TEXT PRIMARY KEY,
+            index_code TEXT NOT NULL,
+            saved_at   REAL NOT NULL
         );
     """)
     # Add per-period max-drawdown / Sharpe / return columns (migration for
@@ -836,15 +851,155 @@ def _fetch_holdings_year(code: str, year: str) -> Optional[pd.DataFrame]:
     return pd.concat(frames, ignore_index=True)
 
 
+# ── ETF联接基金重仓穿透 ──────────────────────────────────────────────────────
+# 联接基金 90%+ 仓位是目标 ETF 本身,季报直接持股占净值不到 1%,展示无意义。
+# 解析出目标场内 ETF 后改拉它的重仓。目标 ETF 代码没有直接接口可查:
+# 名称粗排(全量代码表里的场内 ETF 简称)+ 跟踪指数代码精确验证。
+
+_EM_BASIC_INFO_URL = ("https://fundmobapi.eastmoney.com/FundMNewApi/"
+                      "FundMNBasicInformation")
+_EM_FUNDCODE_JS = "https://fund.eastmoney.com/js/fundcode_search.js"
+_ETF_MAP_FAIL_TTL = 30 * 86400   # 解析失败一个月后重试
+
+_fund_names: Optional[dict] = None
+_etf_cands: Optional[list] = None
+
+
+def _fund_name(code: str) -> Optional[str]:
+    """基金名称(来自缓存的基金列表),进程内建一次字典。"""
+    global _fund_names
+    if _fund_names is None:
+        try:
+            df = fetch_fund_list()
+            _fund_names = dict(zip(df["code"], df["name"]))
+        except Exception as e:
+            logger.debug("fund name lookup failed: %s", e)
+            return None
+    return _fund_names.get(code)
+
+
+def _fund_index_code(code: str, conn) -> Optional[str]:
+    """基金跟踪指数代码,DB 缓存;网络失败返回 None 且不落缓存。"""
+    row = conn.execute(
+        "SELECT index_code FROM fund_index_code WHERE code=?", (code,)).fetchone()
+    if row:
+        return row["index_code"] or None
+    try:
+        r = requests.get(
+            _EM_BASIC_INFO_URL,
+            params={"FCODE": code, "deviceid": "Wap", "plat": "Wap",
+                    "product": "EFund", "version": "2.0.0"},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        idx = (r.json().get("Datas") or {}).get("INDEXCODE") or ""
+    except Exception as e:
+        logger.debug("index code fetch failed %s: %s", code, e)
+        return None
+    conn.execute("INSERT OR REPLACE INTO fund_index_code VALUES (?, ?, ?)",
+                 (code, idx, time.time()))
+    conn.commit()
+    return idx or None
+
+
+def _etf_candidates() -> list:
+    """场内指数 ETF 候选 [(code, name)],来自全量基金代码表,进程内缓存。"""
+    global _etf_cands
+    if _etf_cands is None:
+        try:
+            r = requests.get(_EM_FUNDCODE_JS,
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+            data = json.loads(r.text[r.text.find("["):r.text.rfind("]") + 1])
+            _etf_cands = [(d[0], d[2]) for d in data
+                          if "ETF" in d[2] and "联接" not in d[2]
+                          and "指数型" in (d[3] or "")]
+        except Exception as e:
+            logger.debug("fundcode list fetch failed: %s", e)
+            return []
+    return _etf_cands
+
+
+def _lcs_len(a: str, b: str) -> int:
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, a, b).find_longest_match(
+        0, len(a), 0, len(b)).size
+
+
+def resolve_target_etf(code: str, name: Optional[str] = None
+                       ) -> Optional[Tuple[str, str]]:
+    """ETF联接基金 → (目标ETF代码, 名称);非联接基金或解析失败返回 None。
+
+    成功映射永久缓存;确认无匹配按 _ETF_MAP_FAIL_TTL 重试;
+    网络故障不落缓存,下次再试。
+    """
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT target_code, target_name, saved_at FROM etf_target_map "
+            "WHERE code=?", (code,)).fetchone()
+        if row:
+            if row["target_code"]:
+                return row["target_code"], row["target_name"]
+            if time.time() - row["saved_at"] < _ETF_MAP_FAIL_TTL:
+                return None
+        if name is None:
+            name = _fund_name(code)
+        if not name or "ETF" not in name or "联接" not in name:
+            return None
+        feeder_idx = _fund_index_code(code, conn)
+        if not feeder_idx:
+            return None                        # 网络失败,不缓存,下次重试
+        # 名称粗排,两梯队依次做指数验证:
+        # ① 同管理人(场内简称尾部的管理人简称出现在联接名里,如
+        #    "创业板ETF易方达")按相似度排——核心词被缩写时(纳斯达克100
+        #    →纳指)纯名称匹配会错配到其他管理人的同指数 ETF,先验自家;
+        # ② 纯名称相似(最长公共子串)——覆盖场内简称不带管理人的情形
+        #    (如"上证50ETF")。错配指数的候选会被 INDEXCODE 验证拒绝。
+        base = name.split("联接")[0]           # "易方达创业板ETF"
+        from collections import Counter
+        base_chars = Counter(base)
+        def _sim(cand_name: str) -> int:
+            common = sum((Counter(cand_name) & base_chars).values())
+            return _lcs_len(base, cand_name) * 2 + common
+        cands = _etf_candidates()
+        mgr = [c for c in cands
+               if (t := c[1].rsplit("ETF", 1)[-1]) and t in base]
+        mgr.sort(key=lambda c: _sim(c[1]), reverse=True)
+        by_lcs = sorted(cands, key=lambda c: _lcs_len(base, c[1]),
+                        reverse=True)
+        seen, ranked = set(), []
+        for c in mgr[:8] + by_lcs[:8]:
+            if c[0] not in seen:
+                seen.add(c[0])
+                ranked.append(c)
+        target = None
+        for c_code, c_name in ranked:
+            if _fund_index_code(c_code, conn) == feeder_idx:
+                target = (c_code, c_name)
+                break
+        conn.execute(
+            "INSERT OR REPLACE INTO etf_target_map VALUES (?, ?, ?, ?)",
+            (code, target[0] if target else "",
+             target[1] if target else "", time.time()))
+        conn.commit()
+        return target
+    finally:
+        conn.close()
+
+
 def fetch_holdings(code: str, force_refresh: bool = False) -> Optional[pd.DataFrame]:
     """Quarterly top holdings from HOLDINGS_START_Q (2020Q4) to the latest
     disclosed quarter, cache-first.
+
+    ETF联接基金自动穿透:改拉目标场内 ETF 的重仓(联接自身季报的直接持股
+    占净值不足 1%,无参考价值)。来源标注可用 resolve_target_etf 查询。
 
     Columns: quarter ("2025Q1"), kind (股票/债券), 代码, 名称, 占净值比例(%),
     持股数(万股, stocks only), 持仓市值(万元). Sorted newest quarter first,
     biggest position first within a quarter. Returns None only when nothing
     could be fetched and no cache exists.
     """
+    target = resolve_target_etf(code)
+    if target:
+        return fetch_holdings(target[0], force_refresh)
     years = [str(y) for y in range(HOLDINGS_START_YEAR, datetime.now().year + 1)]
     frames, any_data = [], False
     conn = _conn()

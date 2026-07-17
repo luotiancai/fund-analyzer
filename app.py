@@ -83,7 +83,10 @@ def load_fund_list(cache_key):
 # recomputed + re-WROTE the fund's Sharpe row on the slow /mnt/c disk.
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_holdings(code: str):
-    return fetcher.fetch_holdings(code)
+    """(持仓df, 穿透来源) — ETF联接基金的持仓来自同指数场内ETF,
+    来源为 (代码, 名称);非联接基金来源为 None。"""
+    df = fetcher.fetch_holdings(code)
+    return df, fetcher.resolve_target_etf(code)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -523,21 +526,22 @@ with tab_table:
                      else dt.date.today()).strftime("%Y-%m-%d")
 
         def _latest_holdings(fcode):
-            """基金在截至日期下最新披露季度的持仓:(季度, DataFrame) 或
-            (None, 提示文案)。"""
-            _hdf = load_holdings(fcode)
+            """基金在截至日期下最新披露季度的持仓:(季度, DataFrame, 来源)
+            或 (None, 提示文案, 来源)。"""
+            _hdf, _src = load_holdings(fcode)
             if _hdf is None or _hdf.empty:
-                return None, "该基金暂无披露的重仓持仓（货币基金、新基金常见）。"
+                return (None, "该基金暂无披露的重仓持仓（货币基金、新基金常见）。",
+                        _src)
             _qend = {"1": "-03-31", "2": "-06-30", "3": "-09-30", "4": "-12-31"}
             _h = _hdf.dropna(subset=["quarter"]).copy()
             _h["quarter"] = _h["quarter"].astype(str)
             _h["_qend"] = _h["quarter"].str[:4] + _h["quarter"].str[-1].map(_qend)
             _h = _h[_h["_qend"] <= _asof_lim]
             if _h.empty:
-                return None, ("截至该日期尚无已披露的季度持仓（本地持仓数据从 "
-                              f"{fetcher.HOLDINGS_START_Q} 起）。")
+                return (None, ("截至该日期尚无已披露的季度持仓（本地持仓数据从 "
+                               f"{fetcher.HOLDINGS_START_Q} 起）。"), _src)
             _q = _h["quarter"].max()
-            return _q, _h[_h["quarter"] == _q]
+            return _q, _h[_h["quarter"] == _q], _src
 
         def _cell_top10(hq):
             """卡片实际展示的标的代码集合(股票+债券各前十)。"""
@@ -552,9 +556,12 @@ with tab_table:
         _SHARED_BG = ["#ffe0b2", "#c8e6c9", "#bbdefb", "#f8bbd0",
                       "#e1bee7", "#fff9c4", "#b2dfdb", "#ffcdd2"]
 
-        def _render_holdings_cell(frow, q, hq, shared_colors):
+        def _render_holdings_cell(frow, q, hq, src, shared_colors):
             _fcode = str(frow["基金代码"]).zfill(6)
             st.markdown(f"**📦 {_fcode} {frow.get('基金名称', '')}**")
+            if src:
+                st.caption(f"⤴ 联接基金，重仓来自同指数场内 ETF："
+                           f"{src[0]} {src[1]}")
             if q is None:
                 st.info(hq)   # hq 此时是提示文案
                 return
@@ -599,11 +606,12 @@ with tab_table:
             with st.spinner("加载持仓…"):
                 _cell_data = []
                 for _cell in _cells:
-                    _q, _hq = _latest_holdings(str(_cell["基金代码"]).zfill(6))
-                    _cell_data.append((_cell, _q, _hq))
+                    _q, _hq, _src = _latest_holdings(
+                        str(_cell["基金代码"]).zfill(6))
+                    _cell_data.append((_cell, _q, _hq, _src))
 
                 _code_hits = {}
-                for _, _q, _hq in _cell_data:
+                for _, _q, _hq, _ in _cell_data:
                     if _q is None:
                         continue
                     for _c in _cell_top10(_hq):
@@ -622,9 +630,10 @@ with tab_table:
                 for _start in range(0, len(_cell_data), _PER_ROW):
                     _chunk = _cell_data[_start:_start + _PER_ROW]
                     _cols = st.columns(_PER_ROW, gap="medium")
-                    for _col, (_cell, _q, _hq) in zip(_cols, _chunk):
+                    for _col, (_cell, _q, _hq, _src) in zip(_cols, _chunk):
                         with _col, st.container(border=True):
-                            _render_holdings_cell(_cell, _q, _hq, _shared_colors)
+                            _render_holdings_cell(_cell, _q, _hq, _src,
+                                                  _shared_colors)
 
         csv = table.to_csv(index=False, encoding="utf-8-sig")
         st.download_button(
@@ -699,7 +708,10 @@ with tab_detail:
             st.markdown("---")
             st.subheader(f"📦 重仓持仓（{fetcher.HOLDINGS_START_Q} 至最新）")
             with st.spinner("加载持仓数据…"):
-                hold_df = load_holdings(code_input.strip().zfill(6))
+                hold_df, hold_src = load_holdings(code_input.strip().zfill(6))
+            if hold_src:
+                st.caption(f"⤴ 联接基金，重仓来自同指数场内 ETF："
+                           f"{hold_src[0]} {hold_src[1]}")
             if hold_df is None:
                 st.warning("持仓数据获取失败，请稍后重试。")
             elif hold_df.empty:
