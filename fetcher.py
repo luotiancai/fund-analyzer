@@ -1201,11 +1201,18 @@ def recompute_all(rf: Optional[float] = None,
         if progress_callback and (done % 500 == 0 or done == total):
             progress_callback(done, total)
     conn.commit()
+    # Record WHICH data these metrics were computed from — the newest NAV
+    # trading date and how many funds carry it — so metrics_stale() compares
+    # data versions, not wall-clock timestamps ("今天的数据算今天的,明天的
+    # 数据来了才失效"). The timestamp marker is kept separately for display.
+    # Deliberately NOT derived from MAX(fund_sharpe.saved_at): the detail tab
+    # persists single rows via compute_sharpe_for_fund, which would make the
+    # whole table look fresh after viewing one fund.
+    date_num, at_date = _nav_data_version(conn)
     conn.close()
-    # Full-table recompute marker. Deliberately NOT derived from
-    # MAX(fund_sharpe.saved_at): the detail tab persists single rows via
-    # compute_sharpe_for_fund, which would make the whole table look fresh
-    # after viewing one fund.
+    if date_num is not None:
+        _set_meta("metrics_nav_date", date_num)
+        _set_meta("metrics_nav_date_rows", at_date)
     _set_meta("metrics_recomputed_at", time.time())
     return saved
 
@@ -1278,25 +1285,41 @@ def last_update_time() -> Optional[float]:
     return row["t"] if row and row["t"] else None
 
 
-def metrics_stale() -> bool:
-    """True when NAV data has been updated since the last full metrics
-    recompute — i.e. the precomputed Sharpe/drawdown table is out of date and
-    filtering on it would use yesterday's values.
-
-    Missing markers (pre-marker DBs) fall back to MAX(fund_nav_meta.saved_at)
-    for the NAV side and count as stale on the metrics side, so the first
-    filter after upgrading recomputes once and plants both markers.
+def _nav_data_version(conn) -> tuple:
+    """(newest NAV trading date as a yyyymmdd float, #funds already carrying
+    that date) — the identity of "which day's data is in the store". Appending
+    a new trading day flips the date; late stragglers for the same day bump
+    the count. Re-running the pipeline on a weekend/holiday (no new NAV)
+    changes neither, so metrics keyed to this never recompute for nothing.
+    (None, 0) with no NAV data at all.
     """
-    nav_t, _ = _get_meta("nav_updated_at")
-    if nav_t is None:
-        conn = _conn()
-        row = conn.execute("SELECT MAX(saved_at) AS t FROM fund_nav_meta").fetchone()
-        conn.close()
-        nav_t = row["t"] if row else None
-    if nav_t is None:
+    row = conn.execute(
+        "SELECT MAX(last_date) AS d FROM fund_nav_meta").fetchone()
+    if not row or not row["d"]:
+        return None, 0
+    n = conn.execute(
+        "SELECT COUNT(*) AS n FROM fund_nav_meta WHERE last_date = ?",
+        (row["d"],)).fetchone()["n"]
+    return float(row["d"].replace("-", "")), n
+
+
+def metrics_stale() -> bool:
+    """True when the stored NAV holds data the last full metrics recompute
+    hasn't seen — a newer trading date, or more funds reporting the same
+    newest date — i.e. filtering on the precomputed Sharpe/drawdown/returns
+    would use the previous day's values.
+
+    A missing marker (pre-marker DBs) counts as stale, so the first filter
+    after upgrading recomputes once and plants the markers.
+    """
+    conn = _conn()
+    date_num, at_date = _nav_data_version(conn)
+    conn.close()
+    if date_num is None:
         return False   # no NAV data at all — nothing to recompute from
-    met_t, _ = _get_meta("metrics_recomputed_at")
-    return met_t is None or met_t < nav_t
+    met_date, _ = _get_meta("metrics_nav_date")
+    met_rows, _ = _get_meta("metrics_nav_date_rows")
+    return met_date != date_num or met_rows != at_date
 
 
 def fund_list_saved_at() -> Optional[float]:
@@ -1377,10 +1400,10 @@ def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
         )
 
     res = append_incremental(list_df, progress=_p)
-    # NAV data just changed; metrics_stale() compares this against the
-    # recompute marker so a do_recompute=False run (the in-app button) leaves
-    # the metrics flagged stale until the next filter recomputes them.
-    _set_meta("nav_updated_at", time.time())
+    # No staleness marker needed here: metrics_stale() derives the data
+    # version straight from fund_nav_meta, so whatever this run appended is
+    # visible to the next filter's check automatically (and a run that
+    # appended nothing new leaves metrics valid).
 
     saved = 0
     if do_recompute:
