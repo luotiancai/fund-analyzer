@@ -592,6 +592,9 @@ with tab_table:
         _cells = [{"基金代码": _c, "基金名称": _sim_names.get(_c, "")}
                   for _c in _sim_codes]
         for _ri in _sel_rows:
+            # 重新筛选后表格可能变短,session 里残留的旧勾选行号会越界。
+            if _ri >= len(table):
+                continue
             _frow = table.iloc[_ri]
             if str(_frow["基金代码"]).zfill(6) not in _sim_codes:
                 _cells.append(_frow)
