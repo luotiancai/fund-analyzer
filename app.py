@@ -176,9 +176,10 @@ if fund_df is None or fund_df.empty:
     st.stop()
 
 # ── Filters ───────────────────────────────────────────────────────────────────
-# Each time-period maps to its return column (from the fund list), its computed
-# max-drawdown column, and its computed Sharpe column (only 6m/1y have Sharpe;
-# shorter windows are too noisy, so None means "no Sharpe column").
+# Each time-period maps to its return column (locally recomputed from stored
+# NAV where available, rank-list value otherwise — see the merge in the filter
+# path), its computed max-drawdown column, and its computed Sharpe column (only
+# 6m/1y have Sharpe; shorter windows are too noisy, so None means "no Sharpe").
 PERIODS = {
     "近1月": ("ret_1m", "mdd_1m", None),
     "近3月": ("ret_3m", "mdd_3m", None),
@@ -348,18 +349,32 @@ with tab_table:
             filtered = work_df.copy()
             if selected_types:
                 filtered = filtered[filtered["type"].isin(selected_types)]
-            if ret_col in filtered.columns:
-                # Only keep funds that actually have a return for the selected period
-                # (e.g. newly-launched funds have no 近1年 value); NaN is dropped.
-                filtered = filtered[filtered[ret_col] >= min_ret]
 
-            # ── Merge Sharpe/drawdown into display table ──────────────────────────
+            # ── Merge Sharpe/drawdown/period returns BEFORE the return filter ────
             # (In as-of mode work_df already carries the snapshot metrics columns.)
-            display = filtered.copy()
+            # 区间收益优先用本地净值重算的值:榜单接口早间常出现净值/日增长率已
+            # 更新到最新交易日、而近X收益率列仍是前一窗口旧值的情况(实测 018359
+            # 榜单近1年 226.03 = 截至7-15,实际截至7-16 应为 211.39)。无本地净值
+            # 历史的基金(非C类)回退榜单值——它们本来也没有夏普/回撤。
             if not asof_mode:
                 sharpe_df = load_metrics_df(fetcher.last_update_time())
                 if sharpe_df is not None:
-                    display = display.merge(sharpe_df, on="code", how="left")
+                    filtered = filtered.merge(sharpe_df, on="code", how="left",
+                                              suffixes=("_list", ""))
+                    for _rc in ("ret_1m", "ret_3m", "ret_6m", "ret_1y"):
+                        if _rc in filtered.columns and f"{_rc}_list" in filtered.columns:
+                            filtered[_rc] = pd.to_numeric(
+                                filtered[_rc], errors="coerce"
+                            ).fillna(pd.to_numeric(
+                                filtered[f"{_rc}_list"], errors="coerce"))
+
+            if ret_col in filtered.columns:
+                # Only keep funds that actually have a return for the selected period
+                # (e.g. newly-launched funds have no 近1年 value); NaN is dropped.
+                filtered = filtered[
+                    pd.to_numeric(filtered[ret_col], errors="coerce") >= min_ret]
+
+            display = filtered.copy()
 
             # Drawdown filter. Funds without a computed drawdown (e.g. younger than
             # the window) are kept rather than hidden.

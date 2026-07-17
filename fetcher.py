@@ -133,8 +133,12 @@ def init_db():
             saved_at REAL NOT NULL
         );
     """)
-    # Add per-period max-drawdown and Sharpe columns (migration for existing DBs).
-    for col in ("mdd_1m", "mdd_3m", "mdd_6m", "mdd_1y", "sharpe_6m", "sharpe_1y"):
+    # Add per-period max-drawdown / Sharpe / return columns (migration for
+    # existing DBs). Returns are recomputed locally from stored NAV because the
+    # EastMoney rank list's 近X收益率 columns lag its own nav_date in the
+    # morning (nav/日增长率 updated, period returns still the prior window's).
+    for col in ("mdd_1m", "mdd_3m", "mdd_6m", "mdd_1y", "sharpe_6m", "sharpe_1y",
+                "ret_1m", "ret_3m", "ret_6m", "ret_1y"):
         try:
             conn.execute(f"ALTER TABLE fund_sharpe ADD COLUMN {col} REAL")
         except sqlite3.OperationalError:
@@ -616,16 +620,18 @@ def fetch_nav(code: str) -> Optional[pd.DataFrame]:
 # ── Sharpe calculation ────────────────────────────────────────────────────────
 
 def _save_sharpe(code: str, ann_return: float, volatility: float, sharpe: float,
-                 n: int, mdd: dict, psharpe: dict):
+                 n: int, mdd: dict, psharpe: dict, rets: dict):
     conn = _conn()
     conn.execute(
         "INSERT OR REPLACE INTO fund_sharpe "
         "(code, ann_return, volatility, sharpe, data_points, "
-        " mdd_1m, mdd_3m, mdd_6m, mdd_1y, sharpe_6m, sharpe_1y, saved_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " mdd_1m, mdd_3m, mdd_6m, mdd_1y, sharpe_6m, sharpe_1y, "
+        " ret_1m, ret_3m, ret_6m, ret_1y, saved_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (code, ann_return, volatility, sharpe, n,
          mdd.get("mdd_1m"), mdd.get("mdd_3m"), mdd.get("mdd_6m"), mdd.get("mdd_1y"),
          psharpe.get("sharpe_6m"), psharpe.get("sharpe_1y"),
+         rets.get("ret_1m"), rets.get("ret_3m"), rets.get("ret_6m"), rets.get("ret_1y"),
          time.time()),
     )
     conn.commit()
@@ -677,6 +683,7 @@ def _save_metrics(code: str, m: dict):
         code, m["ann_return"], m["volatility"], m["sharpe"], m["data_points"],
         {k: m[k] for k in ("mdd_1m", "mdd_3m", "mdd_6m", "mdd_1y")},
         {k: m[k] for k in ("sharpe_6m", "sharpe_1y")},
+        {k: m[k] for k in ("ret_1m", "ret_3m", "ret_6m", "ret_1y")},
     )
 
 
@@ -1182,11 +1189,13 @@ def recompute_all(rf: Optional[float] = None,
             conn.execute(
                 "INSERT OR REPLACE INTO fund_sharpe "
                 "(code, ann_return, volatility, sharpe, data_points, "
-                " mdd_1m, mdd_3m, mdd_6m, mdd_1y, sharpe_6m, sharpe_1y, saved_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " mdd_1m, mdd_3m, mdd_6m, mdd_1y, sharpe_6m, sharpe_1y, "
+                " ret_1m, ret_3m, ret_6m, ret_1y, saved_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (code, m["ann_return"], m["volatility"], m["sharpe"], m["data_points"],
                  m["mdd_1m"], m["mdd_3m"], m["mdd_6m"], m["mdd_1y"],
-                 m["sharpe_6m"], m["sharpe_1y"], time.time()),
+                 m["sharpe_6m"], m["sharpe_1y"],
+                 m["ret_1m"], m["ret_3m"], m["ret_6m"], m["ret_1y"], time.time()),
             )
             saved += 1
         if progress_callback and (done % 500 == 0 or done == total):
@@ -1246,7 +1255,8 @@ def load_all_precomputed() -> dict:
     conn = _conn()
     rows = conn.execute(
         "SELECT code, ann_return, volatility, sharpe, data_points, "
-        "mdd_1m, mdd_3m, mdd_6m, mdd_1y, sharpe_6m, sharpe_1y FROM fund_sharpe"
+        "mdd_1m, mdd_3m, mdd_6m, mdd_1y, sharpe_6m, sharpe_1y, "
+        "ret_1m, ret_3m, ret_6m, ret_1y FROM fund_sharpe"
     ).fetchall()
     conn.close()
     return {r["code"]: {k: r[k] for k in r.keys() if k != "code"} for r in rows}
