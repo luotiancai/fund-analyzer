@@ -359,9 +359,10 @@ with tab_table:
             "types": sorted(selected_types), "period": period_label,
             "min_ret": min_ret, "max_dd": max_dd, "asof": _asof_iso,
             # Bumped when the filter rules change (v3: exclude funds younger
-            # than the *selected* period window; v4: exclude 债券型; v5: also
-            # exclude 指数型-固收), so stale cached results never get served.
-            "rule_ver": 5,
+            # than the *selected* period window; v4-v6: exclude 债券/固收/偏债
+            # types, is_bond 逐步收敛为「含债或固收」), so stale cached
+            # results never get served.
+            "rule_ver": 6,
             # Combines the Sharpe/drawdown recompute timestamp with the fund
             # list's own saved_at: the in-app update button refreshes the list
             # (fresh returns) but skips recompute_all, so last_update_time()
