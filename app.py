@@ -300,6 +300,9 @@ with tab_table:
         _fparams = {
             "types": sorted(selected_types), "period": period_label,
             "min_ret": min_ret, "max_dd": max_dd, "asof": _asof_iso,
+            # Bumped when the filter rules change (v2: exclude funds <1y old),
+            # so stale cached results from older rules never get served.
+            "rule_ver": 2,
             # Combines the Sharpe/drawdown recompute timestamp with the fund
             # list's own saved_at: the in-app update button refreshes the list
             # (fresh returns) but skips recompute_all, so last_update_time()
@@ -367,6 +370,14 @@ with tab_table:
                                 filtered[_rc], errors="coerce"
                             ).fillna(pd.to_numeric(
                                 filtered[f"{_rc}_list"], errors="coerce"))
+
+            # ── 剔除成立不满一年的基金 ─────────────────────────────────────────
+            # 近1年收益率为空即视为历史不足一年:榜单对不满一年的基金该列留空,
+            # 本地重算的 ret_1y 同样因缺少一年前的锚点而为 None。即使选的是
+            # 近1月/近3月等短区间,这类新基金也一律不进筛选列表。
+            if "ret_1y" in filtered.columns:
+                filtered = filtered[
+                    pd.to_numeric(filtered["ret_1y"], errors="coerce").notna()]
 
             if ret_col in filtered.columns:
                 # Only keep funds that actually have a return for the selected period
