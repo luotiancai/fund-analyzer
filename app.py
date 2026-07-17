@@ -9,6 +9,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 import fetcher
 import simulator
@@ -240,6 +241,48 @@ with tab_table:
                      "因此最早可选 2021-01-01，保证近1年窗口有完整数据。",
             )
         submitted = st.form_submit_button("🔍 开始筛选", type="primary")
+
+    # ── 截至日期日历上标记上证大跌日 ──────────────────────────────────────────
+    # st.date_input 的日历(BaseWeb Datepicker)不支持按日期加样式,从组件
+    # iframe 注入脚本到父页面:MutationObserver 监听日历弹层出现,按日期格子
+    # 的 aria-label 解析出日期(streamlit 1.50 固定为英文,如 "Choose
+    # Wednesday, July 16th 2026. It's available."),给上证跌超1%的交易日画
+    # 红色下划线,悬浮显示当日跌幅。日历关闭时选择器查不到任何格子,零开销。
+    _sse_marks = load_sse_daily()
+    if _sse_marks is not None and not _sse_marks.empty:
+        _mk_pct = pd.to_numeric(_sse_marks["pct"], errors="coerce")
+        _mk = _sse_marks[_mk_pct <= -1.0]
+        _drop_map = dict(zip(_mk["date"].astype(str),
+                             _mk_pct[_mk_pct <= -1.0].round(2).astype(float)))
+        components.html("""<script>
+        const DROPS = __DROPS__;
+        const MONTHS = {January:1, February:2, March:3, April:4, May:5, June:6,
+                        July:7, August:8, September:9, October:10,
+                        November:11, December:12};
+        const RE = new RegExp(
+          '(' + Object.keys(MONTHS).join('|') + ') (\\\\d+)(?:st|nd|rd|th),? (\\\\d{4})');
+        const doc = window.parent.document;
+        function mark() {
+          doc.querySelectorAll('div[data-baseweb="calendar"] [aria-label]')
+            .forEach(el => {
+              const m = el.getAttribute('aria-label').match(RE);
+              if (!m) return;
+              const iso = m[3] + '-' + String(MONTHS[m[1]]).padStart(2, '0')
+                        + '-' + String(m[2]).padStart(2, '0');
+              // 翻月时 BaseWeb 复用同一批格子 DOM,必须显式清除,否则上个
+              // 月的标记会残留在同位置的格子上。
+              if (iso in DROPS) {
+                el.style.boxShadow = 'inset 0 -3px 0 0 #e0454b';
+                el.title = '沪指 ' + DROPS[iso].toFixed(2) + '%';
+              } else {
+                el.style.boxShadow = '';
+                el.removeAttribute('title');
+              }
+            });
+        }
+        new MutationObserver(mark).observe(doc.body, {subtree: true, childList: true});
+        </script>""".replace("__DROPS__", json.dumps(_drop_map)), height=0)
+        st.caption("📅 截至日期的日历中,红色下划线标记 = 上证当日跌超 1%")
 
     # Nothing is filtered/merged/rendered until the user explicitly runs a filter —
     # a fresh page load stops at the (cached) fund list. The flag persists in the
