@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""一次性维护:删除库内债券型基金(用户不做债基,筛选已整体排除)。
+"""一次性维护:删除库内债券/固收类基金(用户不做债基,筛选已整体排除)。
 
-删除类型前缀为「债券型」的基金(长债/中短债/混合一级/混合二级/利率债/
-信用债)的净值/指标/持仓数据,并清空筛选结果缓存。日常管线的回填过滤已
-排除该类型(见 fetcher.run_pipeline 的 is_bond 检查),删后不会再拉回来。
+删除 fetcher.is_bond 命中类型(债券型全部子类 + 指数型-固收)的净值/
+指标/持仓数据,并清空筛选结果缓存。日常管线的回填过滤已排除该类型
+(见 fetcher.run_pipeline 的 is_bond 检查),删后不会再拉回来。
 
 用法:
   python3 purge_bonds.py --dry-run   # 只看统计,不动数据
@@ -11,12 +11,13 @@
 """
 
 import argparse
+import json
 
 import fetcher
 
 
 def main():
-    parser = argparse.ArgumentParser(description="删除库内债券型基金")
+    parser = argparse.ArgumentParser(description="删除库内债券/固收类基金")
     parser.add_argument("--dry-run", action="store_true", help="只统计不执行")
     args = parser.parse_args()
 
@@ -26,15 +27,19 @@ def main():
 
     conn = fetcher._conn()
     stored = {r["code"] for r in conn.execute("SELECT DISTINCT code FROM fund_nav_daily")}
-    # 模拟盘交易涉及的基金保留净值,否则持仓估值/图表会断(nav_series 只读库)。
+    # 模拟盘交易涉及的基金保留净值,否则持仓估值/图表会断(nav_series 只读
+    # 库)。归档(sim_archives)里的交易恢复后同样要读净值,一并保护。
+    sim_codes = set()
     try:
-        sim_codes = {r["code"] for r in conn.execute("SELECT DISTINCT code FROM sim_trades")}
+        sim_codes |= {r["code"] for r in conn.execute("SELECT DISTINCT code FROM sim_trades")}
+        for r in conn.execute("SELECT trades FROM sim_archives"):
+            sim_codes |= {t["code"] for t in json.loads(r["trades"])}
     except Exception:
-        sim_codes = set()
+        pass
     kept = sorted(bond_codes & stored & sim_codes)
     to_del = sorted((bond_codes & stored) - sim_codes)
     n_filter, = conn.execute("SELECT COUNT(*) FROM filter_results").fetchone()
-    print(f"债券型代码 {len(bond_codes)} 个 · 库内命中 {len(to_del) + len(kept)} 只 · "
+    print(f"债券/固收代码 {len(bond_codes)} 个 · 库内命中 {len(to_del) + len(kept)} 只 · "
           f"筛选缓存 {n_filter} 条")
     if kept:
         print(f"保留 {len(kept)} 只(模拟盘交易涉及): {', '.join(kept)}")
@@ -52,7 +57,7 @@ def main():
     left, = conn.execute("SELECT COUNT(DISTINCT code) FROM fund_nav_daily").fetchone()
     conn.execute("VACUUM")
     conn.close()
-    print(f"✅ 已删除 {len(to_del)} 只债券型基金,清空筛选缓存,库内剩余 {left} 只")
+    print(f"✅ 已删除 {len(to_del)} 只债券/固收基金,清空筛选缓存,库内剩余 {left} 只")
 
 
 if __name__ == "__main__":

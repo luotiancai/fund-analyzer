@@ -400,10 +400,11 @@ def is_overseas_equity(fund_type) -> bool:
     return fund_type in OVERSEAS_EQUITY_TYPES
 
 
-# 债券型基金同样不入库、不参与筛选(用户不做债基)。类型前缀匹配覆盖全部
-# 子类:长债/中短债/混合一级/混合二级/利率债/信用债。
+# 债券/固收类基金同样不入库、不参与筛选(用户不做债基)。覆盖:债券型全部
+# 子类(长债/中短债/混合一级/混合二级/利率债/信用债)及指数型-固收。
 def is_bond(fund_type) -> bool:
-    return str(fund_type).startswith("债券型")
+    t = str(fund_type)
+    return t.startswith("债券型") or "固收" in t
 
 
 # ── Fund list ────────────────────────────────────────────────────────────────
