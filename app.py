@@ -69,8 +69,11 @@ with st.sidebar:
 update_btn = st.session_state.pop("_run_update", False)
 
 # ── Load fund list ────────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner="正在加载基金列表…")
-def load_fund_list():
+# `cache_key` 是 SQLite 里榜单的 saved_at:数据版本没变就一直命中(TTL 只是
+# 兜底),变了(更新按钮/update_daily.py 刷新)立即失效。之前按 1h TTL 过期
+# 会在盘中交互时穿透到网络全量重拉,页面卡几十秒且标签页被顶回首页。
+@st.cache_data(ttl=24 * 3600, show_spinner="正在加载基金列表…")
+def load_fund_list(cache_key):
     return fetcher.fetch_fund_list(force_refresh=False)
 
 
@@ -179,7 +182,7 @@ if update_btn:
     )
 
 with st.spinner("加载基金列表中…"):
-    fund_df = load_fund_list()
+    fund_df = load_fund_list(fetcher.fund_list_saved_at())
 
 if fund_df is None or fund_df.empty:
     st.error("无法获取基金列表，请检查网络连接。")

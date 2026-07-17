@@ -50,7 +50,10 @@ def _migrate_db_location():
             os.remove(_LEGACY_DB + suffix)
         except OSError:
             pass
-FUND_LIST_TTL = 3600    # 1 hour
+# 26h:榜单本质是每日数据,由 update_daily.py/「更新数据」按钮强制刷新;
+# 留 2h 余量给每日节奏。此前 1h 会让盘中任意交互(如模拟盘买入触发的
+# rerun)穿透缓存、现场全量重拉榜单卡住页面几十秒,还把标签页顶回首页。
+FUND_LIST_TTL = 26 * 3600
 NAV_TTL = 86400         # 24 hours
 NAV_START = "2020-01-01"  # NAV history is kept from this date onward
 MAX_WORKERS = 8
