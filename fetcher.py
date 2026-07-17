@@ -1193,6 +1193,11 @@ def recompute_all(rf: Optional[float] = None,
             progress_callback(done, total)
     conn.commit()
     conn.close()
+    # Full-table recompute marker. Deliberately NOT derived from
+    # MAX(fund_sharpe.saved_at): the detail tab persists single rows via
+    # compute_sharpe_for_fund, which would make the whole table look fresh
+    # after viewing one fund.
+    _set_meta("metrics_recomputed_at", time.time())
     return saved
 
 
@@ -1248,11 +1253,55 @@ def load_all_precomputed() -> dict:
 
 
 def last_update_time() -> Optional[float]:
-    """Unix time of the most recent precomputed metric, or None if empty."""
+    """Unix time of the last FULL metrics recompute, or None if never.
+
+    Prefers the recompute_all marker; MAX(fund_sharpe.saved_at) is only a
+    legacy fallback (pre-marker DBs) — it overstates freshness because the
+    detail tab persists individual rows, bumping the max after one lookup.
+    """
+    t, _ = _get_meta("metrics_recomputed_at")
+    if t is not None:
+        return t
     conn = _conn()
     row = conn.execute("SELECT MAX(saved_at) AS t FROM fund_sharpe").fetchone()
     conn.close()
     return row["t"] if row and row["t"] else None
+
+
+def metrics_stale() -> bool:
+    """True when NAV data has been updated since the last full metrics
+    recompute — i.e. the precomputed Sharpe/drawdown table is out of date and
+    filtering on it would use yesterday's values.
+
+    Missing markers (pre-marker DBs) fall back to MAX(fund_nav_meta.saved_at)
+    for the NAV side and count as stale on the metrics side, so the first
+    filter after upgrading recomputes once and plants both markers.
+    """
+    nav_t, _ = _get_meta("nav_updated_at")
+    if nav_t is None:
+        conn = _conn()
+        row = conn.execute("SELECT MAX(saved_at) AS t FROM fund_nav_meta").fetchone()
+        conn.close()
+        nav_t = row["t"] if row else None
+    if nav_t is None:
+        return False   # no NAV data at all — nothing to recompute from
+    met_t, _ = _get_meta("metrics_recomputed_at")
+    return met_t is None or met_t < nav_t
+
+
+def fund_list_saved_at() -> Optional[float]:
+    """Unix time the fund list snapshot (returns, incl. ret_1m/3m/6m/1y) was
+    last saved, or None if never fetched.
+
+    The in-app update button refreshes the fund list every run but skips
+    recompute_all() (do_recompute=False), so last_update_time() alone doesn't
+    move — callers needing a cache key that reflects *any* data refresh
+    (not just a Sharpe recompute) should combine this with last_update_time().
+    """
+    conn = _conn()
+    row = conn.execute("SELECT saved_at FROM fund_list WHERE id = 1").fetchone()
+    conn.close()
+    return row["saved_at"] if row else None
 
 
 def _backfill_codes(codes: list, workers: int = MAX_WORKERS,
@@ -1318,6 +1367,10 @@ def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
         )
 
     res = append_incremental(list_df, progress=_p)
+    # NAV data just changed; metrics_stale() compares this against the
+    # recompute marker so a do_recompute=False run (the in-app button) leaves
+    # the metrics flagged stale until the next filter recomputes them.
+    _set_meta("nav_updated_at", time.time())
 
     saved = 0
     if do_recompute:

@@ -256,6 +256,24 @@ with tab_table:
         return {}
 
 
+    # Lazy metrics recompute — the piece the 「🔄 更新数据」 button's
+    # do_recompute=False has always been promising ("筛选时按需计算"): if NAV
+    # data changed since the last full recompute, the stored Sharpe/drawdown
+    # are yesterday's and would let funds past today's thresholds (e.g. a fund
+    # whose latest drop pushed 近1年回撤 over the cutoff). Recompute the whole
+    # table once, here, before any filtering or cache lookup.
+    if filter_ready and not asof_mode and fetcher.metrics_stale():
+        _bar = st.progress(0.0, text="🧮 净值已更新，正在重算全市场指标…")
+        fetcher.recompute_all(
+            rf=rf_rate,
+            progress_callback=lambda d, t: _bar.progress(
+                (d / t) if t else 1.0,
+                text=f"🧮 净值已更新，正在重算全市场指标… {d:,}/{t:,}",
+            ),
+        )
+        load_metrics_df.clear()
+        _bar.empty()
+
     if not (filter_ready and asof_mode):
         _last_update = fetcher.last_update_time()
         if _last_update:
@@ -281,7 +299,12 @@ with tab_table:
         _fparams = {
             "types": sorted(selected_types), "period": period_label,
             "min_ret": min_ret, "max_dd": max_dd, "asof": _asof_iso,
-            "data_ver": None if asof_mode else fetcher.last_update_time(),
+            # Combines the Sharpe/drawdown recompute timestamp with the fund
+            # list's own saved_at: the in-app update button refreshes the list
+            # (fresh returns) but skips recompute_all, so last_update_time()
+            # alone wouldn't invalidate this cache on its own.
+            "data_ver": None if asof_mode
+                else [fetcher.last_update_time(), fetcher.fund_list_saved_at()],
         }
         _fkey = hashlib.md5(json.dumps(
             _fparams, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
