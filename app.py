@@ -1154,6 +1154,7 @@ with tab_sim:
                 st.dataframe(pd.DataFrame({
                     "代码": hold["code"],
                     "名称": hold["code"].map(_code_names),
+                    "买入日期": hold["open_date"],
                     "成本(¥)": hold["cost"].round(2),
                     "当日收益率(%)": pd.to_numeric(
                         hold["day_ret"], errors="coerce").round(2),
