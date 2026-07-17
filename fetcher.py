@@ -664,9 +664,14 @@ def _save_sharpe(code: str, ann_return: float, volatility: float, sharpe: float,
     conn.close()
 
 
-def _metrics_from_nav(nav_df: pd.DataFrame, rf: float) -> Optional[dict]:
+def _metrics_from_nav(nav_df: pd.DataFrame, rf: float,
+                      cols: Optional[set] = None) -> Optional[dict]:
     """Compute annualized return / volatility / Sharpe + per-period Sharpe and
-    max-drawdown from an already-fetched NAV DataFrame. Pure (no I/O)."""
+    max-drawdown from an already-fetched NAV DataFrame. Pure (no I/O).
+
+    `cols` 给出时只算这些区间列(如 {"ret_1y","mdd_1y","sharpe_1y"}),
+    并跳过全期年化三件套——快照筛选只用所选区间,砍掉无关窗口能省近半
+    耗时;None 保持全量(recompute_all 落库用)。"""
     df = nav_df.copy()
     df["date"] = pd.to_datetime(df["date"])
     df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
@@ -683,20 +688,29 @@ def _metrics_from_nav(nav_df: pd.DataFrame, rf: float) -> Optional[dict]:
     if len(returns) < 20:
         return None
 
+    # Per-period Sharpe and max drawdown over trailing calendar-day windows,
+    # date-aligned with EastMoney's 近X 收益率. A fund younger than a window
+    # gets None for it (no anchor) rather than a misleadingly short reading.
+    # Drawdown runs on accumulated NAV so dividends aren't mistaken for drops.
+    psharpe = {key: _period_sharpe(df, days, rf)
+               for key, days in SHARPE_DAYS.items()
+               if cols is None or key in cols}
+    mdd = {key: _period_mdd(df, days)
+           for key, days in DRAWDOWN_DAYS.items()
+           if cols is None or key in cols}
+    rets = {key: _period_return(df, days)
+            for key, days in RETURN_DAYS.items()
+            if cols is None or key in cols}
+
+    if cols is not None:
+        return {**mdd, **psharpe, **rets}
+
     n = len(returns)
     span = (df["date"].iloc[-1] - df["date"].iloc[0]).days
     res = _annualized(returns, span, rf)
     if res is None:
         return None
     ann_return, ann_vol, sharpe = res
-
-    # Per-period Sharpe and max drawdown over trailing calendar-day windows,
-    # date-aligned with EastMoney's 近X 收益率. A fund younger than a window
-    # gets None for it (no anchor) rather than a misleadingly short reading.
-    # Drawdown runs on accumulated NAV so dividends aren't mistaken for drops.
-    psharpe = {key: _period_sharpe(df, days, rf) for key, days in SHARPE_DAYS.items()}
-    mdd = {key: _period_mdd(df, days) for key, days in DRAWDOWN_DAYS.items()}
-    rets = {key: _period_return(df, days) for key, days in RETURN_DAYS.items()}
 
     return {
         "ann_return": ann_return, "volatility": ann_vol, "sharpe": sharpe,
@@ -1402,7 +1416,8 @@ def recompute_all(rf: Optional[float] = None,
 
 
 def compute_metrics_asof(asof: str, rf: Optional[float] = None,
-                         progress_callback: Optional[Callable] = None) -> dict:
+                         progress_callback: Optional[Callable] = None,
+                         cols: Optional[set] = None) -> dict:
     """Every fund's metrics as an observer ON `asof` could have seen them.
 
     Truncates each fund's history to rows STRICTLY BEFORE `asof` (ISO
@@ -1411,6 +1426,8 @@ def compute_metrics_asof(asof: str, rf: Optional[float] = None,
     period returns, Sharpe and drawdown over the same trailing windows — no
     network, nothing persisted. Funds with under 20 NAV points by that date
     are omitted. Returns {code: metrics-dict}.
+
+    `cols` 只算指定区间列(见 _metrics_from_nav),筛选快照用。
     """
     if rf is None:
         rf = get_risk_free_rate()
@@ -1425,7 +1442,7 @@ def compute_metrics_asof(asof: str, rf: Optional[float] = None,
         if len(df) >= 20:
             df["date"] = pd.to_datetime(df["date"])
             try:
-                m = _metrics_from_nav(df, rf)
+                m = _metrics_from_nav(df, rf, cols=cols)
             except Exception as e:
                 logger.debug("asof metrics failed %s: %s", code, e)
                 m = None

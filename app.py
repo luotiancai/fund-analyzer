@@ -389,11 +389,14 @@ with tab_table:
     if filter_ready and _hit is None:
         if asof_mode:
             _cache = _asof_cache()
-            _key = (_asof_iso, round(rf_rate, 6))
+            # 只算所选区间的收益/回撤/夏普三列(其余窗口筛选和展示都用不到,
+            # 全算耗时翻倍),缓存键因此带上区间。
+            _cols = {ret_col, mdd_col} | ({sharpe_col} if sharpe_col else set())
+            _key = (_asof_iso, round(rf_rate, 6), tuple(sorted(_cols)))
             if _key not in _cache:
-                _bar = st.progress(0.0, text=f"📅 正在按 {_asof_iso} 重算全市场指标（约1分钟）…")
+                _bar = st.progress(0.0, text=f"📅 正在按 {_asof_iso} 重算全市场指标（约半分钟）…")
                 _cache[_key] = fetcher.compute_metrics_asof(
-                    _asof_iso, rf_rate,
+                    _asof_iso, rf_rate, cols=_cols,
                     progress_callback=lambda d, t: _bar.progress(
                         (d / t) if t else 1.0,
                         text=f"📅 正在按 {_asof_iso} 重算全市场指标… {d:,}/{t:,}",
