@@ -366,9 +366,9 @@ with tab_table:
             "min_ret": min_ret, "max_dd": max_dd, "asof": _asof_iso,
             # Bumped when the filter rules change (v3: exclude funds younger
             # than the *selected* period window; v4-v6: exclude 债券/固收/偏债
-            # types, is_bond 逐步收敛为「含债或固收」), so stale cached
-            # results never get served.
-            "rule_ver": 6,
+            # types, is_bond 逐步收敛为「含债或固收」; v7: 回撤改按校正收益
+            # 复利口径,与模拟盘一致), so stale cached results never get served.
+            "rule_ver": 7,
             # Combines the Sharpe/drawdown recompute timestamp with the fund
             # list's own saved_at: the in-app update button refreshes the list
             # (fresh returns) but skips recompute_all, so last_update_time()

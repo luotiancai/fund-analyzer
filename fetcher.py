@@ -386,11 +386,21 @@ def _period_return(df: pd.DataFrame, days_back: int) -> Optional[float]:
 
 
 def _period_mdd(df: pd.DataFrame, days_back: int) -> Optional[float]:
-    """Max drawdown over the trailing `days_back` window, on accumulated NAV."""
+    """Max drawdown over the trailing `days_back` window, 按校正日收益率的
+    复利增长指数计算(分红视作再投),与模拟盘 mdd_1y_at_buy 同口径。
+
+    此前用累计净值:它把历史分红单利加回,对分红基金会低估回撤
+    (002583 近1年 14.51% vs 复利口径 16.45%),导致表格与模拟盘对不上。
+    需要 df 已带校正收益列 r(_metrics_from_nav 保证)。"""
     window = _window_by_date(df, days_back)
     if window is None:
         return None
-    return _max_drawdown(window["acc_nav"])
+    r = window["r"].iloc[1:].fillna(0.0)   # 首行是窗口锚点,其收益属窗口外
+    if r.empty:
+        return None
+    idx = pd.concat([pd.Series([1.0]), (1.0 + r).cumprod()],
+                    ignore_index=True)
+    return _max_drawdown(idx)
 
 
 # ── C-class share detection ──────────────────────────────────────────────────
