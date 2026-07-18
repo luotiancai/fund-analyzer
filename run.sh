@@ -8,5 +8,11 @@ else
     PY="python3"
 fi
 
-"$PY" -m pip install -q -r requirements.txt
+# requirements.txt 没变就跳过 pip(空跑也要 ~3s)
+REQ_STAMP=".venv/.req-$(md5sum requirements.txt | cut -d' ' -f1)"
+if [ ! -f "$REQ_STAMP" ]; then
+    "$PY" -m pip install -q -r requirements.txt \
+        && rm -f .venv/.req-* && touch "$REQ_STAMP"
+fi
+
 "$PY" -m streamlit run app.py --server.port 8501

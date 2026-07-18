@@ -11,6 +11,16 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
+# Streamlit 首个元素入队时会无条件调 env_util.is_repl()(inspect.stack 扫
+# 全部已加载模块的源文件),在 /mnt/c 的 9p 文件系统上实测 ~8s,占了首屏
+# 卡顿的大半。该检查只为打印「请用 streamlit run」提示,置位其去重标志
+# 直接跳过;私有属性,失败则退回原行为。
+try:
+    import streamlit.delta_generator as _dg
+    _dg._use_warning_has_been_displayed = True
+except Exception:
+    pass
+
 import fetcher
 import simulator
 
@@ -1226,7 +1236,8 @@ with tab_sse:
         sse_all = sse_all.sort_values("date").reset_index(drop=True)
 
         _sse_ranges = {"近1月": 30, "近3月": 91, "近6月": 182,
-                       "近1年": 365, "近3年": 365 * 3, "全部": None}
+                       "近1年": 365, "近3年": 365 * 3, "近5年": 365 * 5,
+                       "近10年": 365 * 10, "全部": None}
         _c_rng, _c_bands, _c_vix = st.columns([4, 1, 1])
         with _c_rng:
             _rng = st.radio("时间区间", list(_sse_ranges.keys()), index=3,

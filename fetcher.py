@@ -12,9 +12,20 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional, Tuple
 
-import akshare as ak
 import pandas as pd
 import requests
+
+
+class _LazyAkshare:
+    """akshare 导入要 ~3s(/mnt/c 上尤甚),而缓存命中的日常路径用不到它;
+    首次真正访问属性时才导入,并把模块回填进全局名 ak。"""
+    def __getattr__(self, name):
+        import akshare
+        globals()["ak"] = akshare
+        return getattr(akshare, name)
+
+
+ak = _LazyAkshare()
 
 logger = logging.getLogger(__name__)
 
@@ -1082,6 +1093,10 @@ def fetch_holdings(code: str, force_refresh: bool = False) -> Optional[pd.DataFr
 
 _INDEX_TTL = 12 * 3600
 
+# 指数/QVIX 历史起点,独立于基金净值的 NAV_START(2020):图表要看近10年,
+# 取 2015 起同时覆盖 QVIX 全史(2015-02 起)和 2015 股灾样本。
+INDEX_START = "2015-01-01"
+
 
 def fetch_sse_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     """上证指数 daily history from NAV_START, cache-first (12h TTL).
@@ -1115,7 +1130,7 @@ def fetch_sse_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
             "close": pd.to_numeric(raw["close"], errors="coerce"),
         }).dropna(subset=["date", "close"])
         df["pct"] = df["close"].pct_change() * 100.0
-        df = df[df["date"] >= NAV_START].reset_index(drop=True)
+        df = df[df["date"] >= INDEX_START].reset_index(drop=True)
     except Exception as e:
         logger.debug("SSE index fetch failed: %s", e)
 
@@ -1160,7 +1175,7 @@ def fetch_qvix_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
             "date": pd.to_datetime(raw["date"]).dt.strftime("%Y-%m-%d"),
             "close": pd.to_numeric(raw["close"], errors="coerce"),
         }).dropna(subset=["date", "close"])
-        df = df[df["date"] >= NAV_START].reset_index(drop=True)
+        df = df[df["date"] >= INDEX_START].reset_index(drop=True)
     except Exception as e:
         logger.debug("QVIX fetch failed: %s", e)
 
