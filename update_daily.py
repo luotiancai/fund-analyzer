@@ -61,6 +61,28 @@ def main():
                  summary["funds"], summary["backfilled"], summary["appended"],
                  summary["patched"], summary["failed"], summary["recomputed"])
 
+    # ── 指数/恐慌指数刷新 + 动态恐慌阈值 ────────────────────────────────────
+    # 强刷上证与 QVIX 缓存(app 侧 12h TTL 直接命中),并按滚动 3 年 95 分位
+    # 计算当日恐慌阈值,把「是否触发 B 点」直接打进日志。
+    log.info("刷新指数缓存(上证 / QVIX / 纳指 / VIX)…")
+    try:
+        sse = fetcher.fetch_sse_daily(force_refresh=True)
+        qvix = fetcher.fetch_qvix_daily(force_refresh=True)
+        fetcher.fetch_nasdaq_daily(force_refresh=True)
+        fetcher.fetch_vix_daily(force_refresh=True)
+        if sse is not None and qvix is not None and len(qvix) >= 240:
+            thr = float(qvix["close"].rolling(720, min_periods=240)
+                        .quantile(0.95).iloc[-1])
+            q_last = float(qvix["close"].iloc[-1])
+            s_last = sse.iloc[-1]
+            triggered = q_last > thr and float(s_last["pct"]) < 0
+            log.info("   上证 %s 收 %.0f(%+.2f%%) · QVIX %.2f · 恐慌阈值(3年95分位) %.2f%s",
+                     s_last["date"], s_last["close"], s_last["pct"],
+                     q_last, thr,
+                     " · 🔔 B点触发(QVIX破阈值且大盘下跌)" if triggered else "")
+    except Exception as e:
+        log.warning("   指数刷新失败(不影响基金跑批): %s", e)
+
     log.info("✅ 完成,总耗时 %.1f 分钟", (time.time() - t0) / 60)
 
 
