@@ -119,6 +119,16 @@ def load_qvix_daily():
     return fetcher.fetch_qvix_daily()
 
 
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def load_nasdaq_daily():
+    return fetcher.fetch_nasdaq_daily()
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def load_vix_daily():
+    return fetcher.fetch_vix_daily()
+
+
 # 1y max drawdown as it stood on the buy date (window: buy_date-365d → buy_date),
 # on the corrected daily-return growth index (nav_series 的 ret 列) so dividend
 # NAV resets don't count as drops, while build-up-period fake-zero growth rates
@@ -224,8 +234,8 @@ for _c in ("ret_1m", "ret_3m", "ret_6m", "ret_1y"):
         fund_df[_c] = pd.to_numeric(fund_df[_c], errors="coerce")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_table, tab_detail, tab_sim, tab_sse = st.tabs(
-    ["📋 基金列表", "🔍 基金详情", "💰 模拟盘", "📈 上证指数"])
+tab_table, tab_detail, tab_sim, tab_sse, tab_ndx = st.tabs(
+    ["📋 基金列表", "🔍 基金详情", "💰 模拟盘", "📈 上证指数", "🇺🇸 纳指"])
 
 # ─── Tab 1: Table ────────────────────────────────────────────────────────────
 with tab_table:
@@ -1448,3 +1458,116 @@ with tab_sse:
                 "买入后高点回撤 5%,或基金自身从买入后高点回撤 20%(20% 高于"
                 "高贝塔冠军 12~15% 的日常洗盘振幅,10%/15% 线会被正常震荡"
                 "抖出局;12 案例中仅 2025-04-07 由基金线先触发)。")
+
+# ─── Tab 5: Nasdaq + VIX ─────────────────────────────────────────────────────
+with tab_ndx:
+    ndx_df = load_nasdaq_daily()
+    if ndx_df is None or ndx_df.empty:
+        st.warning("纳指数据获取失败，请稍后重试。")
+    else:
+        ndx_all = ndx_df.copy()
+        ndx_all["date"] = pd.to_datetime(ndx_all["date"])
+        ndx_all = ndx_all.sort_values("date").reset_index(drop=True)
+
+        _ndx_ranges = {"近1月": 30, "近3月": 91, "近6月": 182,
+                       "近1年": 365, "近3年": 365 * 3, "近5年": 365 * 5,
+                       "近10年": 365 * 10, "全部": None}
+        _c_rng2, _c_vix2 = st.columns([5, 1])
+        with _c_rng2:
+            _rng2 = st.radio("时间区间", list(_ndx_ranges.keys()), index=6,
+                             horizontal=True, key="ndx_range")
+        with _c_vix2:
+            _show_vix2 = st.checkbox("VIX恐慌指数", value=True, key="ndx_vix",
+                                     help="CBOE VIX(标普500期权隐含波动率),右轴")
+
+        _days2 = _ndx_ranges[_rng2]
+        if _days2 is None:
+            nview = ndx_all
+        else:
+            _start2 = ndx_all["date"].max() - pd.Timedelta(days=_days2)
+            _older2 = ndx_all[ndx_all["date"] <= _start2]
+            nview = ndx_all.loc[_older2.index[-1]:] if not _older2.empty else ndx_all
+
+        _nlatest = ndx_all.iloc[-1]
+        _nchg = (_nlatest["close"] / nview["close"].iloc[0] - 1.0) * 100.0
+        _npeak = nview["close"].cummax()
+        _nmdd = float(((_npeak - nview["close"]) / _npeak).max() * 100.0)
+        nk1, nk2, nk3, nk4 = st.columns(4)
+        nk1.metric("最新收盘", f"{_nlatest['close']:,.2f}",
+                   f"{_nlatest['pct']:+.2f}%（当日）")
+        nk2.metric(f"{_rng2}涨跌幅", f"{_nchg:+.2f}%")
+        nk3.metric(f"{_rng2}最大回撤", f"{_nmdd:.2f}%")
+        nk4.metric("数据日期", _nlatest["date"].strftime("%Y-%m-%d"))
+
+        fig_ndx = px.line(
+            nview, x="date", y="close",
+            title=f"纳斯达克综合指数走势（{_rng2}）",
+            labels={"date": "日期", "close": "收盘点位"},
+            height=420,
+        )
+        fig_ndx.update_traces(
+            customdata=nview[["pct"]],
+            hovertemplate="收盘 %{y:,.2f} · 日涨跌 %{customdata[0]:+.2f}%"
+                          "<extra></extra>")
+
+        vix_view = None
+        if _show_vix2:
+            _vix = load_vix_daily()
+            if _vix is not None and not _vix.empty:
+                vix_view = _vix.copy()
+                vix_view["date"] = pd.to_datetime(vix_view["date"])
+                vix_view = vix_view[
+                    (vix_view["date"] >= nview["date"].min())
+                    & (vix_view["date"] <= nview["date"].max())]
+            if vix_view is None or vix_view.empty:
+                st.caption("⚠️ VIX 数据暂不可用")
+                vix_view = None
+        if vix_view is not None:
+            fig_ndx.data[0].name = "纳指"
+            fig_ndx.data[0].showlegend = True
+            fig_ndx.add_trace(go.Scatter(
+                x=vix_view["date"], y=vix_view["close"],
+                name="VIX恐慌指数", yaxis="y2",
+                line=dict(color="#f28e2b", width=1.3),
+                hovertemplate="VIX %{y:.2f}<extra></extra>"))
+            fig_ndx.update_layout(
+                yaxis2=dict(title="VIX恐慌指数", overlaying="y", side="right",
+                            showgrid=False))
+            # 20 预警 / 30 恐慌,美股 VIX 的常用阈值。
+            for _lvl2, _dash2 in ((20, "dot"), (30, "dash")):
+                fig_ndx.add_shape(
+                    type="line", xref="paper", x0=0, x1=1,
+                    yref="y2", y0=_lvl2, y1=_lvl2,
+                    line=dict(color="#8e44ad", width=1, dash=_dash2),
+                    opacity=0.6)
+                fig_ndx.add_annotation(
+                    x=1, xref="paper", xanchor="left", y=_lvl2, yref="y2",
+                    text=str(_lvl2), showarrow=False,
+                    font=dict(size=10, color="#8e44ad"))
+
+        fig_ndx.update_layout(
+            hovermode="x unified", hoverdistance=-1, spikedistance=-1)
+        _nspan = max((nview["date"].max() - nview["date"].min()).days, 1)
+        fig_ndx.update_xaxes(
+            showspikes=True, spikemode="across", spikesnap="data",
+            spikedash="dot", spikethickness=1,
+            hoverformat="%Y-%m-%d", tickformat="%Y-%m-%d",
+            dtick=max(1, _nspan // 8) * 86400000)
+        fig_ndx.update_yaxes(
+            showspikes=True, spikemode="across", spikesnap="data",
+            spikedash="dot", spikethickness=1)
+        st.plotly_chart(fig_ndx, use_container_width=True)
+
+        with st.expander("📄 每日数据（当前区间）"):
+            _ntab = nview.sort_values("date", ascending=False).reset_index(drop=True)
+            _ntbl = pd.DataFrame({
+                "日期": _ntab["date"].dt.strftime("%Y-%m-%d"),
+                "收盘点位": _ntab["close"].round(2),
+                "日涨跌(%)": pd.to_numeric(_ntab["pct"], errors="coerce").round(2),
+            })
+            if vix_view is not None:
+                _v = vix_view.assign(
+                    日期=vix_view["date"].dt.strftime("%Y-%m-%d"),
+                    **{"VIX": vix_view["close"].round(2)})
+                _ntbl = _ntbl.merge(_v[["日期", "VIX"]], on="日期", how="left")
+            st.dataframe(_ntbl, use_container_width=True, height=420)

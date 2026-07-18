@@ -1146,6 +1146,93 @@ def fetch_sse_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     return df
 
 
+def fetch_nasdaq_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
+    """纳斯达克综合指数 daily(sina 源),cache-first(12h TTL)。
+    Columns: date, close, pct。与 fetch_sse_daily 同契约。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
+                 "key TEXT PRIMARY KEY, data TEXT, saved_at REAL)")
+    row = conn.execute(
+        "SELECT data, saved_at FROM index_daily_cache WHERE key='ixic'"
+    ).fetchone()
+
+    def _from_row(r):
+        return pd.read_json(io.StringIO(r["data"]), orient="split",
+                            dtype=False, convert_dates=False)
+
+    if row and not force_refresh and time.time() - row["saved_at"] < _INDEX_TTL:
+        conn.close()
+        return _from_row(row)
+
+    df = None
+    try:
+        raw = ak.index_us_stock_sina(symbol=".ixic")
+        df = pd.DataFrame({
+            "date": pd.to_datetime(raw["date"]).dt.strftime("%Y-%m-%d"),
+            "close": pd.to_numeric(raw["close"], errors="coerce"),
+        }).dropna(subset=["date", "close"])
+        df["pct"] = df["close"].pct_change() * 100.0
+        df = df[df["date"] >= INDEX_START].reset_index(drop=True)
+    except Exception as e:
+        logger.debug("Nasdaq fetch failed: %s", e)
+
+    if df is not None and not df.empty:
+        conn.execute(
+            "INSERT OR REPLACE INTO index_daily_cache (key, data, saved_at) "
+            "VALUES ('ixic', ?, ?)",
+            (df.to_json(orient="split", force_ascii=False), time.time()))
+        conn.commit()
+    elif row:
+        df = _from_row(row)
+    conn.close()
+    return df
+
+
+def fetch_vix_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
+    """CBOE VIX(美股恐慌指数)daily close,官方 CSV 源,cache-first(12h TTL)。
+    Columns: date, close。腾讯/东财/新浪均无现货 VIX(腾讯 2026-04 起停更),
+    CBOE cdn 是唯一稳定源。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
+                 "key TEXT PRIMARY KEY, data TEXT, saved_at REAL)")
+    row = conn.execute(
+        "SELECT data, saved_at FROM index_daily_cache WHERE key='vix'"
+    ).fetchone()
+
+    def _from_row(r):
+        return pd.read_json(io.StringIO(r["data"]), orient="split",
+                            dtype=False, convert_dates=False)
+
+    if row and not force_refresh and time.time() - row["saved_at"] < _INDEX_TTL:
+        conn.close()
+        return _from_row(row)
+
+    df = None
+    try:
+        raw = pd.read_csv(io.StringIO(requests.get(
+            "https://cdn.cboe.com/api/global/us_indices/daily_prices/"
+            "VIX_History.csv",
+            timeout=30, headers={"User-Agent": "Mozilla/5.0"}).text))
+        df = pd.DataFrame({
+            "date": pd.to_datetime(raw["DATE"]).dt.strftime("%Y-%m-%d"),
+            "close": pd.to_numeric(raw["CLOSE"], errors="coerce"),
+        }).dropna(subset=["date", "close"])
+        df = df[df["date"] >= INDEX_START].reset_index(drop=True)
+    except Exception as e:
+        logger.debug("VIX fetch failed: %s", e)
+
+    if df is not None and not df.empty:
+        conn.execute(
+            "INSERT OR REPLACE INTO index_daily_cache (key, data, saved_at) "
+            "VALUES ('vix', ?, ?)",
+            (df.to_json(orient="split", force_ascii=False), time.time()))
+        conn.commit()
+    elif row:
+        df = _from_row(row)
+    conn.close()
+    return df
+
+
 def fetch_qvix_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     """VIX恐慌指数（50ETF期权QVIX，中国版VIX）daily close, cache-first (12h TTL).
 
