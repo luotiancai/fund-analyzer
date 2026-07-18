@@ -104,6 +104,11 @@ def load_sse_daily():
     return fetcher.fetch_sse_daily()
 
 
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def load_qvix_daily():
+    return fetcher.fetch_qvix_daily()
+
+
 # 1y max drawdown as it stood on the buy date (window: buy_date-365d → buy_date),
 # on the corrected daily-return growth index (nav_series 的 ret 列) so dividend
 # NAV resets don't count as drops, while build-up-period fake-zero growth rates
@@ -1222,7 +1227,7 @@ with tab_sse:
 
         _sse_ranges = {"近1月": 30, "近3月": 91, "近6月": 182,
                        "近1年": 365, "近3年": 365 * 3, "全部": None}
-        _c_rng, _c_bands = st.columns([4, 1])
+        _c_rng, _c_bands, _c_vix = st.columns([4, 1, 1])
         with _c_rng:
             _rng = st.radio("时间区间", list(_sse_ranges.keys()), index=3,
                             horizontal=True, key="sse_range")
@@ -1230,6 +1235,10 @@ with tab_sse:
             _show_bands = st.checkbox("标记跌超1%的交易日", value=True,
                                       key="sse_bands",
                                       help="长区间下标记较密，可关闭")
+        with _c_vix:
+            _show_vix = st.checkbox("VIX恐慌指数", value=True,
+                                    key="sse_vix",
+                                    help="50ETF期权QVIX（中国版VIX），右轴")
 
         # Window slice keeps the anchor row (last close on/before the window
         # start) so the period change is measured against the true base point —
@@ -1263,6 +1272,35 @@ with tab_sse:
             customdata=view[["pct"]],
             hovertemplate="收盘 %{y:,.2f} · 日涨跌 %{customdata[0]:+.2f}%"
                           "<extra></extra>")
+
+        # VIX恐慌指数（QVIX）on a secondary right axis: levels (~15–40) are
+        # incomparable with index points, so it never shares the left scale.
+        qvix_view = None
+        if _show_vix:
+            _qvix = load_qvix_daily()
+            if _qvix is not None and not _qvix.empty:
+                qvix_view = _qvix.copy()
+                qvix_view["date"] = pd.to_datetime(qvix_view["date"])
+                qvix_view = qvix_view[
+                    (qvix_view["date"] >= view["date"].min())
+                    & (qvix_view["date"] <= view["date"].max())]
+            if qvix_view is None or qvix_view.empty:
+                st.caption("⚠️ VIX恐慌指数数据暂不可用")
+                qvix_view = None
+        if qvix_view is not None:
+            fig_sse.data[0].name = "上证指数"
+            fig_sse.data[0].showlegend = True
+            fig_sse.add_trace(go.Scatter(
+                x=qvix_view["date"], y=qvix_view["close"],
+                name="VIX恐慌指数(QVIX)", yaxis="y2",
+                line=dict(color="#f28e2b", width=1.3),
+                hovertemplate="VIX %{y:.2f}<extra></extra>"))
+            # Default (right-side vertical) legend keeps clear of the
+            # 跌超1% annotations that sit above the plot area.
+            fig_sse.update_layout(
+                yaxis2=dict(title="VIX恐慌指数", overlaying="y", side="right",
+                            showgrid=False))
+
         if _show_bands:
             _add_sse_drop_bands(fig_sse, sse_df,
                                 view["date"].min(), view["date"].max())
@@ -1281,12 +1319,16 @@ with tab_sse:
 
         with st.expander("📄 每日数据（当前区间）"):
             _sse_table = view.sort_values("date", ascending=False).reset_index(drop=True)
-            st.dataframe(
-                pd.DataFrame({
-                    "日期": _sse_table["date"].dt.strftime("%Y-%m-%d"),
-                    "收盘点位": _sse_table["close"].round(2),
-                    "日涨跌(%)": pd.to_numeric(_sse_table["pct"],
-                                             errors="coerce").round(2),
-                }),
-                use_container_width=True, height=420,
-            )
+            _tbl = pd.DataFrame({
+                "日期": _sse_table["date"].dt.strftime("%Y-%m-%d"),
+                "收盘点位": _sse_table["close"].round(2),
+                "日涨跌(%)": pd.to_numeric(_sse_table["pct"],
+                                         errors="coerce").round(2),
+            })
+            if qvix_view is not None:
+                _q = qvix_view.assign(
+                    日期=qvix_view["date"].dt.strftime("%Y-%m-%d"),
+                    **{"VIX恐慌指数": qvix_view["close"].round(2)})
+                _tbl = _tbl.merge(_q[["日期", "VIX恐慌指数"]],
+                                  on="日期", how="left")
+            st.dataframe(_tbl, use_container_width=True, height=420)

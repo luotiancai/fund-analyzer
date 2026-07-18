@@ -1125,6 +1125,51 @@ def fetch_sse_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     return df
 
 
+def fetch_qvix_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
+    """VIX恐慌指数（50ETF期权QVIX，中国版VIX）daily close, cache-first (12h TTL).
+
+    Columns: date (ISO str), close. Same stale-cache contract as
+    fetch_sse_daily. CBOE VIX has no akshare source here, so the A股 analog
+    (optbbs QVIX) is used.
+    """
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
+                 "key TEXT PRIMARY KEY, data TEXT, saved_at REAL)")
+    row = conn.execute(
+        "SELECT data, saved_at FROM index_daily_cache WHERE key='qvix'"
+    ).fetchone()
+
+    def _from_row(r):
+        return pd.read_json(io.StringIO(r["data"]), orient="split",
+                            dtype=False, convert_dates=False)
+
+    if row and not force_refresh and time.time() - row["saved_at"] < _INDEX_TTL:
+        conn.close()
+        return _from_row(row)
+
+    df = None
+    try:
+        raw = ak.index_option_50etf_qvix()
+        df = pd.DataFrame({
+            "date": pd.to_datetime(raw["date"]).dt.strftime("%Y-%m-%d"),
+            "close": pd.to_numeric(raw["close"], errors="coerce"),
+        }).dropna(subset=["date", "close"])
+        df = df[df["date"] >= NAV_START].reset_index(drop=True)
+    except Exception as e:
+        logger.debug("QVIX fetch failed: %s", e)
+
+    if df is not None and not df.empty:
+        conn.execute(
+            "INSERT OR REPLACE INTO index_daily_cache (key, data, saved_at) "
+            "VALUES ('qvix', ?, ?)",
+            (df.to_json(orient="split", force_ascii=False), time.time()))
+        conn.commit()
+    elif row:   # refresh failed → stale cache beats nothing
+        df = _from_row(row)
+    conn.close()
+    return df
+
+
 # ── Daily-batch pipeline ──────────────────────────────────────────────────────
 # Used by update_daily.py: backfill once, then each day append the latest NAV
 # point (from the bulk fund-list call) and recompute Sharpe/drawdown for all.
