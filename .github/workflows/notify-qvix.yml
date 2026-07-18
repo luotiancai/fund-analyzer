@@ -20,6 +20,8 @@ jobs:
         run: pip install --quiet requests pandas numpy akshare
       - name: 推送 QVIX 与恐慌阈值
         env:
-          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: 506804924@qq.com
           WAIT_UNTIL_CST: ${{ github.event_name == 'schedule' && '14:40' || '' }}
         run: python notify_qvix.py

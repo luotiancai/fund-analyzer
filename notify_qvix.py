@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""每个交易日 14:40 微信推送:盘中 QVIX vs 恐慌阈值(滚动3年95分位)+ 触发状态。
+"""每个交易日 14:40 邮件推送:盘中 QVIX vs 恐慌阈值(滚动3年95分位)+ 触发状态。
 
 设计给收盘前的决策窗口用:QVIX 取 optbbs 分钟接口的最新一笔(实时),
 阈值用日线缓存(截至昨日)算,大盘当日涨跌取新浪实时行情——三者拼出
 「QVIX>阈值 且 当日下跌,或单日≤-5%」的 B 点触发判定,15:00 前来得及下单。
 
-SendKey 读取顺序:环境变量 SERVERCHAN_KEY → 同目录 .serverchan_key 文件。
-非交易日(新浪行情日期不是今天)静默退出,cron 直接排工作日即可:
-  40 14 * * 1-5  cd /path/to/fund-analyzer && .venv/bin/python notify_qvix.py >> notify.log 2>&1
+跑在 GitHub Actions(见 .github/workflows/notify-qvix.yml),邮件经
+QQ 邮箱 SMTP 直发(自发自收,手机 QQ 邮箱 App 即时提醒),凭据从环境变量读:
+  SMTP_USER  发件 QQ 邮箱地址
+  SMTP_PASS  QQ 邮箱 SMTP 授权码(设置→账号→开启SMTP服务→生成授权码)
+  MAIL_TO    收件人,缺省同 SMTP_USER
+  SMTP_HOST/SMTP_PORT  缺省 smtp.qq.com / 465
+非交易日(新浪行情日期不是当天)静默退出。
 """
 
 import datetime as dt
@@ -28,15 +32,26 @@ logging.basicConfig(level=logging.INFO,
                     datefmt="%m-%d %H:%M:%S")
 log = logging.getLogger("notify_qvix")
 
-_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         ".serverchan_key")
+def _send_mail(subject: str, body: str) -> bool:
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.header import Header
 
-
-def _sendkey():
-    key = os.environ.get("SERVERCHAN_KEY", "").strip()
-    if not key and os.path.exists(_KEY_FILE):
-        key = open(_KEY_FILE).read().strip()
-    return key
+    user = os.environ.get("SMTP_USER", "").strip()
+    pw = os.environ.get("SMTP_PASS", "").strip()
+    to = os.environ.get("MAIL_TO", "").strip() or user
+    host = os.environ.get("SMTP_HOST", "smtp.qq.com")
+    port = int(os.environ.get("SMTP_PORT", "465"))
+    if not user or not pw:
+        return False
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = Header(subject, "utf-8")
+    msg["From"] = user
+    msg["To"] = to
+    with smtplib.SMTP_SSL(host, port, timeout=30) as smtp:
+        smtp.login(user, pw)
+        smtp.sendmail(user, [to], msg.as_string())
+    return True
 
 
 def _sse_realtime():
@@ -98,23 +113,24 @@ def main():
     triggered = (qvix > thr and sse_pct < 0) or sse_pct <= -5.0
     status = "🔔 B点触发!" if triggered else "未触发"
     title = f"QVIX {qvix:.2f} / 阈值 {thr:.2f} · {status}"
-    body = (f"**{today} {qtime}**\n\n"
-            f"- 盘中 QVIX:**{qvix:.2f}**\n"
-            f"- 恐慌阈值(3年95分位):**{thr:.2f}**\n"
-            f"- 上证:{sse_now:.0f}({sse_pct:+.2f}%)\n"
-            f"- 判定:QVIX{'>' if qvix > thr else '≤'}阈值,"
-            f"大盘{'下跌' if sse_pct < 0 else '上涨'} → **{status}**\n\n"
+    body = (f"{today} {qtime}\n\n"
+            f"盘中 QVIX:{qvix:.2f}\n"
+            f"恐慌阈值(3年95分位):{thr:.2f}\n"
+            f"上证:{sse_now:.0f}({sse_pct:+.2f}%)\n"
+            f"判定:QVIX{'>' if qvix > thr else '≤'}阈值,"
+            f"大盘{'下跌' if sse_pct < 0 else '上涨'} → {status}\n\n"
             + ("触发条件满足:按规则看前一日榜单选国内 C 类冠军,15:00 前下单。"
                if triggered else "不满足触发条件,继续等待。"))
 
-    key = _sendkey()
-    if not key:
-        log.warning("未配置 SendKey(环境变量 SERVERCHAN_KEY 或 .serverchan_key 文件),只打日志:\n%s\n%s", title, body)
-        return
-    r = requests.post(f"https://sctapi.ftqq.com/{key}.send",
-                      data={"title": title, "desp": body}, timeout=15)
-    ok = r.json().get("code") == 0
-    log.info("推送%s: %s", "成功" if ok else f"失败 {r.text[:100]}", title)
+    try:
+        sent = _send_mail(title, body)
+    except Exception as e:
+        log.error("邮件发送失败: %s", e)
+        sys.exit(1)
+    if sent:
+        log.info("邮件已发: %s", title)
+    else:
+        log.warning("未配置 SMTP_USER/SMTP_PASS,只打日志:\n%s\n%s", title, body)
 
 
 if __name__ == "__main__":
