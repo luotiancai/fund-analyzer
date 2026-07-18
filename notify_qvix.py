@@ -14,10 +14,14 @@ import datetime as dt
 import logging
 import os
 import sys
+import time
+from zoneinfo import ZoneInfo
 
 import requests
 
 import fetcher
+
+_CST = ZoneInfo("Asia/Shanghai")
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s  %(levelname)s  %(message)s",
@@ -62,8 +66,24 @@ def _threshold():
                  .quantile(0.95).iloc[-1])
 
 
+def _wait_until_cst():
+    """WAIT_UNTIL_CST=HH:MM 时睡到北京时间该时刻(已过则立即继续)。
+    给 GitHub Actions 用:cron 有分钟级抖动,提前启动、脚本内精确对时。"""
+    target = os.environ.get("WAIT_UNTIL_CST", "").strip()
+    if not target:
+        return
+    hh, mm = map(int, target.split(":"))
+    now = dt.datetime.now(_CST)
+    goal = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    delta = (goal - now).total_seconds()
+    if delta > 0:
+        log.info("等待至北京时间 %s(%.0f 秒)…", target, delta)
+        time.sleep(delta)
+
+
 def main():
-    today = dt.date.today().strftime("%Y-%m-%d")
+    _wait_until_cst()
+    today = dt.datetime.now(_CST).strftime("%Y-%m-%d")
     quote_date, sse_now, sse_pct = _sse_realtime()
     if quote_date != today:
         log.info("非交易日(行情日期 %s),跳过", quote_date)

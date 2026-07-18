@@ -1,0 +1,25 @@
+name: QVIX 恐慌指数推送
+
+on:
+  schedule:
+    # 06:15 UTC = 北京 14:15;GitHub cron 有分钟级延迟抖动,
+    # 脚本内 WAIT_UNTIL_CST 精确等到 14:40 再取数推送。
+    - cron: "15 6 * * 1-5"
+  workflow_dispatch: {}   # 手动触发测试用(手动跑不等待,立即推)
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装依赖(不装 streamlit)
+        run: pip install --quiet requests pandas numpy akshare
+      - name: 推送 QVIX 与恐慌阈值
+        env:
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          WAIT_UNTIL_CST: ${{ github.event_name == 'schedule' && '14:40' || '' }}
+        run: python notify_qvix.py
