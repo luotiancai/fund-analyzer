@@ -1321,17 +1321,22 @@ with tab_sse:
             fig_sse.update_layout(
                 yaxis2=dict(title="VIX恐慌指数", overlaying="y", side="right",
                             showgrid=False))
-            # 25/30 参考虚线:30 是「QVIX>30 且当日下跌 → 大底」的触发线。
-            for _lvl, _dash in ((25, "dot"), (30, "dash")):
-                fig_sse.add_shape(
-                    type="line", xref="paper", x0=0, x1=1,
-                    yref="y2", y0=_lvl, y1=_lvl,
-                    line=dict(color="#8e44ad", width=1, dash=_dash),
-                    opacity=0.6)
-                fig_sse.add_annotation(
-                    x=1, xref="paper", xanchor="left", y=_lvl, yref="y2",
-                    text=str(_lvl), showarrow=False,
-                    font=dict(size=10, color="#8e44ad"))
+            # 动态恐慌阈值(滚动3年95分位)。QVIX 水位随时代漂移(2015 年
+            # 中位 37 vs 2023 年 16),固定 30 在高波动年代整年误触、低波动
+            # 年代永不触发;95 分位在 1~5 年窗口全域稳健(敏感性网格实测),
+            # 3 年窗口兼顾"记住常态"与"跟上时代"。
+            _qfull = _qvix.copy()
+            _qfull["date"] = pd.to_datetime(_qfull["date"])
+            _qfull["thr"] = _qfull["close"].rolling(
+                720, min_periods=240).quantile(0.95)
+            _thr_view = _qfull[(_qfull["date"] >= view["date"].min())
+                               & (_qfull["date"] <= view["date"].max())]
+            if _thr_view["thr"].notna().any():
+                fig_sse.add_trace(go.Scatter(
+                    x=_thr_view["date"], y=_thr_view["thr"],
+                    name="恐慌阈值(3年95分位)", yaxis="y2",
+                    line=dict(color="#8e44ad", width=1.2, dash="dash"),
+                    hovertemplate="恐慌阈值 %{y:.1f}<extra></extra>"))
 
         if _show_bands:
             _add_sse_drop_bands(fig_sse, sse_df,
@@ -1453,7 +1458,8 @@ with tab_sse:
                 "三笔——2020-02-03(27天,0.5%)、2020-03-12(6天,1.5%)、"
                 "2024-09-30(节前买入 10/8 才确认,实际持有 2 天,1.5%)。"
                 "三步规则:恐慌急跌日触发"
-                "(QVIX>30 且当日下跌,或 -5% 级暴跌)→ 看榜单结构定攻防(权益"
+                "(QVIX 突破滚动 3 年 95 分位阈值且当日下跌,或 -5% 级暴跌;"
+                "固定 30 有时代漂移问题,见图上动态阈值线)→ 看榜单结构定攻防(权益"
                 "霸榜买权益冠军,债基霸榜买固收冠军)→ 离场取先触发者:大盘从"
                 "买入后高点回撤 5%,或基金自身从买入后高点回撤 20%(20% 高于"
                 "高贝塔冠军 12~15% 的日常洗盘振幅,10%/15% 线会被正常震荡"
