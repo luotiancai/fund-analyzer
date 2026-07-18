@@ -1305,12 +1305,12 @@ with tab_sse:
                 fig_sse.add_shape(
                     type="line", xref="paper", x0=0, x1=1,
                     yref="y2", y0=_lvl, y1=_lvl,
-                    line=dict(color="#f28e2b", width=1, dash=_dash),
+                    line=dict(color="#8e44ad", width=1, dash=_dash),
                     opacity=0.6)
                 fig_sse.add_annotation(
                     x=1, xref="paper", xanchor="left", y=_lvl, yref="y2",
                     text=str(_lvl), showarrow=False,
-                    font=dict(size=10, color="#f28e2b"))
+                    font=dict(size=10, color="#8e44ad"))
 
         if _show_bands:
             _add_sse_drop_bands(fig_sse, sse_df,
