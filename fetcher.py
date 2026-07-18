@@ -282,6 +282,12 @@ def effective_daily_ret(df: pd.DataFrame) -> pd.Series:
     out = r.copy()
     use_implied = (conflict & ~dividendish & implied_nav.notna()) | r.isna()
     out[use_implied] = implied_nav[use_implied]
+    # 巨额赎回:惩罚性赎回费摊入剩余净值时,净值/累计净值/官方日增长率
+    # 三者一致地单日暴涨(014939 2025-03-31 +68.7%、018658 +38.2%、
+    # 005297 +31.3%),上面的分红判别拦不住,只能按幅度判无效。阈值取
+    # ±30%:全库实测最大真实行情日是 +25.6%(2024-10-08 北交所基金),
+    # 满仓 30cm 涨停的理论上限也不到 30%。
+    out[out.abs() > 0.30] = 0.0
     return out
 
 
