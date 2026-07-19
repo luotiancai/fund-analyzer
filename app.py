@@ -100,7 +100,9 @@ def _sync_db_from_release() -> bool:
 _IS_CLOUD = _sync_db_from_release()
 _init_db_once()
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── 更新数据(仅本地)────────────────────────────────────────────────────────
+# 侧边栏已整体移除:云端数据由每日跑批自动更新,无需任何入口;
+# 本地入口缩成页面右上角一个小按钮,无风险利率(进夏普计算)折进悬浮提示。
 @st.dialog("确认更新数据")
 def _confirm_update():
     st.write("将增量拉取最新净值（不重算指标，筛选时按需计算），确定继续？")
@@ -112,23 +114,15 @@ def _confirm_update():
         st.rerun()
 
 
-with st.sidebar:
-    rf_rate = _get_rf()
+rf_rate = _get_rf()
 
-    if _IS_CLOUD:
-        st.caption("☁️ 云端模式:数据由每日跑批自动更新")
-    elif st.button("🔄 更新数据", type="primary", use_container_width=True,
-                   help="增量拉取最新净值；指标在筛选时按需计算"):
+if not _IS_CLOUD:
+    _, _upd_col = st.columns([6, 1])
+    if _upd_col.button("🔄 更新数据", use_container_width=True,
+                       help="增量拉取最新净值；指标在筛选时按需计算。"
+                            f"无风险利率 {rf_rate*100:.2f}%"
+                            "（1年期国债收益率，自动取、进夏普计算）"):
         _confirm_update()
-
-    st.divider()
-    st.metric("无风险利率", f"{rf_rate*100:.2f}%")
-    st.caption("1年期国债收益率，自动取、每月刷新")
-
-    st.divider()
-    st.caption("数据来源：天天基金（AKShare）")
-    st.caption("夏普比率 = (年化收益 − 无风险利率) / 年化波动率，日频收益计算；"
-               "支付宝展示值为周频口径，通常比这里高 0.3 左右")
 
 update_btn = st.session_state.pop("_run_update", False)
 
