@@ -1688,18 +1688,20 @@ with tab_gold:
             fig_au.update_layout(
                 yaxis2=dict(title="GVZ黄金波动率", overlaying="y",
                             side="right", showgrid=False))
-            # GVZ 长期均值 ~17;>20 波动升温,>30 极端(2020-03 流动性
-            # 挤兑 48、2011 欧债 40)。只是波动预期参考线,不构成买卖信号。
-            for _lvl3, _dash3 in ((20, "dot"), (30, "dash")):
-                fig_au.add_shape(
-                    type="line", xref="paper", x0=0, x1=1,
-                    yref="y2", y0=_lvl3, y1=_lvl3,
-                    line=dict(color="#8e44ad", width=1, dash=_dash3),
-                    opacity=0.5)
-                fig_au.add_annotation(
-                    x=1, xref="paper", xanchor="left", y=_lvl3, yref="y2",
-                    text=str(_lvl3), showarrow=False,
-                    font=dict(size=10, color="#8e44ad"))
+            # 动态阈值(滚动3年95分位),与上证 QVIX/纳指 VIX 同口径。
+            # 只是波动极端度参考线,不构成买卖信号(见下方口径说明)。
+            _gfull = _gvz3.copy()
+            _gfull["date"] = pd.to_datetime(_gfull["date"])
+            _gfull["thr"] = _gfull["close"].rolling(
+                720, min_periods=240).quantile(0.95)
+            _gthr_view = _gfull[(_gfull["date"] >= aview["date"].min())
+                                & (_gfull["date"] <= aview["date"].max())]
+            if _gthr_view["thr"].notna().any():
+                fig_au.add_trace(go.Scatter(
+                    x=_gthr_view["date"], y=_gthr_view["thr"],
+                    name="波动阈值(3年95分位)", yaxis="y2",
+                    line=dict(color="#c0392b", width=1.2, dash="dash"),
+                    hovertemplate="波动阈值 %{y:.2f}<extra></extra>"))
 
         fig_au.update_layout(
             hovermode="x unified", hoverdistance=-1, spikedistance=-1)
