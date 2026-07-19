@@ -129,6 +129,11 @@ def load_vix_daily():
     return fetcher.fetch_vix_daily()
 
 
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def load_gvz_daily():
+    return fetcher.fetch_gvz_daily()
+
+
 # 1y max drawdown as it stood on the buy date (window: buy_date-365d → buy_date),
 # on the corrected daily-return growth index (nav_series 的 ret 列) so dividend
 # NAV resets don't count as drops, while build-up-period fake-zero growth rates
@@ -1483,13 +1488,19 @@ with tab_ndx:
         _ndx_ranges = {"近1月": 30, "近3月": 91, "近6月": 182,
                        "近1年": 365, "近3年": 365 * 3, "近5年": 365 * 5,
                        "近10年": 365 * 10, "全部": None}
-        _c_rng2, _c_vix2 = st.columns([5, 1])
+        _c_rng2, _c_vix2, _c_gvz2 = st.columns([4, 1, 1])
         with _c_rng2:
             _rng2 = st.radio("时间区间", list(_ndx_ranges.keys()), index=6,
                              horizontal=True, key="ndx_range")
         with _c_vix2:
             _show_vix2 = st.checkbox("VIX恐慌指数", value=True, key="ndx_vix",
                                      help="CBOE VIX(标普500期权隐含波动率),右轴")
+        with _c_gvz2:
+            _show_gvz2 = st.checkbox("GVZ黄金波动率", value=False,
+                                     key="ndx_gvz",
+                                     help="CBOE GVZ(GLD期权隐含波动率),右轴。"
+                                          "注意:黄金急涨急跌都会推高 GVZ,"
+                                          "高读数≠下跌恐慌")
 
         _days2 = _ndx_ranges[_rng2]
         if _days2 is None:
@@ -1533,17 +1544,38 @@ with tab_ndx:
             if vix_view is None or vix_view.empty:
                 st.caption("⚠️ VIX 数据暂不可用")
                 vix_view = None
-        if vix_view is not None:
+        gvz_view = None
+        if _show_gvz2:
+            _gvz = load_gvz_daily()
+            if _gvz is not None and not _gvz.empty:
+                gvz_view = _gvz.copy()
+                gvz_view["date"] = pd.to_datetime(gvz_view["date"])
+                gvz_view = gvz_view[
+                    (gvz_view["date"] >= nview["date"].min())
+                    & (gvz_view["date"] <= nview["date"].max())]
+            if gvz_view is None or gvz_view.empty:
+                st.caption("⚠️ GVZ 数据暂不可用")
+                gvz_view = None
+
+        if vix_view is not None or gvz_view is not None:
             fig_ndx.data[0].name = "纳指"
             fig_ndx.data[0].showlegend = True
+            fig_ndx.update_layout(
+                yaxis2=dict(title="波动率指数", overlaying="y", side="right",
+                            showgrid=False))
+        if vix_view is not None:
             fig_ndx.add_trace(go.Scatter(
                 x=vix_view["date"], y=vix_view["close"],
                 name="VIX恐慌指数", yaxis="y2",
                 line=dict(color="#f28e2b", width=1.3),
                 hovertemplate="VIX %{y:.2f}<extra></extra>"))
-            fig_ndx.update_layout(
-                yaxis2=dict(title="VIX恐慌指数", overlaying="y", side="right",
-                            showgrid=False))
+        if gvz_view is not None:
+            fig_ndx.add_trace(go.Scatter(
+                x=gvz_view["date"], y=gvz_view["close"],
+                name="GVZ黄金波动率", yaxis="y2",
+                line=dict(color="#d4af37", width=1.3),
+                hovertemplate="GVZ %{y:.2f}<extra></extra>"))
+        if vix_view is not None:
             # 20 预警 / 30 恐慌,美股 VIX 的常用阈值。
             for _lvl2, _dash2 in ((20, "dot"), (30, "dash")):
                 fig_ndx.add_shape(
@@ -1581,4 +1613,9 @@ with tab_ndx:
                     日期=vix_view["date"].dt.strftime("%Y-%m-%d"),
                     **{"VIX": vix_view["close"].round(2)})
                 _ntbl = _ntbl.merge(_v[["日期", "VIX"]], on="日期", how="left")
+            if gvz_view is not None:
+                _g = gvz_view.assign(
+                    日期=gvz_view["date"].dt.strftime("%Y-%m-%d"),
+                    **{"GVZ": gvz_view["close"].round(2)})
+                _ntbl = _ntbl.merge(_g[["日期", "GVZ"]], on="日期", how="left")
             st.dataframe(_ntbl, use_container_width=True, height=420)

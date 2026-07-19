@@ -1233,6 +1233,52 @@ def fetch_vix_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     return df
 
 
+def fetch_gvz_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
+    """CBOE GVZ(黄金波动率指数,GLD期权隐含波动率)daily close,
+    与 fetch_vix_daily 同源同契约(CBOE cdn CSV,cache-first 12h TTL)。
+    注意语义:黄金是避险资产,GVZ 高读数既出现在金价急跌也出现在急涨,
+    只代表"金价波动预期",不等同股票 VIX 的下跌恐慌。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
+                 "key TEXT PRIMARY KEY, data TEXT, saved_at REAL)")
+    row = conn.execute(
+        "SELECT data, saved_at FROM index_daily_cache WHERE key='gvz'"
+    ).fetchone()
+
+    def _from_row(r):
+        return pd.read_json(io.StringIO(r["data"]), orient="split",
+                            dtype=False, convert_dates=False)
+
+    if row and not force_refresh and time.time() - row["saved_at"] < _INDEX_TTL:
+        conn.close()
+        return _from_row(row)
+
+    df = None
+    try:
+        raw = pd.read_csv(io.StringIO(requests.get(
+            "https://cdn.cboe.com/api/global/us_indices/daily_prices/"
+            "GVZ_History.csv",
+            timeout=30, headers={"User-Agent": "Mozilla/5.0"}).text))
+        df = pd.DataFrame({
+            "date": pd.to_datetime(raw["DATE"]).dt.strftime("%Y-%m-%d"),
+            "close": pd.to_numeric(raw["GVZ"], errors="coerce"),
+        }).dropna(subset=["date", "close"])
+        df = df[df["date"] >= INDEX_START].reset_index(drop=True)
+    except Exception as e:
+        logger.debug("GVZ fetch failed: %s", e)
+
+    if df is not None and not df.empty:
+        conn.execute(
+            "INSERT OR REPLACE INTO index_daily_cache (key, data, saved_at) "
+            "VALUES ('gvz', ?, ?)",
+            (df.to_json(orient="split", force_ascii=False), time.time()))
+        conn.commit()
+    elif row:
+        df = _from_row(row)
+    conn.close()
+    return df
+
+
 def fetch_qvix_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     """VIX恐慌指数（50ETF期权QVIX，中国版VIX）daily close, cache-first (12h TTL).
 
