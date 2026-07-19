@@ -307,11 +307,11 @@ with tab_table:
             asof_date = st.date_input(
                 "截至日期（不选=今天）",
                 value=None,
-                min_value=dt.date(2021, 1, 1),
+                min_value=dt.date(2019, 1, 1),
                 max_value=dt.date.today(),
                 help="还原你在该日进行筛选时能看到的结果：只用该日之前"
                      "（不含当日，当日净值当时尚未公布）的净值历史重算"
-                     "收益/回撤/夏普。本地净值（仅C类）从 2020-01-01 起，"
+                     "收益/回撤/夏普。本地净值（仅C类）从 2018-01-01 起，"
                      "因此最早可选 2021-01-01，保证近1年窗口有完整数据。",
             )
         submitted = st.form_submit_button("🔍 开始筛选", type="primary")

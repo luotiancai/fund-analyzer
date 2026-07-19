@@ -66,7 +66,7 @@ def _migrate_db_location():
 # rerun)穿透缓存、现场全量重拉榜单卡住页面几十秒,还把标签页顶回首页。
 FUND_LIST_TTL = 26 * 3600
 NAV_TTL = 86400         # 24 hours
-NAV_START = "2020-01-01"  # NAV history is kept from this date onward
+NAV_START = "2018-01-01"  # NAV history is kept from this date onward
 MAX_WORKERS = 8
 RISK_FREE_RATE = 0.0113  # fallback 1-year China gov bond yield (see get_risk_free_rate)
 RF_TTL = 30 * 86400      # auto-refresh the risk-free rate ~monthly
