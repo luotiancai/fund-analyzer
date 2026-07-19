@@ -1698,28 +1698,6 @@ with tab_gold:
                     line=dict(color="#c0392b", width=1.2, dash="dash"),
                     hovertemplate="波动阈值 %{y:.2f}<extra></extra>"))
 
-        # 回撤≥15% 离场区色带(全史滚动峰值口径,裁剪到当前区间)
-        _addser = 1.0 - au_all["close"] / au_all["close"].cummax()
-        _in_zone = (_addser >= 0.15).tolist()
-        _zone_start = None
-        for _i, _flag in enumerate(_in_zone + [False]):
-            if _flag and _zone_start is None:
-                _zone_start = au_all["date"].iloc[_i]
-            elif not _flag and _zone_start is not None:
-                _zend = au_all["date"].iloc[min(_i, len(au_all) - 1)]
-                if _zend >= aview["date"].min() \
-                        and _zone_start <= aview["date"].max():
-                    fig_au.add_vrect(
-                        x0=max(_zone_start, aview["date"].min()),
-                        x1=min(_zend, aview["date"].max()),
-                        fillcolor="#e0454b", opacity=0.10, line_width=0)
-                    fig_au.add_annotation(
-                        x=max(_zone_start, aview["date"].min()), y=1.02,
-                        yref="paper", yanchor="bottom",
-                        text="回撤≥15%离场区", showarrow=False,
-                        font=dict(size=10, color="#e0454b"))
-                _zone_start = None
-
         fig_au.update_layout(
             hovermode="x unified", hoverdistance=-1, spikedistance=-1)
         _aspan = max((aview["date"].max() - aview["date"].min()).days, 1)
@@ -1737,8 +1715,7 @@ with tab_gold:
             "与伦敦金走势略有差异);GVZ 为 CBOE 黄金ETF波动率指数(GLD 期权"
             "隐含波动率,美元金价口径)。黄金是避险资产,GVZ 的高读数在金价"
             "急涨与急跌时都会出现,衡量的是波动预期而非下跌恐慌,故不能套用"
-            "股票 QVIX 的恐慌买点逻辑。红色色带为\"自滚动峰值回撤≥15%\"的"
-            "离场区(规则依据见下方复盘)。")
+            "股票 QVIX 的恐慌买点逻辑。")
 
         # ── 黄金策略复盘:买入案例记录,高点回撤15%卖出 ──────────────────────
         # 与上证 Tab 的策略复盘同格式:记录实际操作案例,数字按 Au99.99
@@ -1762,45 +1739,9 @@ with tab_gold:
             st.caption(
                 "口径:Au99.99 收盘价成交,自买入后最高收盘回撤≥15% 当日"
                 "收盘卖出,无恐慌买点信号(黄金入场时机由人工判断,GVZ 只作"
-                "波动参考)。定线依据见下方展开区。")
-
-        with st.expander("📐 15% 定线依据(回测)"):
-            st.markdown("**历轮回撤段(2017-2026,峰到谷≥5%)**")
-            st.dataframe(pd.DataFrame({
-                "见顶日": ["2017-04-17", "2019-08-29", "2020-02-24",
-                          "2020-08-07", "2023-09-25", "2024-05-20",
-                          "2024-10-30", "2025-04-22", "2025-10-17",
-                          "2026-01-29"],
-                "谷底日": ["2018-08-17", "2019-11-12", "2020-03-17",
-                          "2021-03-05", "2023-10-09", "2024-06-27",
-                          "2024-11-14", "2025-05-15", "2025-10-28",
-                          "2026-07-01"],
-                "回撤深度": ["-8.8%", "-8.7%", "-12.2%", "-20.2%", "-7.9%",
-                            "-5.2%", "-7.2%", "-10.9%", "-10.1%", "-30.1%"],
-                "性质": ["洗盘", "洗盘", "新冠流动性挤兑", "真顶部", "洗盘",
-                        "洗盘", "洗盘", "洗盘", "洗盘", "真顶部(本轮)"],
-            }), use_container_width=True, hide_index=True)
-            st.markdown("**案例:2019-06-24 买入,各止损线实测**")
-            st.dataframe(pd.DataFrame({
-                "止损线": ["5%", "8%", "10%", "12%", "15%", "20%"],
-                "离场日": ["2019-10-14", "2019-11-12", "2020-03-17",
-                          "2020-03-17", "2020-11-25", "2021-03-05"],
-                "收益": ["+8.5%", "+4.6%", "+5.7%", "+5.7%",
-                        "+20.8%", "+13.5%"],
-                "点评": ["每轮洗盘都被扫出", "同上,还多亏了3个月",
-                        "撑过洗盘却被新冠挤兑抖出,不上不下",
-                        "同 10%,12.2% 挤兑刚好扫到",
-                        "全组最佳:洗盘全撑过,顶部及时走",
-                        "回吐太多(峰值 +42.4% 只落袋 +13.5%)"],
-            }), use_container_width=True, hide_index=True)
-            st.caption(
-                "口径:Au99.99 收盘价,自买入后最高收盘回撤≥线值当日收盘卖出。"
-                "定线:正常洗盘最深 12.2%(2020-03 挤兑),真顶部回撤 20%+,"
-                "15% 取两档之间空档(13%~19%)的稳健位。样本仅一轮完整牛市"
-                "周期(n=10 段回撤),理解为 12%~15% 区间取上沿,而非精确"
-                "常数;移动止损是风控而非收益优化,代价是每次从峰值回吐约"
-                " 15 个点。黄金与股票不同:无恐慌买点信号(GVZ 高读数涨跌"
-                "都出现),此规则只管离场,不管入场。")
+                "波动参考)。定线依据(2026-07 回测):2017-2026 十轮回撤"
+                "天然分两档——正常洗盘 5%~12%,真顶部 20%+;15% 取空档"
+                "稳健位,洗盘够不到、真顶部必触发。")
 
         with st.expander("📄 每日数据（当前区间）"):
             _atab = aview.sort_values("date", ascending=False)\
