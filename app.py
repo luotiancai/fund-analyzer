@@ -1574,5 +1574,6 @@ with tab_sse:
                 return _styles
 
             st.dataframe(
-                _review_df.style.apply(_trigger_cell_style, axis=1),
+                _review_df.style.apply(_trigger_cell_style, axis=1)
+                .format(precision=2, na_rep=""),
                 use_container_width=True, hide_index=True)
