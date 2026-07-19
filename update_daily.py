@@ -64,20 +64,27 @@ def main():
     # ── 指数/恐慌指数刷新 + 动态恐慌阈值 ────────────────────────────────────
     # 强刷上证与 QVIX 缓存(app 侧 12h TTL 直接命中),并按滚动 3 年 95 分位
     # 计算当日恐慌阈值,把「是否触发 B 点」直接打进日志。
-    log.info("刷新指数缓存(上证 / QVIX)…")
+    log.info("刷新指数缓存(上证 / 创业板 / 科创50 及各自QVIX)…")
     try:
-        sse = fetcher.fetch_sse_daily(force_refresh=True)
-        qvix = fetcher.fetch_qvix_daily(force_refresh=True)
-        if sse is not None and qvix is not None and len(qvix) >= 240:
+        boards = [
+            ("上证", fetcher.fetch_sse_daily, fetcher.fetch_qvix_daily),
+            ("创业板", fetcher.fetch_cyb_daily, fetcher.fetch_cyb_qvix_daily),
+            ("科创50", fetcher.fetch_kcb_daily, fetcher.fetch_kcb_qvix_daily),
+        ]
+        for name, fetch_idx, fetch_qvix in boards:
+            idx = fetch_idx(force_refresh=True)
+            qvix = fetch_qvix(force_refresh=True)
+            if idx is None or qvix is None or len(qvix) < 240:
+                log.warning("   %s 数据不足,跳过", name)
+                continue
             thr = float(qvix["close"].rolling(720, min_periods=240)
                         .quantile(0.95).iloc[-1])
             q_last = float(qvix["close"].iloc[-1])
-            s_last = sse.iloc[-1]
-            triggered = q_last > thr
-            log.info("   上证 %s 收 %.0f(%+.2f%%) · QVIX %.2f · 恐慌阈值(3年95分位) %.2f%s",
-                     s_last["date"], s_last["close"], s_last["pct"],
+            i_last = idx.iloc[-1]
+            log.info("   %s %s 收 %.0f(%+.2f%%) · QVIX %.2f · 恐慌阈值(3年95分位) %.2f%s",
+                     name, i_last["date"], i_last["close"], i_last["pct"],
                      q_last, thr,
-                     " · 🔔 B点触发(QVIX破阈值)" if triggered else "")
+                     " · 🔔 B点触发(QVIX破阈值)" if q_last > thr else "")
     except Exception as e:
         log.warning("   指数刷新失败(不影响基金跑批): %s", e)
 

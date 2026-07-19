@@ -167,6 +167,26 @@ def load_qvix_daily():
     return fetcher.fetch_qvix_daily()
 
 
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def load_cyb_daily():
+    return fetcher.fetch_cyb_daily()
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def load_cyb_qvix_daily():
+    return fetcher.fetch_cyb_qvix_daily()
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def load_kcb_daily():
+    return fetcher.fetch_kcb_daily()
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def load_kcb_qvix_daily():
+    return fetcher.fetch_kcb_qvix_daily()
+
+
 # 1y max drawdown as it stood on the buy date (window: buy_date-365d → buy_date),
 # on the corrected daily-return growth index (nav_series 的 ret 列) so dividend
 # NAV resets don't count as drops, while build-up-period fake-zero growth rates
@@ -272,8 +292,9 @@ for _c in ("ret_1m", "ret_3m", "ret_6m", "ret_1y"):
         fund_df[_c] = pd.to_numeric(fund_df[_c], errors="coerce")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_table, tab_detail, tab_sim, tab_sse = st.tabs(
-    ["📋 基金列表", "🔍 基金详情", "💰 模拟盘", "📈 上证指数"])
+tab_table, tab_detail, tab_sim, tab_sse, tab_cyb, tab_kcb = st.tabs(
+    ["📋 基金列表", "🔍 基金详情", "💰 模拟盘", "📈 上证指数",
+     "🚀 创业板指", "🔬 科创50"])
 
 # ─── Tab 1: Table ────────────────────────────────────────────────────────────
 with tab_table:
@@ -1490,3 +1511,134 @@ with tab_sse:
                     "+39.1% 全表最佳;6/5 止损离场躲开 6-7 月的 -11% 大跌",
                 ],
             }), use_container_width=True, hide_index=True)
+
+
+# ─── Tab 5/6: 创业板指 / 科创50(+ 各自期权QVIX与动态恐慌阈值)──────────────
+# 与上证 Tab 同一套视觉与口径:指数左轴、QVIX 右轴、恐慌阈值为 QVIX 的
+# 滚动 3 年 95 分位(阈值在全历史上先算好再切窗,窗口边缘不失真)。
+# 两板期权上市晚(创业板 2022-09、科创板 2023-06),QVIX 起点即数据起点。
+def _render_board_tab(prefix: str, index_name: str, idx_df, qvix_df,
+                      qvix_note: str):
+    if idx_df is None or idx_df.empty:
+        st.warning(f"{index_name}数据获取失败，请稍后重试。")
+        return
+    all_df = idx_df.copy()
+    all_df["date"] = pd.to_datetime(all_df["date"])
+    all_df = all_df.sort_values("date").reset_index(drop=True)
+
+    _ranges = {"近1月": 30, "近3月": 91, "近6月": 182, "近1年": 365,
+               "近3年": 365 * 3, "近5年": 365 * 5, "全部": None}
+    _c_rng, _c_vix = st.columns([5, 1])
+    with _c_rng:
+        _rng = st.radio("时间区间", list(_ranges.keys()), index=3,
+                        horizontal=True, key=f"{prefix}_range")
+    with _c_vix:
+        _show_vix = st.checkbox("VIX恐慌指数", value=True,
+                                key=f"{prefix}_vix", help=qvix_note)
+
+    _days = _ranges[_rng]
+    if _days is None:
+        view = all_df
+    else:
+        _start = all_df["date"].max() - pd.Timedelta(days=_days)
+        _older = all_df[all_df["date"] <= _start]
+        view = all_df.loc[_older.index[-1]:] if not _older.empty else all_df
+
+    q_all = q_last = thr_last = None
+    if qvix_df is not None and not qvix_df.empty:
+        q_all = qvix_df.copy()
+        q_all["date"] = pd.to_datetime(q_all["date"])
+        q_all = q_all.sort_values("date").reset_index(drop=True)
+        q_all["thr"] = q_all["close"].rolling(
+            720, min_periods=240).quantile(0.95)
+        q_last = float(q_all["close"].iloc[-1])
+        if pd.notna(q_all["thr"].iloc[-1]):
+            thr_last = float(q_all["thr"].iloc[-1])
+
+    _latest = all_df.iloc[-1]
+    _chg = (_latest["close"] / view["close"].iloc[0] - 1.0) * 100.0
+    _peak = view["close"].cummax()
+    _mdd = float(((_peak - view["close"]) / _peak).max() * 100.0)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("最新收盘", f"{_latest['close']:,.2f}",
+              f"{_latest['pct']:+.2f}%（当日）")
+    k2.metric(f"{_rng}涨跌幅", f"{_chg:+.2f}%")
+    k3.metric(f"{_rng}最大回撤", f"{_mdd:.2f}%")
+    if q_last is not None and thr_last is not None:
+        k4.metric("QVIX / 恐慌阈值", f"{q_last:.2f} / {thr_last:.2f}",
+                  "🔔 已破阈值" if q_last > thr_last else "阈值下方",
+                  delta_color="inverse" if q_last > thr_last else "off")
+    else:
+        k4.metric("数据日期", _latest["date"].strftime("%Y-%m-%d"))
+
+    fig = px.line(view, x="date", y="close",
+                  title=f"{index_name}走势（{_rng}）",
+                  labels={"date": "日期", "close": "收盘点位"}, height=420)
+    fig.update_traces(
+        customdata=view[["pct"]],
+        hovertemplate="收盘 %{y:,.2f} · 日涨跌 %{customdata[0]:+.2f}%"
+                      "<extra></extra>")
+
+    q_view = None
+    if _show_vix and q_all is not None:
+        q_view = q_all[(q_all["date"] >= view["date"].min())
+                       & (q_all["date"] <= view["date"].max())]
+        if q_view.empty:
+            st.caption("⚠️ 该区间内没有 QVIX 数据（期权上市较晚）")
+            q_view = None
+    if q_view is not None:
+        fig.data[0].name = index_name
+        fig.data[0].showlegend = True
+        fig.add_trace(go.Scatter(
+            x=q_view["date"], y=q_view["close"],
+            name="VIX恐慌指数(QVIX)", yaxis="y2",
+            line=dict(color="#f28e2b", width=1.3),
+            hovertemplate="VIX %{y:.2f}<extra></extra>"))
+        if q_view["thr"].notna().any():
+            fig.add_trace(go.Scatter(
+                x=q_view["date"], y=q_view["thr"],
+                name="恐慌阈值(3年95分位)", yaxis="y2",
+                line=dict(color="#8e44ad", width=1.2, dash="dash"),
+                hovertemplate="恐慌阈值 %{y:.2f}<extra></extra>"))
+        fig.update_layout(
+            yaxis2=dict(title="VIX恐慌指数", overlaying="y", side="right",
+                        showgrid=False))
+
+    fig.update_layout(
+        hovermode="x unified", hoverdistance=-1, spikedistance=-1)
+    _span_d = max((view["date"].max() - view["date"].min()).days, 1)
+    fig.update_xaxes(
+        showspikes=True, spikemode="across", spikesnap="data",
+        spikedash="dot", spikethickness=1,
+        hoverformat="%Y-%m-%d", tickformat="%Y-%m-%d",
+        dtick=max(1, _span_d // 8) * 86400000)
+    fig.update_yaxes(
+        showspikes=True, spikemode="across", spikesnap="data",
+        spikedash="dot", spikethickness=1)
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("📄 每日数据（当前区间）"):
+        _t = view.sort_values("date", ascending=False).reset_index(drop=True)
+        _tbl = pd.DataFrame({
+            "日期": _t["date"].dt.strftime("%Y-%m-%d"),
+            "收盘点位": _t["close"].round(2),
+            "日涨跌(%)": pd.to_numeric(_t["pct"], errors="coerce").round(2),
+        })
+        if q_view is not None:
+            _q = q_view.assign(日期=q_view["date"].dt.strftime("%Y-%m-%d"),
+                               **{"VIX恐慌指数": q_view["close"].round(2),
+                                  "恐慌阈值": q_view["thr"].round(2)})
+            _tbl = _tbl.merge(_q[["日期", "VIX恐慌指数", "恐慌阈值"]],
+                              on="日期", how="left")
+        st.dataframe(_tbl, use_container_width=True, height=420)
+
+
+with tab_cyb:
+    _render_board_tab(
+        "cyb", "创业板指", load_cyb_daily(), load_cyb_qvix_daily(),
+        "创业板ETF期权QVIX，数据自 2022-09 期权上市起，右轴")
+
+with tab_kcb:
+    _render_board_tab(
+        "kcb", "科创50", load_kcb_daily(), load_kcb_qvix_daily(),
+        "科创50ETF期权QVIX，数据自 2023-06 期权上市起，右轴")
