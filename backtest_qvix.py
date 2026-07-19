@@ -2,8 +2,9 @@
 回测: QVIX恐慌信号买入 + 双止损(基金回撤控制线 / 大盘回撤线)
 - 买入: QVIX > 3年95分位阈值, 且资金可用(空仓或当天恰好卖出)
 - 标的: 前一交易日近3月冠军(C类全市场)
-- 卖出: 基金回撤控制线(买入日阈值/5×Beta) 或 大盘回撤线(买入日阈值/5),
+- 卖出: 基金回撤控制线(买入日阈值/5×波动率比值) 或 大盘回撤线(买入日阈值/5),
   逐交易日检查, 先到先卖(双线在买入日锁定, 与 app.py 复盘口径一致)
+  波动率比值 = 基金日收益率std / 大盘日收益率std(纯波动对比, 不按相关系数加权)
 """
 import sys, os, time, sqlite3, io
 import numpy as np
@@ -82,7 +83,11 @@ def find_champion_on_date(conn, asof_date):
 
 
 def compute_beta(conn, sse_df, code, buy_date):
-    """买入日前91天窗口的 Beta."""
+    """买入日前91天窗口的波动率比值(基金日收益率std / 大盘日收益率std).
+
+    纯波动对比,不按相关系数加权——目的是衡量基金相对大盘的振幅倍数,
+    而非系统性风险敞口(标准 Beta 会被低相关性拉低,弱化真实波动)。
+    """
     end = pd.Timestamp(buy_date)
     start = end - timedelta(days=91)
 
@@ -93,20 +98,19 @@ def compute_beta(conn, sse_df, code, buy_date):
         return 1.0
     nav_df["nav"] = pd.to_numeric(nav_df["nav"], errors="coerce")
     f_ret = nav_df["nav"].pct_change().dropna().values
+    # 剔除净值重置/份额折算等技术性跳变(单日|收益率|>20%非真实市场波动)
+    f_ret = f_ret[np.abs(f_ret) <= 0.20]
 
     sse_w = sse_df[(sse_df["date"] >= start) & (sse_df["date"] < end)]
     m_ret = sse_w["close"].pct_change().dropna().values
 
-    min_len = min(len(f_ret), len(m_ret))
-    if min_len < 20:
+    if len(f_ret) < 20 or len(m_ret) < 20:
         return 1.0
-    f_ret, m_ret = f_ret[-min_len:], m_ret[-min_len:]
 
-    cov = np.cov(f_ret, m_ret)
-    var = cov[1, 1]
-    if var == 0 or np.isnan(var):
+    m_std = np.std(m_ret)
+    if m_std == 0 or np.isnan(m_std):
         return 1.0
-    return round(float(cov[0, 1] / var), 2)
+    return round(float(np.std(f_ret) / m_std), 2)
 
 
 def get_fund_nav_after(conn, code, from_date):
@@ -203,7 +207,7 @@ def run_backtest():
                     "买入日": position["buy_date"].strftime("%Y-%m-%d"),
                     "冠军(C类全市场,按前一交易日榜单)": f"{name} ({code})",
                     "类型": fund_types.get(code, ""),
-                    "Beta(近3月)": position["beta"],
+                    "波动率比值(近3月)": position["beta"],
                     "恐慌阈值": round(position["threshold"], 2),
                     "回撤控制线(%)": round(position["fund_dd_limit"], 2),
                     "大盘回撤线(%)": round(position["sse_dd_limit"], 2),
@@ -298,7 +302,7 @@ def run_backtest():
                 "买入日": position["buy_date"].strftime("%Y-%m-%d"),
                 "冠军(C类全市场,按前一交易日榜单)": f"{name} ({code})",
                 "类型": fund_types.get(code, ""),
-                "Beta(近3月)": position["beta"],
+                "波动率比值(近3月)": position["beta"],
                 "恐慌阈值": round(position["threshold"], 2),
                 "回撤控制线(%)": round(position["fund_dd_limit"], 2),
                 "大盘回撤线(%)": round(position["sse_dd_limit"], 2),
@@ -352,7 +356,7 @@ def main():
 
     # 输出表格
     display_cols = ["买入日", "冠军(C类全市场,按前一交易日榜单)", "类型",
-                    "Beta(近3月)", "恐慌阈值", "回撤控制线(%)", "大盘回撤线(%)",
+                    "波动率比值(近3月)", "恐慌阈值", "回撤控制线(%)", "大盘回撤线(%)",
                     "冠军近3月涨幅(前日口径)", "卖出日", "持有收益",
                     "手续费%", "期间最高", "期间最大回撤", "同期上证", "卖出原因"]
     print(f"\n{df[display_cols].to_string(index=False)}")
