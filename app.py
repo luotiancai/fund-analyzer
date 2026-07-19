@@ -1555,6 +1555,21 @@ with tab_ndx:
             fig_ndx.update_layout(
                 yaxis2=dict(title="VIX恐慌指数", overlaying="y", side="right",
                             showgrid=False))
+            # 动态恐慌阈值(滚动3年95分位),与上证 Tab 的 QVIX 阈值同口径:
+            # 720 交易日窗口、min_periods 240。VIX 水位同样有时代漂移
+            # (2017 全年中位 11 vs 2020 年 28),动态分位比固定 20/30 稳健。
+            _vfull = _vix.copy()
+            _vfull["date"] = pd.to_datetime(_vfull["date"])
+            _vfull["thr"] = _vfull["close"].rolling(
+                720, min_periods=240).quantile(0.95)
+            _vthr_view = _vfull[(_vfull["date"] >= nview["date"].min())
+                                & (_vfull["date"] <= nview["date"].max())]
+            if _vthr_view["thr"].notna().any():
+                fig_ndx.add_trace(go.Scatter(
+                    x=_vthr_view["date"], y=_vthr_view["thr"],
+                    name="恐慌阈值(3年95分位)", yaxis="y2",
+                    line=dict(color="#8e44ad", width=1.2, dash="dash"),
+                    hovertemplate="恐慌阈值 %{y:.2f}<extra></extra>"))
             # 20 预警 / 30 恐慌,美股 VIX 的常用阈值。
             for _lvl2, _dash2 in ((20, "dot"), (30, "dash")):
                 fig_ndx.add_shape(
