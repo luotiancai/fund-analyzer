@@ -1,0 +1,362 @@
+"""
+回测: QVIX恐慌信号买入 + 双止损(基金回撤控制线 / 大盘回撤线)
+- 买入: QVIX > 3年95分位阈值, 且资金可用(空仓或当天恰好卖出)
+- 标的: 前一交易日近3月冠军(C类全市场)
+- 卖出: 基金回撤控制线(买入日阈值/5×Beta) 或 大盘回撤线(买入日阈值/5),
+  逐交易日检查, 先到先卖(双线在买入日锁定, 与 app.py 复盘口径一致)
+"""
+import sys, os, time, sqlite3, io
+import numpy as np
+import pandas as pd
+from datetime import timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fetcher
+
+DB = os.path.expanduser("~/.local/share/fund-analyzer/fund_cache.db")
+
+
+def get_conn():
+    return sqlite3.connect(DB, check_same_thread=False, timeout=30)
+
+
+def load_cached_json(conn, key):
+    row = conn.execute(
+        "SELECT data FROM index_daily_cache WHERE key=?", (key,)).fetchone()
+    if not row:
+        return pd.DataFrame()
+    df = pd.read_json(io.StringIO(row[0]), orient="split",
+                      dtype=False, convert_dates=False)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+def find_champion_on_date(conn, asof_date):
+    """找 asof_date 前一交易日的近3月冠军. 返回 (code, ret_3m)."""
+    end = pd.Timestamp(asof_date)
+    start = end - timedelta(days=91)
+    grace = start - timedelta(days=10)
+    prev_day = end - timedelta(days=1)
+
+    # SQL: 对每只基金, 取 [grace, prev_day] 区间内最早和最晚的净值
+    rows = conn.execute("""
+        SELECT code,
+               MIN(CASE WHEN date >= ? THEN nav END) as no_use,
+               MAX(date) as last_date
+        FROM fund_nav_daily
+        WHERE date >= ? AND date <= ?
+        GROUP BY code
+    """, (grace.strftime("%Y-%m-%d"),
+          grace.strftime("%Y-%m-%d"),
+          prev_day.strftime("%Y-%m-%d"))).fetchall()
+
+    # 更直接的方法: 取每只基金在窗口内的首尾净值
+    sql = """
+        SELECT t.code, first_nav.nav as anchor_nav, last_nav.nav as end_nav
+        FROM (
+            SELECT code, MIN(date) as first_d, MAX(date) as last_d
+            FROM fund_nav_daily
+            WHERE date >= ? AND date <= ?
+            GROUP BY code
+            HAVING julianday(MAX(date)) - julianday(MIN(date)) >= 60
+        ) t
+        JOIN fund_nav_daily first_nav ON first_nav.code = t.code AND first_nav.date = t.first_d
+        JOIN fund_nav_daily last_nav ON last_nav.code = t.code AND last_nav.date = t.last_d
+    """
+    df = pd.read_sql_query(sql, conn, params=(
+        grace.strftime("%Y-%m-%d"), prev_day.strftime("%Y-%m-%d")))
+
+    if df.empty:
+        return None, 0
+
+    df["anchor_nav"] = pd.to_numeric(df["anchor_nav"], errors="coerce")
+    df["end_nav"] = pd.to_numeric(df["end_nav"], errors="coerce")
+    df = df.dropna()
+    df = df[(df["anchor_nav"] > 0) & (df["end_nav"] > 0)]
+    if df.empty:
+        return None, 0
+
+    df["ret"] = (df["end_nav"] / df["anchor_nav"] - 1.0) * 100
+    best = df.loc[df["ret"].idxmax()]
+    return best["code"], round(best["ret"], 2)
+
+
+def compute_beta(conn, sse_df, code, buy_date):
+    """买入日前91天窗口的 Beta."""
+    end = pd.Timestamp(buy_date)
+    start = end - timedelta(days=91)
+
+    nav_df = pd.read_sql_query(
+        "SELECT date, nav FROM fund_nav_daily WHERE code=? AND date>=? AND date<? ORDER BY date",
+        conn, params=(code, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")))
+    if len(nav_df) < 20:
+        return 1.0
+    nav_df["nav"] = pd.to_numeric(nav_df["nav"], errors="coerce")
+    f_ret = nav_df["nav"].pct_change().dropna().values
+
+    sse_w = sse_df[(sse_df["date"] >= start) & (sse_df["date"] < end)]
+    m_ret = sse_w["close"].pct_change().dropna().values
+
+    min_len = min(len(f_ret), len(m_ret))
+    if min_len < 20:
+        return 1.0
+    f_ret, m_ret = f_ret[-min_len:], m_ret[-min_len:]
+
+    cov = np.cov(f_ret, m_ret)
+    var = cov[1, 1]
+    if var == 0 or np.isnan(var):
+        return 1.0
+    return round(float(cov[0, 1] / var), 2)
+
+
+def get_fund_nav_after(conn, code, from_date):
+    """获取基金从 from_date 起的净值序列 [(date, nav), ...]"""
+    rows = conn.execute(
+        "SELECT date, nav FROM fund_nav_daily WHERE code=? AND date>=? ORDER BY date",
+        (code, from_date.strftime("%Y-%m-%d"))).fetchall()
+    return [(pd.Timestamp(r[0]), float(r[1])) for r in rows if r[1]]
+
+
+def run_backtest():
+    conn = get_conn()
+
+    # Load fund names and types from JSON cache
+    fund_names = {}
+    fund_types = {}
+    raw = conn.execute("SELECT data FROM fund_list").fetchone()
+    if raw and raw[0]:
+        import json as _json
+        items = _json.loads(raw[0])
+        for item in items:
+            c = item.get("code", "")
+            fund_names[c] = item.get("name", c)
+            fund_types[c] = item.get("type", "")
+
+    # Load QVIX with threshold
+    print("加载数据...")
+    qvix = load_cached_json(conn, "qvix")
+    qvix["close"] = pd.to_numeric(qvix["close"], errors="coerce")
+    qvix = qvix.sort_values("date").reset_index(drop=True)
+    qvix["thr"] = qvix["close"].rolling(720, min_periods=240).quantile(0.95)
+
+    sse = load_cached_json(conn, "sse")
+    sse["close"] = pd.to_numeric(sse["close"], errors="coerce")
+    sse = sse.sort_values("date").reset_index(drop=True)
+
+    # Signal days: QVIX > threshold
+    signals = qvix[(qvix["close"] > qvix["thr"]) & (qvix["thr"].notna())]
+    signals = signals[signals["date"] >= pd.Timestamp("2018-01-01")]  # 净值库起点2018-01,冠军窗口自适应
+    print(f"信号日(QVIX > 阈值): {len(signals)} 天")
+    signal_map = {row["date"]: row["thr"] for _, row in signals.iterrows()}
+
+    trades = []
+    position = None
+
+    # 逐交易日走: 持仓时每天检查双止损线, 空仓(或当天刚卖出)遇信号日则买入
+    all_days = sse[sse["date"] >= pd.Timestamp("2018-01-01")]
+
+    for _, day_row in all_days.iterrows():
+        day = day_row["date"]
+        day_str = day.strftime("%Y-%m-%d")
+        sse_close = float(day_row["close"])
+
+        # ── Step 1: 持仓时逐日检查双止损 ──
+        if position is not None:
+            nav_series = position["nav_map"]
+            current_nav = nav_series.get(day, position.get("last_nav"))
+            if current_nav is None:
+                continue
+            position["last_nav"] = current_nav
+
+            position["peak_nav"] = max(position["peak_nav"], current_nav)
+            position["min_nav"] = min(position["min_nav"], current_nav)
+            position["peak_sse"] = max(position["peak_sse"], sse_close)
+            sse_dd = (position["peak_sse"] - sse_close) / position["peak_sse"] * 100
+            fund_dd = (position["peak_nav"] - current_nav) / position["peak_nav"] * 100
+            position["max_dd"] = max(position.get("max_dd", 0.0), fund_dd)
+
+            sell_reason = None
+            if fund_dd >= position["fund_dd_limit"]:
+                sell_reason = f"基金{fund_dd:.1f}%>={position['fund_dd_limit']:.1f}%"
+            elif sse_dd >= position["sse_dd_limit"]:
+                sell_reason = f"大盘{sse_dd:.1f}%>={position['sse_dd_limit']:.1f}%"
+
+            if sell_reason:
+                ret_pct = (current_nav / position["buy_nav"] - 1) * 100
+                hold_days = (day - position["buy_date"]).days
+                # 手续费: <7天扣1.5%, 7-29天扣0.5%, >=30天不扣
+                fee = 1.5 if hold_days < 7 else (0.5 if hold_days < 30 else 0)
+                ret_after_fee = ret_pct - fee
+                # 同期上证
+                sse_ret = (sse_close / position["buy_sse"] - 1) * 100 \
+                    if position["buy_sse"] else 0
+                # 期间最大回撤(逐日沿途峰值口径)
+                max_dd = position.get("max_dd", 0.0)
+                code = position["code"]
+                name = fund_names.get(code, code)
+                # 持有收益格式
+                if fee > 0:
+                    ret_str = f"{ret_pct:+.2f}% (费后{ret_after_fee:+.2f}%)"
+                else:
+                    ret_str = f"{ret_pct:+.2f}%"
+                trades.append({
+                    "买入日": position["buy_date"].strftime("%Y-%m-%d"),
+                    "冠军(C类全市场,按前一交易日榜单)": f"{name} ({code})",
+                    "类型": fund_types.get(code, ""),
+                    "Beta(近3月)": position["beta"],
+                    "恐慌阈值": round(position["threshold"], 2),
+                    "回撤控制线(%)": round(position["fund_dd_limit"], 2),
+                    "大盘回撤线(%)": round(position["sse_dd_limit"], 2),
+                    "冠军近3月涨幅(前日口径)": f"+{position['ret_3m']:.2f}%",
+                    "卖出日": day.strftime("%Y-%m-%d"),
+                    "持有收益": ret_str,
+                    "期间最高": f"+{(position['peak_nav']/position['buy_nav']-1)*100:.1f}%",
+                    "期间最大回撤": f"{max_dd:.1f}%",
+                    "同期上证": f"{sse_ret:+.1f}%",
+                    "持有天数": hold_days,
+                    "手续费%": fee,
+                    "费后收益": round(ret_after_fee, 2),
+                    "卖出原因": sell_reason,
+                })
+                position = None
+
+        # ── Step 2: 空仓(含当天刚卖出)且为信号日时买入 ──
+        if position is None and day in signal_map:
+            threshold = signal_map[day]
+            code, ret_3m = find_champion_on_date(conn, day_str)
+            if code is None:
+                continue
+
+            # 获取当天买入净值
+            row = conn.execute(
+                "SELECT nav FROM fund_nav_daily WHERE code=? AND date=?",
+                (code, day_str)).fetchone()
+            if not row or not row[0]:
+                # 取之后最近的
+                row2 = conn.execute(
+                    "SELECT date, nav FROM fund_nav_daily WHERE code=? AND date>=? ORDER BY date LIMIT 1",
+                    (code, day_str)).fetchone()
+                if not row2:
+                    continue
+                buy_nav = float(row2[1])
+                actual_buy_date = pd.Timestamp(row2[0])
+            else:
+                buy_nav = float(row[0])
+                actual_buy_date = day
+
+            beta = compute_beta(conn, sse, code, day_str)
+            fund_dd_limit = threshold / 5.0 * beta
+
+            # SSE peak at buy (从买入日开始追踪, 不是历史最高)
+            sse_on_buy = sse[sse["date"] <= actual_buy_date]
+            sse_peak = float(sse_on_buy["close"].iloc[-1]) if not sse_on_buy.empty else 3000.0
+
+            # 预载基金净值序列, 供逐日止损检查
+            nav_map = dict(get_fund_nav_after(conn, code, actual_buy_date))
+
+            position = {
+                "code": code,
+                "buy_date": actual_buy_date,
+                "buy_nav": buy_nav,
+                "peak_nav": buy_nav,
+                "min_nav": buy_nav,
+                "last_nav": buy_nav,
+                "peak_sse": sse_peak,
+                "buy_sse": sse_peak,
+                "ret_3m": ret_3m,
+                "beta": beta,
+                "fund_dd_limit": fund_dd_limit,
+                "sse_dd_limit": threshold / 5.0,
+                "threshold": threshold,
+                "nav_map": nav_map,
+            }
+
+    # Close open position
+    if position is not None:
+        row = conn.execute(
+            "SELECT date, nav FROM fund_nav_daily WHERE code=? ORDER BY date DESC LIMIT 1",
+            (position["code"],)).fetchone()
+        if row and row[1]:
+            last_date = pd.Timestamp(row[0])
+            last_nav = float(row[1])
+            ret_pct = (last_nav / position["buy_nav"] - 1) * 100
+            hold_days = (last_date - position["buy_date"]).days
+            fee = 1.5 if hold_days < 7 else (0.5 if hold_days < 30 else 0)
+            ret_after_fee = ret_pct - fee
+            # 同期上证
+            sse_last = sse.iloc[-1]["close"] if not sse.empty else 3000
+            sse_ret = (float(sse_last) / position["buy_sse"] - 1) * 100 \
+                if position["buy_sse"] else 0
+            max_dd = position.get("max_dd", 0.0)
+            code = position["code"]
+            name = fund_names.get(code, code)
+            if fee > 0:
+                ret_str = f"{ret_pct:+.2f}% (费后{ret_after_fee:+.2f}%)"
+            else:
+                ret_str = f"{ret_pct:+.2f}%"
+            trades.append({
+                "买入日": position["buy_date"].strftime("%Y-%m-%d"),
+                "冠军(C类全市场,按前一交易日榜单)": f"{name} ({code})",
+                "类型": fund_types.get(code, ""),
+                "Beta(近3月)": position["beta"],
+                "恐慌阈值": round(position["threshold"], 2),
+                "回撤控制线(%)": round(position["fund_dd_limit"], 2),
+                "大盘回撤线(%)": round(position["sse_dd_limit"], 2),
+                "冠军近3月涨幅(前日口径)": f"+{position['ret_3m']:.2f}%",
+                "卖出日": f"{last_date.strftime('%Y-%m-%d')}(持仓中)",
+                "持有收益": ret_str,
+                "期间最高": f"+{(position['peak_nav']/position['buy_nav']-1)*100:.1f}%",
+                "期间最大回撤": f"{max_dd:.1f}%",
+                "同期上证": f"{sse_ret:+.1f}%",
+                "持有天数": hold_days,
+                "手续费%": fee,
+                "费后收益": round(ret_after_fee, 2),
+                "卖出原因": "未触发",
+            })
+
+    conn.close()
+    return trades
+
+
+def main():
+    t0 = time.time()
+    trades = run_backtest()
+    elapsed = time.time() - t0
+
+    if not trades:
+        print("无交易记录")
+        return
+
+    df = pd.DataFrame(trades)
+    print(f"\n{'='*110}")
+    print(f"回测结果: {len(df)} 笔交易, 耗时 {elapsed:.0f}s")
+    print(f"{'='*110}\n")
+
+    completed = df[~df["卖出原因"].str.contains("持仓中")]
+    if not completed.empty:
+        # 用费后收益算累计
+        rets = completed["费后收益"]
+        days = completed["持有天数"]
+        wins = rets[rets > 0]
+        losses = rets[rets <= 0]
+        total_ret = ((1 + rets / 100).prod() - 1) * 100
+        total_fee = completed["手续费%"].sum()
+        print(f"已完成: {len(completed)} 笔")
+        print(f"  胜率: {len(wins)}/{len(completed)} = {len(wins)/len(completed)*100:.1f}%")
+        print(f"  累计收益(费后复利): {total_ret:+.2f}%")
+        print(f"  累计手续费: {total_fee:.1f}%")
+        print(f"  平均持有: {days.mean():.0f} 天")
+        print(f"  平均收益(费后): {rets.mean():+.2f}%")
+        print(f"  最佳: {rets.max():+.2f}%")
+        print(f"  最差: {rets.min():+.2f}%")
+
+    # 输出表格
+    display_cols = ["买入日", "冠军(C类全市场,按前一交易日榜单)", "类型",
+                    "Beta(近3月)", "恐慌阈值", "回撤控制线(%)", "大盘回撤线(%)",
+                    "冠军近3月涨幅(前日口径)", "卖出日", "持有收益",
+                    "手续费%", "期间最高", "期间最大回撤", "同期上证", "卖出原因"]
+    print(f"\n{df[display_cols].to_string(index=False)}")
+
+
+if __name__ == "__main__":
+    main()
