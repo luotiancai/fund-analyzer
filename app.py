@@ -134,6 +134,11 @@ def load_gvz_daily():
     return fetcher.fetch_gvz_daily()
 
 
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def load_gold_daily():
+    return fetcher.fetch_gold_daily()
+
+
 # 1y max drawdown as it stood on the buy date (window: buy_date-365d → buy_date),
 # on the corrected daily-return growth index (nav_series 的 ret 列) so dividend
 # NAV resets don't count as drops, while build-up-period fake-zero growth rates
@@ -239,8 +244,9 @@ for _c in ("ret_1m", "ret_3m", "ret_6m", "ret_1y"):
         fund_df[_c] = pd.to_numeric(fund_df[_c], errors="coerce")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_table, tab_detail, tab_sim, tab_sse, tab_ndx = st.tabs(
-    ["📋 基金列表", "🔍 基金详情", "💰 模拟盘", "📈 上证指数", "🇺🇸 纳指"])
+tab_table, tab_detail, tab_sim, tab_sse, tab_ndx, tab_gold = st.tabs(
+    ["📋 基金列表", "🔍 基金详情", "💰 模拟盘", "📈 上证指数", "🇺🇸 纳指",
+     "🥇 黄金"])
 
 # ─── Tab 1: Table ────────────────────────────────────────────────────────────
 with tab_table:
@@ -1488,19 +1494,13 @@ with tab_ndx:
         _ndx_ranges = {"近1月": 30, "近3月": 91, "近6月": 182,
                        "近1年": 365, "近3年": 365 * 3, "近5年": 365 * 5,
                        "近10年": 365 * 10, "全部": None}
-        _c_rng2, _c_vix2, _c_gvz2 = st.columns([4, 1, 1])
+        _c_rng2, _c_vix2 = st.columns([5, 1])
         with _c_rng2:
             _rng2 = st.radio("时间区间", list(_ndx_ranges.keys()), index=6,
                              horizontal=True, key="ndx_range")
         with _c_vix2:
             _show_vix2 = st.checkbox("VIX恐慌指数", value=True, key="ndx_vix",
                                      help="CBOE VIX(标普500期权隐含波动率),右轴")
-        with _c_gvz2:
-            _show_gvz2 = st.checkbox("GVZ黄金波动率", value=False,
-                                     key="ndx_gvz",
-                                     help="CBOE GVZ(GLD期权隐含波动率),右轴。"
-                                          "注意:黄金急涨急跌都会推高 GVZ,"
-                                          "高读数≠下跌恐慌")
 
         _days2 = _ndx_ranges[_rng2]
         if _days2 is None:
@@ -1544,38 +1544,17 @@ with tab_ndx:
             if vix_view is None or vix_view.empty:
                 st.caption("⚠️ VIX 数据暂不可用")
                 vix_view = None
-        gvz_view = None
-        if _show_gvz2:
-            _gvz = load_gvz_daily()
-            if _gvz is not None and not _gvz.empty:
-                gvz_view = _gvz.copy()
-                gvz_view["date"] = pd.to_datetime(gvz_view["date"])
-                gvz_view = gvz_view[
-                    (gvz_view["date"] >= nview["date"].min())
-                    & (gvz_view["date"] <= nview["date"].max())]
-            if gvz_view is None or gvz_view.empty:
-                st.caption("⚠️ GVZ 数据暂不可用")
-                gvz_view = None
-
-        if vix_view is not None or gvz_view is not None:
+        if vix_view is not None:
             fig_ndx.data[0].name = "纳指"
             fig_ndx.data[0].showlegend = True
-            fig_ndx.update_layout(
-                yaxis2=dict(title="波动率指数", overlaying="y", side="right",
-                            showgrid=False))
-        if vix_view is not None:
             fig_ndx.add_trace(go.Scatter(
                 x=vix_view["date"], y=vix_view["close"],
                 name="VIX恐慌指数", yaxis="y2",
                 line=dict(color="#f28e2b", width=1.3),
                 hovertemplate="VIX %{y:.2f}<extra></extra>"))
-        if gvz_view is not None:
-            fig_ndx.add_trace(go.Scatter(
-                x=gvz_view["date"], y=gvz_view["close"],
-                name="GVZ黄金波动率", yaxis="y2",
-                line=dict(color="#d4af37", width=1.3),
-                hovertemplate="GVZ %{y:.2f}<extra></extra>"))
-        if vix_view is not None:
+            fig_ndx.update_layout(
+                yaxis2=dict(title="VIX恐慌指数", overlaying="y", side="right",
+                            showgrid=False))
             # 20 预警 / 30 恐慌,美股 VIX 的常用阈值。
             for _lvl2, _dash2 in ((20, "dot"), (30, "dash")):
                 fig_ndx.add_shape(
@@ -1613,9 +1592,132 @@ with tab_ndx:
                     日期=vix_view["date"].dt.strftime("%Y-%m-%d"),
                     **{"VIX": vix_view["close"].round(2)})
                 _ntbl = _ntbl.merge(_v[["日期", "VIX"]], on="日期", how="left")
-            if gvz_view is not None:
-                _g = gvz_view.assign(
-                    日期=gvz_view["date"].dt.strftime("%Y-%m-%d"),
-                    **{"GVZ": gvz_view["close"].round(2)})
-                _ntbl = _ntbl.merge(_g[["日期", "GVZ"]], on="日期", how="left")
             st.dataframe(_ntbl, use_container_width=True, height=420)
+
+# ─── Tab 6: 黄金 + GVZ ───────────────────────────────────────────────────────
+with tab_gold:
+    au_df = load_gold_daily()
+    if au_df is None or au_df.empty:
+        st.warning("金价数据获取失败，请稍后重试。")
+    else:
+        au_all = au_df.copy()
+        au_all["date"] = pd.to_datetime(au_all["date"])
+        au_all = au_all.sort_values("date").reset_index(drop=True)
+
+        _au_ranges = {"近1月": 30, "近3月": 91, "近6月": 182,
+                      "近1年": 365, "近3年": 365 * 3, "近5年": 365 * 5,
+                      "近10年": 365 * 10, "全部": None}
+        _c_rng3, _c_gvz3 = st.columns([5, 1])
+        with _c_rng3:
+            _rng3 = st.radio("时间区间", list(_au_ranges.keys()), index=4,
+                             horizontal=True, key="gold_range")
+        with _c_gvz3:
+            _show_gvz3 = st.checkbox("GVZ黄金波动率", value=True,
+                                     key="gold_gvz",
+                                     help="CBOE GVZ(GLD期权隐含波动率),右轴。"
+                                          "注意:黄金急涨急跌都会推高 GVZ,"
+                                          "高读数≠下跌恐慌")
+
+        _days3 = _au_ranges[_rng3]
+        if _days3 is None:
+            aview = au_all
+        else:
+            _start3 = au_all["date"].max() - pd.Timedelta(days=_days3)
+            _older3 = au_all[au_all["date"] <= _start3]
+            aview = au_all.loc[_older3.index[-1]:] if not _older3.empty \
+                else au_all
+
+        _alatest = au_all.iloc[-1]
+        _achg = (_alatest["close"] / aview["close"].iloc[0] - 1.0) * 100.0
+        _apeak = aview["close"].cummax()
+        _amdd = float(((_apeak - aview["close"]) / _apeak).max() * 100.0)
+        ak1, ak2, ak3, ak4 = st.columns(4)
+        ak1.metric("最新金价(元/克)", f"{_alatest['close']:,.2f}",
+                   f"{_alatest['pct']:+.2f}%（当日）")
+        ak2.metric(f"{_rng3}涨跌幅", f"{_achg:+.2f}%")
+        ak3.metric(f"{_rng3}最大回撤", f"{_amdd:.2f}%")
+        ak4.metric("数据日期", _alatest["date"].strftime("%Y-%m-%d"))
+
+        fig_au = px.line(
+            aview, x="date", y="close",
+            title=f"上金所 Au99.99 现货金价（{_rng3}）",
+            labels={"date": "日期", "close": "金价(元/克)"},
+            height=420,
+        )
+        fig_au.update_traces(
+            line=dict(color="#d4af37"),
+            customdata=aview[["pct"]],
+            hovertemplate="金价 %{y:,.2f} 元/克 · 日涨跌 "
+                          "%{customdata[0]:+.2f}%<extra></extra>")
+
+        gvz_view3 = None
+        if _show_gvz3:
+            _gvz3 = load_gvz_daily()
+            if _gvz3 is not None and not _gvz3.empty:
+                gvz_view3 = _gvz3.copy()
+                gvz_view3["date"] = pd.to_datetime(gvz_view3["date"])
+                gvz_view3 = gvz_view3[
+                    (gvz_view3["date"] >= aview["date"].min())
+                    & (gvz_view3["date"] <= aview["date"].max())]
+            if gvz_view3 is None or gvz_view3.empty:
+                st.caption("⚠️ GVZ 数据暂不可用")
+                gvz_view3 = None
+        if gvz_view3 is not None:
+            fig_au.data[0].name = "Au99.99"
+            fig_au.data[0].showlegend = True
+            fig_au.add_trace(go.Scatter(
+                x=gvz_view3["date"], y=gvz_view3["close"],
+                name="GVZ黄金波动率", yaxis="y2",
+                line=dict(color="#8e44ad", width=1.3),
+                hovertemplate="GVZ %{y:.2f}<extra></extra>"))
+            fig_au.update_layout(
+                yaxis2=dict(title="GVZ黄金波动率", overlaying="y",
+                            side="right", showgrid=False))
+            # GVZ 长期均值 ~17;>20 波动升温,>30 极端(2020-03 流动性
+            # 挤兑 48、2011 欧债 40)。只是波动预期参考线,不构成买卖信号。
+            for _lvl3, _dash3 in ((20, "dot"), (30, "dash")):
+                fig_au.add_shape(
+                    type="line", xref="paper", x0=0, x1=1,
+                    yref="y2", y0=_lvl3, y1=_lvl3,
+                    line=dict(color="#8e44ad", width=1, dash=_dash3),
+                    opacity=0.5)
+                fig_au.add_annotation(
+                    x=1, xref="paper", xanchor="left", y=_lvl3, yref="y2",
+                    text=str(_lvl3), showarrow=False,
+                    font=dict(size=10, color="#8e44ad"))
+
+        fig_au.update_layout(
+            hovermode="x unified", hoverdistance=-1, spikedistance=-1)
+        _aspan = max((aview["date"].max() - aview["date"].min()).days, 1)
+        fig_au.update_xaxes(
+            showspikes=True, spikemode="across", spikesnap="data",
+            spikedash="dot", spikethickness=1,
+            hoverformat="%Y-%m-%d", tickformat="%Y-%m-%d",
+            dtick=max(1, _aspan // 8) * 86400000)
+        fig_au.update_yaxes(
+            showspikes=True, spikemode="across", spikesnap="data",
+            spikedash="dot", spikethickness=1)
+        st.plotly_chart(fig_au, use_container_width=True)
+        st.caption(
+            "金价为上海黄金交易所 Au99.99 现货收盘价(人民币计价,含汇率因素,"
+            "与伦敦金走势略有差异);GVZ 为 CBOE 黄金ETF波动率指数(GLD 期权"
+            "隐含波动率,美元金价口径)。黄金是避险资产,GVZ 的高读数在金价"
+            "急涨与急跌时都会出现,衡量的是波动预期而非下跌恐慌,故不能套用"
+            "股票 QVIX 的恐慌买点逻辑。")
+
+        with st.expander("📄 每日数据（当前区间）"):
+            _atab = aview.sort_values("date", ascending=False)\
+                .reset_index(drop=True)
+            _atbl = pd.DataFrame({
+                "日期": _atab["date"].dt.strftime("%Y-%m-%d"),
+                "金价(元/克)": _atab["close"].round(2),
+                "日涨跌(%)": pd.to_numeric(_atab["pct"],
+                                         errors="coerce").round(2),
+            })
+            if gvz_view3 is not None:
+                _g3 = gvz_view3.assign(
+                    日期=gvz_view3["date"].dt.strftime("%Y-%m-%d"),
+                    **{"GVZ": gvz_view3["close"].round(2)})
+                _atbl = _atbl.merge(_g3[["日期", "GVZ"]],
+                                    on="日期", how="left")
+            st.dataframe(_atbl, use_container_width=True, height=420)

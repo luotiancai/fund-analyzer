@@ -1233,6 +1233,50 @@ def fetch_vix_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     return df
 
 
+def fetch_gold_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
+    """上海黄金交易所 Au99.99 现货金价(元/克)daily close,
+    akshare spot_hist_sge 源(SGE 官网),与 fetch_sse_daily 同契约。
+    Columns: date, close, pct。SGE 数据起点约 2016-10。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
+                 "key TEXT PRIMARY KEY, data TEXT, saved_at REAL)")
+    row = conn.execute(
+        "SELECT data, saved_at FROM index_daily_cache WHERE key='au9999'"
+    ).fetchone()
+
+    def _from_row(r):
+        return pd.read_json(io.StringIO(r["data"]), orient="split",
+                            dtype=False, convert_dates=False)
+
+    if row and not force_refresh and time.time() - row["saved_at"] < _INDEX_TTL:
+        conn.close()
+        return _from_row(row)
+
+    df = None
+    try:
+        raw = ak.spot_hist_sge(symbol="Au99.99")
+        df = pd.DataFrame({
+            "date": pd.to_datetime(raw["date"]).dt.strftime("%Y-%m-%d"),
+            "close": pd.to_numeric(raw["close"], errors="coerce"),
+        }).dropna(subset=["date", "close"])
+        df = df.sort_values("date").reset_index(drop=True)
+        df["pct"] = df["close"].pct_change() * 100.0
+        df = df[df["date"] >= INDEX_START].reset_index(drop=True)
+    except Exception as e:
+        logger.debug("SGE gold fetch failed: %s", e)
+
+    if df is not None and not df.empty:
+        conn.execute(
+            "INSERT OR REPLACE INTO index_daily_cache (key, data, saved_at) "
+            "VALUES ('au9999', ?, ?)",
+            (df.to_json(orient="split", force_ascii=False), time.time()))
+        conn.commit()
+    elif row:
+        df = _from_row(row)
+    conn.close()
+    return df
+
+
 def fetch_gvz_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     """CBOE GVZ(黄金波动率指数,GLD期权隐含波动率)daily close,
     与 fetch_vix_daily 同源同契约(CBOE cdn CSV,cache-first 12h TTL)。
