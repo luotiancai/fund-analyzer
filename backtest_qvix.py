@@ -1,7 +1,11 @@
 """
 回测: QVIX恐慌信号买入 + 双止损(基金回撤控制线 / 大盘回撤线)
 - 买入: QVIX > 3年95分位阈值, 且资金可用(空仓或当天恰好卖出)
-- 标的: 前一交易日近3月冠军(C类全市场)
+- 标的: 前一交易日近3月冠军(C类全市场), 冠军排名复用 fetcher.compute_
+  metrics_asof——与 app.py「基金列表」页"截至日期"筛选完全同口径(按日
+  收益率连乘, 正确处理分红除权, 自带单日|收益率|>30%异常值过滤), 而非
+  简化的 end_nav/anchor_nav-1(曾把 2020-07-16 算错成广发医疗保健夺冠,
+  实际应为汇丰晋信智造先锋, 已交叉验证修正)
 - 卖出: 基金回撤控制线(买入日阈值/5×波动率比值) 或 大盘回撤线(买入日阈值/5),
   逐交易日检查, 先到先卖(双线在买入日锁定, 与 app.py 复盘口径一致)
   波动率比值 = 基金日收益率std / 大盘日收益率std(纯波动对比, 不按相关系数加权)
@@ -53,68 +57,31 @@ def load_cached_json(conn, key):
 
 
 def find_champion_on_date(conn, asof_date, exclude_codes=None):
-    """找 asof_date 前一交易日的近3月冠军(排除 exclude_codes). 返回 (code, ret_3m).
+    """找 asof_date 当天视角下的近3月冠军(排除 exclude_codes). 返回 (code, ret_3m).
+
+    复用 fetcher.compute_metrics_asof——按日收益率连乘计算区间收益(正确
+    处理分红除权,不会像 end_nav/anchor_nav-1 那样被除权日的净值跳水拉低),
+    且自带单日|收益率|>30%异常值过滤(effective_daily_ret, 已覆盖 014939
+    2025-03-31 断层等已知案例)。该函数按 asof 严格早于当日截断数据
+    (T日决策只能看到T-1日收盘净值), 与 app.py「基金列表」页"截至日期"
+    筛选完全同口径, 已用 2020-07-16 001644 vs 009163 交叉验证过。
 
     exclude_codes 用于剔除 QDII 等跟踪境外市场、与大盘弱相关的基金——
     策略买入逻辑建立在"大盘恐慌信号→买入国内动量最强标的"上, QDII 收益
     与 QVIX/大盘走势脱钩, 选入冠军池会削弱大盘回撤线对该笔仓位的意义。
     """
-    end = pd.Timestamp(asof_date)
-    start = end - timedelta(days=91)
-    grace = start - timedelta(days=10)
-    prev_day = end - timedelta(days=1)
-
-    # SQL: 对每只基金, 取 [grace, prev_day] 区间内最早和最晚的净值
-    rows = conn.execute("""
-        SELECT code,
-               MIN(CASE WHEN date >= ? THEN nav END) as no_use,
-               MAX(date) as last_date
-        FROM fund_nav_daily
-        WHERE date >= ? AND date <= ?
-        GROUP BY code
-    """, (grace.strftime("%Y-%m-%d"),
-          grace.strftime("%Y-%m-%d"),
-          prev_day.strftime("%Y-%m-%d"))).fetchall()
-
-    # 更直接的方法: 取每只基金在窗口内的首尾净值
-    sql = """
-        SELECT t.code, t.first_d, t.last_d,
-               first_nav.nav as anchor_nav, last_nav.nav as end_nav
-        FROM (
-            SELECT code, MIN(date) as first_d, MAX(date) as last_d
-            FROM fund_nav_daily
-            WHERE date >= ? AND date <= ?
-            GROUP BY code
-            HAVING julianday(MAX(date)) - julianday(MIN(date)) >= 60
-        ) t
-        JOIN fund_nav_daily first_nav ON first_nav.code = t.code AND first_nav.date = t.first_d
-        JOIN fund_nav_daily last_nav ON last_nav.code = t.code AND last_nav.date = t.last_d
-    """
-    df = pd.read_sql_query(sql, conn, params=(
-        grace.strftime("%Y-%m-%d"), prev_day.strftime("%Y-%m-%d")))
-
-    if df.empty:
+    metrics = fetcher.compute_metrics_asof(asof_date, cols={"ret_3m"})
+    if not metrics:
         return None, 0
-
-    df["anchor_nav"] = pd.to_numeric(df["anchor_nav"], errors="coerce")
-    df["end_nav"] = pd.to_numeric(df["end_nav"], errors="coerce")
-    df = df.dropna()
-    df = df[(df["anchor_nav"] > 0) & (df["end_nav"] > 0)]
-    if exclude_codes:
-        df = df[~df["code"].isin(exclude_codes)]
-    if df.empty:
+    candidates = {
+        c: m["ret_3m"] for c, m in metrics.items()
+        if m.get("ret_3m") is not None
+        and (not exclude_codes or c not in exclude_codes)
+    }
+    if not candidates:
         return None, 0
-
-    # 已核实净值异常(见 NAV_ANOMALIES): 剔除跳变对排名窗口首尾净值的污染
-    if NAV_ANOMALIES:
-        df["anchor_nav"] = df.apply(
-            lambda r: _apply_nav_anomaly(r["code"], r["first_d"], r["anchor_nav"]), axis=1)
-        df["end_nav"] = df.apply(
-            lambda r: _apply_nav_anomaly(r["code"], r["last_d"], r["end_nav"]), axis=1)
-
-    df["ret"] = (df["end_nav"] / df["anchor_nav"] - 1.0) * 100
-    best = df.loc[df["ret"].idxmax()]
-    return best["code"], round(best["ret"], 2)
+    best_code = max(candidates, key=candidates.get)
+    return best_code, round(candidates[best_code], 2)
 
 
 def compute_beta(conn, sse_df, code, buy_date):
