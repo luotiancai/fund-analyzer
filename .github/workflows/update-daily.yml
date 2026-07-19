@@ -1,0 +1,44 @@
+name: 每日数据跑批
+
+on:
+  schedule:
+    # 10:00 UTC = 北京 18:00,收盘后当日净值已陆续公布。
+    - cron: "0 10 * * 1-5"
+  workflow_dispatch: {}   # 手动触发测试用
+
+permissions:
+  contents: write   # gh release upload 需要
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      FUND_ANALYZER_DATA: ${{ github.workspace }}/.data
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装依赖(不装 streamlit)
+        run: pip install --quiet requests pandas numpy akshare
+      - name: 取回上次的数据库(Release tag `data`)
+        run: |
+          mkdir -p "$FUND_ANALYZER_DATA"
+          if gh release download data --pattern fund_cache.db.gz \
+               --output db.gz --repo "$GITHUB_REPOSITORY"; then
+            gunzip -c db.gz > "$FUND_ANALYZER_DATA/fund_cache.db" && rm db.gz
+          else
+            echo "::warning::release 不存在,将从零全量回填(耗时数小时,建议先用 push_db.sh 上传种子库)"
+          fi
+      - name: 跑批(增量补净值 + 重算指标 + 刷新上证/QVIX)
+        run: python update_daily.py
+      - name: 压缩并回传数据库
+        run: |
+          gzip -9 -c "$FUND_ANALYZER_DATA/fund_cache.db" > fund_cache.db.gz
+          gh release create data --title "数据快照" \
+            --notes "每日跑批产物 fund_cache.db.gz,应用启动时自动拉取,请勿手动改动" \
+            --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          gh release upload data fund_cache.db.gz --clobber \
+            --repo "$GITHUB_REPOSITORY"

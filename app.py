@@ -1,13 +1,17 @@
 """Fund Analyzer — Streamlit dashboard."""
 
 import datetime as dt
+import gzip
 import hashlib
 import json
+import os
+import shutil
 import time
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -46,6 +50,54 @@ def _get_rf() -> float:
     return fetcher.get_risk_free_rate()
 
 
+# ── 云端数据引导 ──────────────────────────────────────────────────────────────
+# Streamlit Community Cloud 的容器磁盘是临时的:数据库由 GitHub Actions 每日
+# 跑批后上传到 Release(tag `data`,见 .github/workflows/update-daily.yml),
+# 应用启动时/每小时比对 asset 的 updated_at,变了才重新下载(~gzip 压缩传输)。
+# 本地开发机(库已存在且无 marker 文件)完全跳过,零网络开销。
+# marker 同时充当"云端只读模式"开关:存在则隐藏「更新数据」按钮。
+_DB_RELEASE_API = ("https://api.github.com/repos/luotiancai/fund-analyzer/"
+                   "releases/tags/data")
+_DB_MARKER = fetcher.CACHE_DB + ".from-release"
+
+
+@st.cache_resource(ttl=3600, show_spinner="正在同步云端数据库…")
+def _sync_db_from_release() -> bool:
+    """确保数据库就位;返回是否运行在 Release 快照上(云端只读模式)。"""
+    have_db = os.path.exists(fetcher.CACHE_DB)
+    if have_db and not os.path.exists(_DB_MARKER):
+        return False                     # 本地自有数据库,不碰
+    try:
+        r = requests.get(_DB_RELEASE_API, timeout=30,
+                         headers={"Accept": "application/vnd.github+json"})
+        r.raise_for_status()
+        asset = next(a for a in r.json()["assets"]
+                     if a["name"] == "fund_cache.db.gz")
+    except Exception:
+        return have_db                   # API 不通:有旧快照就先用着
+    stamp = asset["updated_at"]
+    if have_db and open(_DB_MARKER).read().strip() == stamp:
+        return True
+    tmp = fetcher.CACHE_DB + ".tmp"
+    try:
+        with requests.get(asset["browser_download_url"], stream=True,
+                          timeout=600) as dl:
+            dl.raise_for_status()
+            with open(tmp, "wb") as f, gzip.GzipFile(fileobj=dl.raw) as gz:
+                shutil.copyfileobj(gz, f)
+        os.replace(tmp, fetcher.CACHE_DB)
+        with open(_DB_MARKER, "w") as m:
+            m.write(stamp)
+        return True
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        if have_db:
+            return True                  # 下载失败:继续用旧快照
+        raise
+
+
+_IS_CLOUD = _sync_db_from_release()
 _init_db_once()
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -63,8 +115,10 @@ def _confirm_update():
 with st.sidebar:
     rf_rate = _get_rf()
 
-    if st.button("🔄 更新数据", type="primary", use_container_width=True,
-                 help="增量拉取最新净值；指标在筛选时按需计算"):
+    if _IS_CLOUD:
+        st.caption("☁️ 云端模式:数据由每日跑批自动更新")
+    elif st.button("🔄 更新数据", type="primary", use_container_width=True,
+                   help="增量拉取最新净值；指标在筛选时按需计算"):
         _confirm_update()
 
     st.divider()
@@ -780,6 +834,9 @@ with tab_detail:
 
 # ─── Tab 3: Paper-trading simulator ──────────────────────────────────────────
 with tab_sim:
+    if _IS_CLOUD:
+        st.info("☁️ 云端页面是每日数据快照:模拟盘操作请在本地进行,"
+                "这里的改动会在次日跑批同步后被覆盖。")
     _code_names = dict(zip(fund_df["code"], fund_df["name"]))
     sim_date = simulator.get_current_date()
 
