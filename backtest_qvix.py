@@ -198,9 +198,6 @@ def run_backtest():
             if sell_reason:
                 ret_pct = (current_nav / position["buy_nav"] - 1) * 100
                 hold_days = (day - position["buy_date"]).days
-                # 手续费: <7天扣1.5%, 7-29天扣0.5%, >=30天不扣
-                fee = 1.5 if hold_days < 7 else (0.5 if hold_days < 30 else 0)
-                ret_after_fee = ret_pct - fee
                 # 同期上证
                 sse_ret = (sse_close / position["buy_sse"] - 1) * 100 \
                     if position["buy_sse"] else 0
@@ -208,11 +205,6 @@ def run_backtest():
                 max_dd = position.get("max_dd", 0.0)
                 code = position["code"]
                 name = fund_names.get(code, code)
-                # 持有收益格式
-                if fee > 0:
-                    ret_str = f"{ret_pct:+.2f}% (费后{ret_after_fee:+.2f}%)"
-                else:
-                    ret_str = f"{ret_pct:+.2f}%"
                 trades.append({
                     "买入日": position["buy_date"].strftime("%Y-%m-%d"),
                     "冠军(C类全市场,按前一交易日榜单)": f"{name} ({code})",
@@ -223,14 +215,15 @@ def run_backtest():
                     "大盘回撤线(%)": round(position["sse_dd_limit"], 2),
                     "冠军近3月涨幅(前日口径)": f"+{position['ret_3m']:.2f}%",
                     "卖出日": day.strftime("%Y-%m-%d"),
-                    "持有收益": ret_str,
                     "期间最高": f"+{(position['peak_nav']/position['buy_nav']-1)*100:.1f}%",
                     "期间最大回撤": f"{max_dd:.1f}%",
                     "同期上证": f"{sse_ret:+.1f}%",
                     "持有天数": hold_days,
-                    "手续费%": fee,
-                    "费后收益": round(ret_after_fee, 2),
                     "卖出原因": sell_reason,
+                    "_code": code,
+                    "_buy_date": position["buy_date"],
+                    "_sell_date": day,
+                    "_ret_pct": ret_pct,
                 })
                 position = None
 
@@ -295,8 +288,6 @@ def run_backtest():
             last_nav = float(row[1])
             ret_pct = (last_nav / position["buy_nav"] - 1) * 100
             hold_days = (last_date - position["buy_date"]).days
-            fee = 1.5 if hold_days < 7 else (0.5 if hold_days < 30 else 0)
-            ret_after_fee = ret_pct - fee
             # 同期上证
             sse_last = sse.iloc[-1]["close"] if not sse.empty else 3000
             sse_ret = (float(sse_last) / position["buy_sse"] - 1) * 100 \
@@ -304,10 +295,6 @@ def run_backtest():
             max_dd = position.get("max_dd", 0.0)
             code = position["code"]
             name = fund_names.get(code, code)
-            if fee > 0:
-                ret_str = f"{ret_pct:+.2f}% (费后{ret_after_fee:+.2f}%)"
-            else:
-                ret_str = f"{ret_pct:+.2f}%"
             trades.append({
                 "买入日": position["buy_date"].strftime("%Y-%m-%d"),
                 "冠军(C类全市场,按前一交易日榜单)": f"{name} ({code})",
@@ -318,18 +305,56 @@ def run_backtest():
                 "大盘回撤线(%)": round(position["sse_dd_limit"], 2),
                 "冠军近3月涨幅(前日口径)": f"+{position['ret_3m']:.2f}%",
                 "卖出日": f"{last_date.strftime('%Y-%m-%d')}(持仓中)",
-                "持有收益": ret_str,
                 "期间最高": f"+{(position['peak_nav']/position['buy_nav']-1)*100:.1f}%",
                 "期间最大回撤": f"{max_dd:.1f}%",
                 "同期上证": f"{sse_ret:+.1f}%",
                 "持有天数": hold_days,
-                "手续费%": fee,
-                "费后收益": round(ret_after_fee, 2),
                 "卖出原因": "未触发",
+                "_code": code,
+                "_buy_date": position["buy_date"],
+                "_sell_date": last_date,
+                "_ret_pct": ret_pct,
             })
 
+    _apply_chain_fees(trades)
     conn.close()
     return trades
+
+
+def _apply_chain_fees(trades):
+    """连续接力同一只基金(上一笔卖出日=下一笔买入日且代码相同)不算真实
+    离场, 中间腿不收手续费; 只有链条最后一腿按"链条首次买入→该腿卖出"的
+    累计持有天数收一次手续费(按实际持有时长计, 而非单腿天数)。"""
+    n = len(trades)
+    chain_start = None
+    for i, t in enumerate(trades):
+        prev = trades[i - 1] if i > 0 else None
+        is_continuation = (prev is not None and
+                           prev["_code"] == t["_code"] and
+                           prev["_sell_date"] == t["_buy_date"])
+        chain_start = t["_buy_date"] if not is_continuation else chain_start
+        nxt = trades[i + 1] if i + 1 < n else None
+        is_last_of_chain = not (nxt is not None and
+                                nxt["_code"] == t["_code"] and
+                                nxt["_buy_date"] == t["_sell_date"])
+
+        if is_last_of_chain:
+            total_days = (t["_sell_date"] - chain_start).days
+            fee = 1.5 if total_days < 7 else (0.5 if total_days < 30 else 0)
+        else:
+            fee = 0.0
+
+        ret_pct = t["_ret_pct"]
+        ret_after_fee = ret_pct - fee
+        ret_str = (f"{ret_pct:+.2f}% (费后{ret_after_fee:+.2f}%)"
+                   if fee > 0 else f"{ret_pct:+.2f}%")
+        t["手续费%"] = fee
+        t["费后收益"] = round(ret_after_fee, 2)
+        t["持有收益"] = ret_str
+
+    for t in trades:
+        for k in ("_code", "_buy_date", "_sell_date", "_ret_pct"):
+            del t[k]
 
 
 def main():
