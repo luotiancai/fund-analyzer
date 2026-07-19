@@ -3,7 +3,7 @@
 
 设计给收盘前的决策窗口用:QVIX 取 optbbs 分钟接口的最新一笔(实时),
 阈值用日线缓存(截至昨日)算,大盘当日涨跌取新浪实时行情——三者拼出
-「QVIX>阈值 且 当日下跌,或单日≤-5%」的 B 点触发判定,15:00 前来得及下单。
+「QVIX>阈值(不论当日涨跌),或单日≤-5%」的 B 点触发判定,15:00 前来得及下单。
 
 跑在 GitHub Actions(见 .github/workflows/notify-qvix.yml),邮件经
 QQ 邮箱 SMTP 直发(自发自收,手机 QQ 邮箱 App 即时提醒),凭据从环境变量读:
@@ -110,15 +110,15 @@ def main():
         log.error("阈值计算失败")
         sys.exit(1)
 
-    triggered = (qvix > thr and sse_pct < 0) or sse_pct <= -5.0
+    triggered = qvix > thr or sse_pct <= -5.0
     status = "🔔 B点触发!" if triggered else "未触发"
     title = f"QVIX {qvix:.2f} / 阈值 {thr:.2f} · {status}"
     body = (f"{today} {qtime}\n\n"
             f"盘中 QVIX:{qvix:.2f}\n"
             f"恐慌阈值(3年95分位):{thr:.2f}\n"
             f"上证:{sse_now:.0f}({sse_pct:+.2f}%)\n"
-            f"判定:QVIX{'>' if qvix > thr else '≤'}阈值,"
-            f"大盘{'下跌' if sse_pct < 0 else '上涨'} → {status}\n\n"
+            f"判定:QVIX{'>' if qvix > thr else '≤'}阈值"
+            f"(大盘{'下跌' if sse_pct < 0 else '上涨'},仅供参考)→ {status}\n\n"
             + ("触发条件满足:按规则看前一日榜单选国内 C 类冠军,15:00 前下单。"
                if triggered else "不满足触发条件,继续等待。"))
 
