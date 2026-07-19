@@ -16,6 +16,26 @@ import fetcher
 
 DB = os.path.expanduser("~/.local/share/fund-analyzer/fund_cache.db")
 
+# 已核实的净值异常(直连东财源头核对过, 不是本地缓存问题, 但明显非真实
+# 市场收益): 014939 同泰产业升级混合C 2025-03-31 单位净值单日 +68.7%
+# (0.9630→1.6249), 累计净值同步跳升(排除分红除权), 前后走势平稳无回撤/
+# 打回迹象(判断为永久性净值断层, 而非孤立坏点), 但一只普通混合型偏股
+# 基金不可能真实单日上涨 68.7%。原因未知(净值更正公告或数据错误均有
+# 可能), 回测中把该日跳变的比例从该日起从整条净值序列剔除, 避免虚假
+# 拉高 2025-04-07 的冠军排名(未剔除时该基金显示 +88.76%近3月涨幅夺冠,
+# 剔除后仅 +11.87%, 真实冠军应为鹏华碳中和主题混合C +46.64%)。
+NAV_ANOMALIES = {
+    "014939": [(pd.Timestamp("2025-03-31"), 1.6249 / 0.9630)],
+}
+
+
+def _apply_nav_anomaly(code, date, nav):
+    """对已知异常基金, 剔除 date 当天起的净值跳变(返回修正后的 nav)."""
+    for anomaly_date, ratio in NAV_ANOMALIES.get(code, []):
+        if pd.Timestamp(date) >= anomaly_date:
+            nav = nav / ratio
+    return nav
+
 
 def get_conn():
     return sqlite3.connect(DB, check_same_thread=False, timeout=30)
@@ -58,7 +78,8 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None):
 
     # 更直接的方法: 取每只基金在窗口内的首尾净值
     sql = """
-        SELECT t.code, first_nav.nav as anchor_nav, last_nav.nav as end_nav
+        SELECT t.code, t.first_d, t.last_d,
+               first_nav.nav as anchor_nav, last_nav.nav as end_nav
         FROM (
             SELECT code, MIN(date) as first_d, MAX(date) as last_d
             FROM fund_nav_daily
@@ -83,6 +104,13 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None):
         df = df[~df["code"].isin(exclude_codes)]
     if df.empty:
         return None, 0
+
+    # 已核实净值异常(见 NAV_ANOMALIES): 剔除跳变对排名窗口首尾净值的污染
+    if NAV_ANOMALIES:
+        df["anchor_nav"] = df.apply(
+            lambda r: _apply_nav_anomaly(r["code"], r["first_d"], r["anchor_nav"]), axis=1)
+        df["end_nav"] = df.apply(
+            lambda r: _apply_nav_anomaly(r["code"], r["last_d"], r["end_nav"]), axis=1)
 
     df["ret"] = (df["end_nav"] / df["anchor_nav"] - 1.0) * 100
     best = df.loc[df["ret"].idxmax()]
@@ -121,11 +149,12 @@ def compute_beta(conn, sse_df, code, buy_date):
 
 
 def get_fund_nav_after(conn, code, from_date):
-    """获取基金从 from_date 起的净值序列 [(date, nav), ...]"""
+    """获取基金从 from_date 起的净值序列 [(date, nav), ...] (已按 NAV_ANOMALIES 修正)"""
     rows = conn.execute(
         "SELECT date, nav FROM fund_nav_daily WHERE code=? AND date>=? ORDER BY date",
         (code, from_date.strftime("%Y-%m-%d"))).fetchall()
-    return [(pd.Timestamp(r[0]), float(r[1])) for r in rows if r[1]]
+    return [(pd.Timestamp(r[0]), _apply_nav_anomaly(code, r[0], float(r[1])))
+            for r in rows if r[1]]
 
 
 def run_backtest():
@@ -245,10 +274,10 @@ def run_backtest():
                     (code, day_str)).fetchone()
                 if not row2:
                     continue
-                buy_nav = float(row2[1])
+                buy_nav = _apply_nav_anomaly(code, row2[0], float(row2[1]))
                 actual_buy_date = pd.Timestamp(row2[0])
             else:
-                buy_nav = float(row[0])
+                buy_nav = _apply_nav_anomaly(code, day, float(row[0]))
                 actual_buy_date = day
 
             beta = compute_beta(conn, sse, code, day_str)
@@ -285,7 +314,7 @@ def run_backtest():
             (position["code"],)).fetchone()
         if row and row[1]:
             last_date = pd.Timestamp(row[0])
-            last_nav = float(row[1])
+            last_nav = _apply_nav_anomaly(position["code"], row[0], float(row[1]))
             ret_pct = (last_nav / position["buy_nav"] - 1) * 100
             hold_days = (last_date - position["buy_date"]).days
             # 同期上证
