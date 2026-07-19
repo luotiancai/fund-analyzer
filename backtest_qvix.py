@@ -32,8 +32,13 @@ def load_cached_json(conn, key):
     return df
 
 
-def find_champion_on_date(conn, asof_date):
-    """找 asof_date 前一交易日的近3月冠军. 返回 (code, ret_3m)."""
+def find_champion_on_date(conn, asof_date, exclude_codes=None):
+    """找 asof_date 前一交易日的近3月冠军(排除 exclude_codes). 返回 (code, ret_3m).
+
+    exclude_codes 用于剔除 QDII 等跟踪境外市场、与大盘弱相关的基金——
+    策略买入逻辑建立在"大盘恐慌信号→买入国内动量最强标的"上, QDII 收益
+    与 QVIX/大盘走势脱钩, 选入冠军池会削弱大盘回撤线对该笔仓位的意义。
+    """
     end = pd.Timestamp(asof_date)
     start = end - timedelta(days=91)
     grace = start - timedelta(days=10)
@@ -74,6 +79,8 @@ def find_champion_on_date(conn, asof_date):
     df["end_nav"] = pd.to_numeric(df["end_nav"], errors="coerce")
     df = df.dropna()
     df = df[(df["anchor_nav"] > 0) & (df["end_nav"] > 0)]
+    if exclude_codes:
+        df = df[~df["code"].isin(exclude_codes)]
     if df.empty:
         return None, 0
 
@@ -135,6 +142,9 @@ def run_backtest():
             c = item.get("code", "")
             fund_names[c] = item.get("name", c)
             fund_types[c] = item.get("type", "")
+
+    # QDII 跟踪境外市场, 与 QVIX/大盘恐慌-反弹逻辑脱钩, 排除出冠军候选池
+    qdii_codes = {c for c, t in fund_types.items() if "QDII" in t}
 
     # Load QVIX with threshold
     print("加载数据...")
@@ -227,7 +237,7 @@ def run_backtest():
         # ── Step 2: 空仓(含当天刚卖出)且为信号日时买入 ──
         if position is None and day in signal_map:
             threshold = signal_map[day]
-            code, ret_3m = find_champion_on_date(conn, day_str)
+            code, ret_3m = find_champion_on_date(conn, day_str, qdii_codes)
             if code is None:
                 continue
 
