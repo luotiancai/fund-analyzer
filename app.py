@@ -1570,17 +1570,6 @@ with tab_ndx:
                     name="恐慌阈值(3年95分位)", yaxis="y2",
                     line=dict(color="#8e44ad", width=1.2, dash="dash"),
                     hovertemplate="恐慌阈值 %{y:.2f}<extra></extra>"))
-            # 20 预警 / 30 恐慌,美股 VIX 的常用阈值。
-            for _lvl2, _dash2 in ((20, "dot"), (30, "dash")):
-                fig_ndx.add_shape(
-                    type="line", xref="paper", x0=0, x1=1,
-                    yref="y2", y0=_lvl2, y1=_lvl2,
-                    line=dict(color="#8e44ad", width=1, dash=_dash2),
-                    opacity=0.6)
-                fig_ndx.add_annotation(
-                    x=1, xref="paper", xanchor="left", y=_lvl2, yref="y2",
-                    text=str(_lvl2), showarrow=False,
-                    font=dict(size=10, color="#8e44ad"))
 
         fig_ndx.update_layout(
             hovermode="x unified", hoverdistance=-1, spikedistance=-1)
