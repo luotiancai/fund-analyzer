@@ -1429,6 +1429,114 @@ with tab_sse:
             # 反而丢掉恐慌后反弹守利润的功能。重议条件:QVIX 中枢驻留 35+。
             st.caption("大盘 5% 线 ≈ 常态波动率(QVIX 20)下的 4 倍日σ;"
                        "12 次触发回测为 3%~10% 网格最优,详见代码注释。")
+
+            # ── Beta 计算:买入日前91天窗口内,基金日收益率对上证的 OLS 斜率 ──
+            import re as _re
+            _review_buy_dates = [
+                "2019-02-25", "2019-05-06",
+                "2020-02-03", "2020-03-12", "2020-03-18",
+                "2020-07-16", "2022-04-25", "2024-02-02", "2024-09-27",
+                "2024-10-09", "2025-04-07", "2026-03-23"]
+            _review_champions = [
+                "前海开源价值成长混合C (006217)",
+                "前海开源中国稀缺资产混合C (002079)",
+                "万家经济新动能C (005312)",
+                "汇丰晋信智造先锋股票C (001644)",
+                "万家经济新动能C (005312)",
+                "汇丰晋信智造先锋股票C (001644)",
+                "招商中证煤炭等权指数C (013596)",
+                "万家精选混合C (015566)",
+                "西部利得新动力混合C (673073)",
+                "中欧北证50成份指数C (021299)",
+                "鹏华碳中和主题混合C (016531)",
+                "广发远见智选混合C (016874)"]
+
+            @st.cache_data(ttl=86400, show_spinner=False)
+            def _compute_review_betas(buy_dates, champion_names):
+                """买入日前91天窗口:基金日收益率对上证日收益率的 Beta。"""
+                _sse = load_sse_daily()
+                if _sse is None or _sse.empty:
+                    return [None] * len(buy_dates)
+                _sse["date"] = pd.to_datetime(_sse["date"])
+                _sse = _sse.set_index("date").sort_index()
+                _sse_ret = _sse["close"].pct_change().dropna()
+
+                betas = []
+                for _bd, _name in zip(buy_dates, champion_names):
+                    _code = _re.search(r"\((\d{6})\)", _name)
+                    if not _code:
+                        betas.append(None)
+                        continue
+                    _code = _code.group(1)
+                    _nav = load_nav(_code)
+                    if _nav is None or _nav.empty:
+                        betas.append(None)
+                        continue
+                    _nav["date"] = pd.to_datetime(_nav["date"])
+                    _nav = _nav.sort_values("date").set_index("date")
+                    _end = pd.Timestamp(_bd)
+                    _start = _end - pd.Timedelta(days=91)
+                    _nav_w = _nav.loc[_start:_end - pd.Timedelta(days=1)]
+                    if len(_nav_w) < 20:
+                        betas.append(None)
+                        continue
+                    _f_ret = pd.to_numeric(_nav_w["nav"], errors="coerce") \
+                        .pct_change().dropna()
+                    _f_ret.index = _f_ret.index.normalize()
+                    # 对齐日期
+                    _common = _f_ret.index.intersection(_sse_ret.index)
+                    if len(_common) < 20:
+                        betas.append(None)
+                        continue
+                    _fr = _f_ret.loc[_common].values
+                    _mr = _sse_ret.loc[_common].values
+                    _cov = np.cov(_fr, _mr)
+                    _var = _cov[1, 1]
+                    if _var == 0 or np.isnan(_var):
+                        betas.append(None)
+                    else:
+                        betas.append(round(float(_cov[0, 1] / _var), 2))
+                return betas
+
+            _betas = _compute_review_betas(_review_buy_dates, _review_champions)
+
+            # ── 买入当天恐慌阈值(QVIX 3年95分位) + 基金回撤控制线 ──
+            @st.cache_data(ttl=86400, show_spinner=False)
+            def _compute_review_qvix_thresholds(buy_dates):
+                """QVIX 滚动3年95分位阈值在每个买入日的值。"""
+                _qvix = load_qvix_daily()
+                if _qvix is None or _qvix.empty:
+                    return [None] * len(buy_dates)
+                _qf = _qvix.copy()
+                _qf["date"] = pd.to_datetime(_qf["date"])
+                _qf = _qf.sort_values("date").reset_index(drop=True)
+                _qf["thr"] = _qf["close"].rolling(
+                    720, min_periods=240).quantile(0.95)
+                _qf = _qf.set_index("date")
+                result = []
+                for _bd in buy_dates:
+                    _ts = pd.Timestamp(_bd)
+                    # 取该日或之前最近的阈值
+                    _before = _qf.loc[:_ts]
+                    if _before.empty or pd.isna(_before["thr"].iloc[-1]):
+                        result.append(None)
+                    else:
+                        result.append(round(float(_before["thr"].iloc[-1]), 2))
+                return result
+
+            _qvix_thrs = _compute_review_qvix_thresholds(_review_buy_dates)
+
+            # 基金最大回撤范围控制 = 恐慌阈值 / 5 × Beta
+            _mdd_ctrl = [
+                round(t / 5.0 * b, 2) if (t is not None and b is not None) else None
+                for t, b in zip(_qvix_thrs, _betas)
+            ]
+            # 大盘最大允许回撤 = 恐慌阈值 / 5
+            _sse_dd_limit = [
+                round(t / 5.0, 2) if t is not None else None
+                for t in _qvix_thrs
+            ]
+
             st.dataframe(pd.DataFrame({
                 "买入日": ["2019-02-25", "2019-05-06",
                           "2020-02-03", "2020-03-12", "2020-03-18",
@@ -1451,6 +1559,10 @@ with tab_sse:
                         "混合型-偏股", "股票型", "指数型-股票(煤炭)",
                         "混合型-偏股(煤炭价值)", "混合型-灵活", "指数型-股票(北证50)",
                         "混合型-偏股(机器人)", "混合型-偏股"],
+                "Beta(近3月)": _betas,
+                "恐慌阈值": _qvix_thrs,
+                "回撤控制线(%)": _mdd_ctrl,
+                "大盘回撤线(%)": _sse_dd_limit,
                 "冠军近3月涨幅(前日口径)": [
                     "+27.48%", "+49.28%", "+45.41%",
                     "+38.48%", "+25.72%", "+56.07%", "+21.37%", "+13.61%",
