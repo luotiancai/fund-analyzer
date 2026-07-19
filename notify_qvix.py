@@ -70,10 +70,14 @@ def _qvix_now():
     return float(last["qvix"]), str(last["time"])
 
 
-def _threshold():
-    """滚动3年95分位阈值(日线缓存截至昨日)。"""
+def _threshold(today: str):
+    """滚动3年95分位阈值,窗口截至昨日——显式剔除今天的行,
+    防止 optbbs 日线接口盘中吐出当天数据混进分位窗口。"""
     q = fetcher.fetch_qvix_daily()
-    if q is None or len(q) < 240:
+    if q is None:
+        return None
+    q = q[q["date"] < today]
+    if len(q) < 240:
         return None
     return float(q["close"].rolling(720, min_periods=240)
                  .quantile(0.95).iloc[-1])
@@ -103,7 +107,7 @@ def main():
         return
 
     qvix, qtime = _qvix_now()
-    thr = _threshold()
+    thr = _threshold(today)
     if thr is None:
         log.error("阈值计算失败")
         sys.exit(1)
