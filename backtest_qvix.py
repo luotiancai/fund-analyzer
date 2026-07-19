@@ -56,6 +56,40 @@ def load_cached_json(conn, key):
     return df
 
 
+# 净值僵化-补涨检测参数: 排名窗口内连续 STALE_MIN_RUN 天|日收益率|<
+# STALE_FLAT_EPS(净值近乎不动, 不像有股票仓位的基金该有的波动), 紧接着
+# 单日|收益率|>STALE_JUMP_THRESH 的补涨/补跌跳变——判断为净值长期未按
+# 市值更新、事后集中补记(如 002631 2024-01-30 前连续9个交易日涨跌幅
+# 全部<0.05%, 随后单日+15.66%补涨, 直连东财源头核对非缓存问题, 但该
+# 基金全历史波动率其实正常, 只在这段窗口反常, 原因未知)。命中的基金
+# 从冠军候选池整体剔除, 而不是像 014939 那样单点修正——这类模式此前
+# 未必只出现过一次, 与 effective_daily_ret 的单日>30%硬过滤是两种不同
+# 场景, 互不替代。
+STALE_FLAT_EPS = 0.0005
+STALE_MIN_RUN = 5
+STALE_JUMP_THRESH = 0.08
+
+
+def _has_stale_catchup(conn, code, window_start, window_end):
+    """排名窗口 [window_start, window_end] 内是否出现净值僵化-补涨模式."""
+    df = pd.read_sql_query(
+        "SELECT date, nav FROM fund_nav_daily WHERE code=? AND date>=? AND date<=? ORDER BY date",
+        conn, params=(code, window_start.strftime("%Y-%m-%d"), window_end.strftime("%Y-%m-%d")))
+    if len(df) < STALE_MIN_RUN + 1:
+        return False
+    df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
+    ret = df["nav"].pct_change().dropna().values
+    run = 0
+    for r in ret:
+        if abs(r) < STALE_FLAT_EPS:
+            run += 1
+            continue
+        if run >= STALE_MIN_RUN and abs(r) > STALE_JUMP_THRESH:
+            return True
+        run = 0
+    return False
+
+
 def find_champion_on_date(conn, asof_date, exclude_codes=None):
     """找 asof_date 当天视角下的近3月冠军(排除 exclude_codes). 返回 (code, ret_3m).
 
@@ -69,6 +103,8 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None):
     exclude_codes 用于剔除 QDII 等跟踪境外市场、与大盘弱相关的基金——
     策略买入逻辑建立在"大盘恐慌信号→买入国内动量最强标的"上, QDII 收益
     与 QVIX/大盘走势脱钩, 选入冠军池会削弱大盘回撤线对该笔仓位的意义。
+    命中净值僵化-补涨模式(见 _has_stale_catchup)的基金也一并跳过, 逐个
+    往下找下一名, 直到选出一个数据正常的真实冠军。
     """
     metrics = fetcher.compute_metrics_asof(asof_date, cols={"ret_3m"})
     if not metrics:
@@ -80,8 +116,16 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None):
     }
     if not candidates:
         return None, 0
-    best_code = max(candidates, key=candidates.get)
-    return best_code, round(candidates[best_code], 2)
+
+    end = pd.Timestamp(asof_date)
+    window_end = end - timedelta(days=1)
+    window_start = end - timedelta(days=101)
+
+    for code in sorted(candidates, key=candidates.get, reverse=True):
+        if _has_stale_catchup(conn, code, window_start, window_end):
+            continue
+        return code, round(candidates[code], 2)
+    return None, 0
 
 
 def compute_beta(conn, sse_df, code, buy_date):
