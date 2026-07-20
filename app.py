@@ -298,10 +298,14 @@ with tab_table:
         with col_f2:
             period_label = st.selectbox("时间区间", options=list(PERIODS.keys()), index=3)
         with col_f3:
-            min_ret = st.number_input("所选区间最低收益率 %", value=50.0, step=1.0)
+            min_ret = st.number_input(
+                "所选区间最低收益率 %", value=None, step=1.0,
+                placeholder="不限",
+            )
         with col_f4:
             max_dd = st.number_input(
-                "所选区间最大回撤率 %", value=15.0, min_value=0.0, step=1.0,
+                "所选区间最大回撤率 %", value=None, min_value=0.0, step=1.0,
+                placeholder="不限",
             )
         with col_f5:
             asof_date = st.date_input(
@@ -524,10 +528,9 @@ with tab_table:
                 )
                 filtered = filtered[~_too_young].drop(columns=["first_nav_date"])
 
-            if ret_col in filtered.columns:
-                # Only keep funds that actually have a return for the selected
-                # period; NaN is dropped — this is also what excludes too-young
-                # funds that have no local NAV (rank list leaves the column blank).
+            if min_ret is not None and ret_col in filtered.columns:
+                # NaN is dropped when this filter is active — the threshold
+                # can't be evaluated for funds with no return in the period.
                 filtered = filtered[
                     pd.to_numeric(filtered[ret_col], errors="coerce") >= min_ret]
 
@@ -535,7 +538,7 @@ with tab_table:
 
             # Drawdown filter. Funds without a computed drawdown (e.g. younger than
             # the window) are kept rather than hidden.
-            if max_dd < 100 and mdd_col in display.columns:
+            if max_dd is not None and mdd_col in display.columns:
                 dd_pct = pd.to_numeric(display[mdd_col], errors="coerce") * 100
                 display = display[dd_pct.isna() | (dd_pct <= max_dd)]
 
@@ -569,7 +572,7 @@ with tab_table:
         st.caption(
             f"共 {_total:,} 条匹配（基金总量 {len(fund_df):,}）· 显示并缓存前 {len(table)} 条"
         )
-        if max_dd < 100 and mdd_col not in display.columns:
+        if max_dd is not None and mdd_col not in display.columns:
             st.caption("⚠️ 暂无回撤数据。请点击「🔄 更新数据」生成。")
 
     if table is None:
