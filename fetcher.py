@@ -5,6 +5,7 @@ import os
 import sqlite3
 import json
 import re
+import threading
 import time
 import logging
 import numpy as np
@@ -1101,13 +1102,30 @@ INDEX_START = "2015-01-01"
 def _fetch_with_timeout(fn, timeout=8):
     """akshare 这两个指数源(pd.read_csv 直连 http)不带超时参数,源站一旦
     卡住会挂起几分钟不报错,把整个 Streamlit rerun 一起拖死。用后台线程
-    强制掐表,超时立刻放弃转走"陈旧缓存兜底"这条已有路径;不等线程收尾
-    (它迟早自己读完或报错退出,不影响后续请求)。"""
-    ex = ThreadPoolExecutor(max_workers=1)
-    try:
-        return ex.submit(fn).result(timeout=timeout)
-    finally:
-        ex.shutdown(wait=False)
+    强制掐表,超时立刻放弃转走"陈旧缓存兜底"这条已有路径。
+
+    用 threading.Thread(daemon=True) 而非 ThreadPoolExecutor:后者的 worker
+    是非 daemon 线程,会被 concurrent.futures 注册的 atexit 钩子 join,一次性
+    脚本(notify_qvix.py)进程退出时会被晾着的慢线程拖到它读完为止——实测
+    把 8 秒超时拖成了 2 分钟。daemon 线程不受这个 atexit 影响,解释器可以
+    直接退出、不等它。"""
+    result: list = []
+    error: list = []
+
+    def _run():
+        try:
+            result.append(fn())
+        except Exception as e:  # noqa: BLE001 — 转交给等待方
+            error.append(e)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(f"fetch exceeded {timeout}s")
+    if error:
+        raise error[0]
+    return result[0]
 
 
 def fetch_sse_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:

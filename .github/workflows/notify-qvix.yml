@@ -7,10 +7,16 @@ on:
     - cron: "15 6 * * 1-5"
   workflow_dispatch: {}   # 手动触发测试用(手动跑不等待,立即推)
 
+permissions:
+  contents: write   # gh release upload 需要(回写刷新后的 QVIX 缓存)
+
 jobs:
   notify:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      FUND_ANALYZER_DATA: ${{ github.workspace }}/.data
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -18,6 +24,13 @@ jobs:
           python-version: "3.12"
       - name: 安装依赖(不装 streamlit)
         run: pip install --quiet requests pandas numpy akshare
+      - name: 取回数据库(Release tag data,否则每次空跑都要现场活取QVIX历史)
+        run: |
+          mkdir -p "$FUND_ANALYZER_DATA"
+          gh release download data --pattern fund_cache.db.gz \
+               --output db.gz --repo "$GITHUB_REPOSITORY" \
+            && gunzip -c db.gz > "$FUND_ANALYZER_DATA/fund_cache.db" && rm db.gz \
+            || echo "::warning::release 不存在或下载失败,本次仍会现场活取"
       - name: 推送 QVIX 与恐慌阈值
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -25,3 +38,9 @@ jobs:
           MAIL_TO: 506804924@qq.com
           WAIT_UNTIL_CST: ${{ github.event_name == 'schedule' && '14:40' || '' }}
         run: python notify_qvix.py
+      - name: 回传刷新后的数据库(仅当本次成功拿到新 QVIX 数据)
+        if: success()
+        run: |
+          gzip -9 -c "$FUND_ANALYZER_DATA/fund_cache.db" > fund_cache.db.gz
+          gh release upload data fund_cache.db.gz --clobber \
+            --repo "$GITHUB_REPOSITORY" || true
