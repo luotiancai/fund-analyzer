@@ -144,8 +144,12 @@ def compute_beta(conn, sse_df, code, buy_date):
         return 1.0
     nav_df["nav"] = pd.to_numeric(nav_df["nav"], errors="coerce")
     f_ret = nav_df["nav"].pct_change().dropna().values
-    # 剔除净值重置/份额折算等技术性跳变(单日|收益率|>20%非真实市场波动)
-    f_ret = f_ret[np.abs(f_ret) <= 0.20]
+    # 剔除净值重置/份额折算等技术性跳变(单日|收益率|>35%非真实市场波动)。
+    # 阈值定在35%: 北交所个股涨跌幅上限±30%, 021299 2024-09-30/10-08 曾真实
+    # 单日+21.9%/+25.2%(924行情后北证50补涨, 广发017513同日+22.5%/+25.6%
+    # 交叉验证非脏数据), 20%阈值曾把这两天真实波动误判成技术性跳变, 把该
+    # 笔波动率比值从~2.6压到1.19。35%仍能拦住014939那种+68.7%的净值断层。
+    f_ret = f_ret[np.abs(f_ret) <= 0.35]
 
     sse_w = sse_df[(sse_df["date"] >= start) & (sse_df["date"] < end)]
     m_ret = sse_w["close"].pct_change().dropna().values
