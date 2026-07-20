@@ -1289,17 +1289,10 @@ with tab_sse:
         sse_all["date"] = pd.to_datetime(sse_all["date"])
         sse_all = sse_all.sort_values("date").reset_index(drop=True)
 
-        # MACD(12,26,9) 基于收盘点位算,在全量历史上算 EMA 再切窗口显示——
-        # 窗口越短 EMA 越失真(冷启动偏差),跟 QVIX 恐慌阈值的处理方式一致。
-        _ema12 = sse_all["close"].ewm(span=12, adjust=False).mean()
-        _ema26 = sse_all["close"].ewm(span=26, adjust=False).mean()
-        sse_all["dif"] = _ema12 - _ema26
-        sse_all["dea"] = sse_all["dif"].ewm(span=9, adjust=False).mean()
-
         _sse_ranges = {"近1月": 30, "近3月": 91, "近6月": 182,
                        "近1年": 365, "近3年": 365 * 3, "近5年": 365 * 5,
                        "近10年": 365 * 10, "全部": None}
-        _c_rng, _c_bands, _c_vix, _c_macd = st.columns([4, 1, 1, 1.2])
+        _c_rng, _c_bands, _c_vix = st.columns([4, 1, 1])
         with _c_rng:
             _rng = st.radio("时间区间", list(_sse_ranges.keys()), index=3,
                             horizontal=True, key="sse_range")
@@ -1311,10 +1304,6 @@ with tab_sse:
             _show_vix = st.checkbox("VIX恐慌指数", value=True,
                                     key="sse_vix",
                                     help="50ETF期权QVIX（中国版VIX），右轴")
-        with _c_macd:
-            _show_macd = st.checkbox("MACD(DIF/DEA)", value=False,
-                                     key="sse_macd",
-                                     help="12/26/9参数,基于上证收盘点位算,右轴")
 
         # Window slice keeps the anchor row (last close on/before the window
         # start) so the period change is measured against the true base point —
@@ -1392,28 +1381,6 @@ with tab_sse:
                     name="恐慌阈值(3年95分位)", yaxis="y2",
                     line=dict(color="#8e44ad", width=1.2, dash="dash"),
                     hovertemplate="恐慌阈值 %{y:.2f}<extra></extra>"))
-
-        if _show_macd:
-            fig_sse.data[0].name = "上证指数"
-            fig_sse.data[0].showlegend = True
-            fig_sse.add_trace(go.Scatter(
-                x=view["date"], y=view["dif"], name="MACD DIF", yaxis="y3",
-                line=dict(color="#2ca02c", width=1.2),
-                hovertemplate="DIF %{y:.2f}<extra></extra>"))
-            fig_sse.add_trace(go.Scatter(
-                x=view["date"], y=view["dea"], name="MACD DEA", yaxis="y3",
-                line=dict(color="#d62728", width=1.2, dash="dot"),
-                hovertemplate="DEA %{y:.2f}<extra></extra>"))
-            if _show_vix:
-                # 两条右轴同时存在时用 free 轴错开位置, 避免刻度重叠。
-                fig_sse.update_layout(
-                    xaxis=dict(domain=[0, 0.88]),
-                    yaxis3=dict(title="MACD", overlaying="y", side="right",
-                                anchor="free", position=1.0, showgrid=False))
-            else:
-                fig_sse.update_layout(
-                    yaxis3=dict(title="MACD", overlaying="y", side="right",
-                                showgrid=False))
 
         if _show_bands:
             _add_sse_drop_bands(fig_sse, sse_df,
