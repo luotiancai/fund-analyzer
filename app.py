@@ -1304,7 +1304,7 @@ with tab_sse:
             _rng = st.radio("时间区间", list(_sse_ranges.keys()), index=3,
                             horizontal=True, key="sse_range")
         with _c_bands:
-            _show_bands = st.checkbox("标记跌超1%的交易日", value=True,
+            _show_bands = st.checkbox("标记跌超1%的交易日", value=False,
                                       key="sse_bands",
                                       help="长区间下标记较密，可关闭")
         with _c_vix:
@@ -1312,7 +1312,7 @@ with tab_sse:
                                     key="sse_vix",
                                     help="50ETF期权QVIX（中国版VIX），右轴")
         with _c_macd:
-            _show_macd = st.checkbox("MACD(DIF/DEA)", value=True,
+            _show_macd = st.checkbox("MACD(DIF/DEA)", value=False,
                                      key="sse_macd",
                                      help="12/26/9参数,基于上证收盘点位算,右轴")
 
