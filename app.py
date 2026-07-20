@@ -157,12 +157,12 @@ def load_fund_metrics(code: str, rf: float):
     return fetcher.compute_sharpe_for_fund(code, rf=rf)
 
 
-@st.cache_data(ttl=12 * 3600, show_spinner=False)
+@st.cache_data(ttl=12 * 3600, show_spinner="正在加载上证指数数据…")
 def load_sse_daily():
     return fetcher.fetch_sse_daily()
 
 
-@st.cache_data(ttl=12 * 3600, show_spinner=False)
+@st.cache_data(ttl=12 * 3600, show_spinner="正在加载VIX恐慌指数数据…")
 def load_qvix_daily():
     return fetcher.fetch_qvix_daily()
 

@@ -1098,6 +1098,18 @@ _INDEX_TTL = 12 * 3600
 INDEX_START = "2015-01-01"
 
 
+def _fetch_with_timeout(fn, timeout=8):
+    """akshare 这两个指数源(pd.read_csv 直连 http)不带超时参数,源站一旦
+    卡住会挂起几分钟不报错,把整个 Streamlit rerun 一起拖死。用后台线程
+    强制掐表,超时立刻放弃转走"陈旧缓存兜底"这条已有路径;不等线程收尾
+    (它迟早自己读完或报错退出,不影响后续请求)。"""
+    ex = ThreadPoolExecutor(max_workers=1)
+    try:
+        return ex.submit(fn).result(timeout=timeout)
+    finally:
+        ex.shutdown(wait=False)
+
+
 def fetch_sse_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     """上证指数 daily history from NAV_START, cache-first (12h TTL).
 
@@ -1124,7 +1136,7 @@ def fetch_sse_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
         # Sina source (stock_zh_index_daily): the EastMoney push2 host is
         # blocked by some proxies. No 涨跌幅 column — derive from closes
         # over the full history, then cut to NAV_START.
-        raw = ak.stock_zh_index_daily(symbol="sh000001")
+        raw = _fetch_with_timeout(lambda: ak.stock_zh_index_daily(symbol="sh000001"))
         df = pd.DataFrame({
             "date": pd.to_datetime(raw["date"]).dt.strftime("%Y-%m-%d"),
             "close": pd.to_numeric(raw["close"], errors="coerce"),
@@ -1170,7 +1182,7 @@ def fetch_qvix_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
 
     df = None
     try:
-        raw = ak.index_option_50etf_qvix()
+        raw = _fetch_with_timeout(ak.index_option_50etf_qvix)
         df = pd.DataFrame({
             "date": pd.to_datetime(raw["date"]).dt.strftime("%Y-%m-%d"),
             "close": pd.to_numeric(raw["close"], errors="coerce"),
