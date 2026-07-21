@@ -56,45 +56,49 @@ def _get_rf() -> float:
 # 应用启动时/每小时比对 asset 的 updated_at,变了才重新下载(~gzip 压缩传输)。
 # 本地开发机(库已存在且无 marker 文件)完全跳过,零网络开销。
 # marker 同时充当"云端只读模式"开关:存在则隐藏「更新数据」按钮。
-_DB_RELEASE_API = ("https://api.github.com/repos/luotiancai/fund-analyzer/"
-                   "releases/tags/data")
+_DB_ASSET_URL = ("https://github.com/luotiancai/fund-analyzer/"
+                 "releases/download/data/fund_cache.db.gz")
 _DB_MARKER = fetcher.CACHE_DB + ".from-release"
 
 
 @st.cache_resource(ttl=3600, show_spinner="正在同步云端数据库…")
 def _sync_db_from_release() -> bool:
     """确保数据库就位;返回是否运行在 Release 快照上(云端只读模式)。"""
-    have_db = os.path.exists(fetcher.CACHE_DB)
+    # 空壳库(引导失败后 _init_db_once 建的,仅几十KB)不算"本地自有",
+    # 照常走同步——否则一次引导失败就把应用永久卡在空库本地模式,
+    # 页面表现为基金列表空、QVIX 不可用、「更新数据」按钮在云端露出。
+    have_db = (os.path.exists(fetcher.CACHE_DB)
+               and os.path.getsize(fetcher.CACHE_DB) > 1024 * 1024)
     if have_db and not os.path.exists(_DB_MARKER):
         return False                     # 本地自有数据库,不碰
     try:
-        r = requests.get(_DB_RELEASE_API, timeout=30,
-                         headers={"Accept": "application/vnd.github+json"})
-        r.raise_for_status()
-        asset = next(a for a in r.json()["assets"]
-                     if a["name"] == "fund_cache.db.gz")
+        # 直连下载地址(302 到对象存储),不走 api.github.com:未认证 API
+        # 每 IP 每小时限 60 次,Streamlit Cloud 出口 IP 共享极易 403,
+        # 引导一失败就退成空库。用响应头 ETag 当版本戳,没变就不重下。
+        dl = requests.get(_DB_ASSET_URL, stream=True, timeout=600)
+        dl.raise_for_status()
     except Exception:
-        return have_db                   # API 不通:有旧快照就先用着
-    stamp = asset["updated_at"]
-    if have_db and open(_DB_MARKER).read().strip() == stamp:
-        return True
-    tmp = fetcher.CACHE_DB + ".tmp"
-    try:
-        with requests.get(asset["browser_download_url"], stream=True,
-                          timeout=600) as dl:
-            dl.raise_for_status()
+        return have_db                   # 拉不到:有旧快照就先用着
+    with dl:
+        stamp = (dl.headers.get("ETag")
+                 or dl.headers.get("Last-Modified") or "")
+        if (have_db and stamp
+                and open(_DB_MARKER).read().strip() == stamp):
+            return True                  # 版本没变,提前断开不下载
+        tmp = fetcher.CACHE_DB + ".tmp"
+        try:
             with open(tmp, "wb") as f, gzip.GzipFile(fileobj=dl.raw) as gz:
                 shutil.copyfileobj(gz, f)
-        os.replace(tmp, fetcher.CACHE_DB)
-        with open(_DB_MARKER, "w") as m:
-            m.write(stamp)
-        return True
-    except Exception:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        if have_db:
-            return True                  # 下载失败:继续用旧快照
-        raise
+            os.replace(tmp, fetcher.CACHE_DB)
+            with open(_DB_MARKER, "w") as m:
+                m.write(stamp)
+            return True
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            if have_db:
+                return True              # 下载失败:继续用旧快照
+            raise
 
 
 _IS_CLOUD = _sync_db_from_release()
