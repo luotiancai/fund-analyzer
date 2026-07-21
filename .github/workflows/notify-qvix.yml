@@ -2,18 +2,55 @@ name: QVIX 恐慌指数推送
 
 on:
   schedule:
-    # 06:15 UTC = 北京 14:15;GitHub cron 有分钟级延迟抖动,
-    # 脚本内 WAIT_UNTIL_CST 精确等到 14:40 再取数推送。
-    - cron: "15 6 * * 1-5"
-  workflow_dispatch: {}   # 手动触发测试用(手动跑不等待,立即推)
+    # GitHub 的 schedule 高峰期会迟到几十分钟到数小时,甚至整次丢弃,
+    # 且整点/整刻最拥挤。对策:大幅提前 + 避开整刻 + 双 cron 兜底,
+    # 脚本内 WAIT_UNTIL_CST 精确睡到北京 14:40 再取数推送。
+    - cron: "47 4 * * 1-5"   # 主:04:47 UTC = 北京 12:47
+    - cron: "20 6 * * 1-5"   # 兜底:06:20 UTC = 北京 14:20
+  workflow_dispatch: {}   # 手动触发测试用(手动跑不等待、不去重,立即推)
 
 permissions:
   contents: write   # gh release upload 需要(回写刷新后的 QVIX 缓存)
 
 jobs:
-  notify:
+  guard:
+    # 双 cron 去重:同一天已有更早的定时运行在排队/在跑/已成功,本次就退出。
+    # 已失败的不拦,兜底运行顺带充当重试。手动触发不经过去重。
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    outputs:
+      go: ${{ steps.check.outputs.go }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: 去重检查
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          today=$(date -u +%Y-%m-%d)
+          blockers=$(gh run list --repo "$GITHUB_REPOSITORY" \
+              --workflow notify-qvix.yml --event schedule --limit 10 \
+              --json databaseId,status,conclusion,createdAt \
+            | jq --arg today "$today" --argjson self "${{ github.run_id }}" \
+                '[.[] | select(.databaseId != $self)
+                      | select(.databaseId < $self)
+                      | select(.createdAt | startswith($today))
+                      | select(.status == "queued" or .status == "in_progress"
+                               or .conclusion == "success")] | length')
+          if [ "$blockers" -gt 0 ]; then
+            echo "今天已有 $blockers 个定时运行在排队/在跑/已成功,本次跳过"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  notify:
+    needs: guard
+    if: needs.guard.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    # 主 cron 北京 12:47 启动后要睡到 14:40(约 113 分钟),45 分钟会被杀
+    timeout-minutes: 150
     env:
       FUND_ANALYZER_DATA: ${{ github.workspace }}/.data
       GH_TOKEN: ${{ github.token }}
