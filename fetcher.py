@@ -1092,8 +1092,6 @@ def fetch_holdings(code: str, force_refresh: bool = False) -> Optional[pd.DataFr
 
 # ── Index daily history (上证指数) ────────────────────────────────────────────
 
-_INDEX_TTL = 12 * 3600
-
 # 指数/QVIX 历史起点,独立于基金净值的 NAV_START(2020):图表要看近10年,
 # 取 2015 起同时覆盖 QVIX 全史(2015-02 起)和 2015 股灾样本。
 INDEX_START = "2015-01-01"
@@ -1129,10 +1127,12 @@ def _fetch_with_timeout(fn, timeout=8):
 
 
 def fetch_sse_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
-    """上证指数 daily history from NAV_START, cache-first (12h TTL).
+    """上证指数 daily history from NAV_START, cache-first.
 
-    Columns: date (ISO str), close, pct (daily % change). Serves stale cache
-    when the refresh fails; None only with no cache at all.
+    No time-based expiry — the cache is only refreshed when
+    force_refresh=True, which update_daily.py's 06:00 跑批 does every
+    trading day. Columns: date (ISO str), close, pct (daily % change).
+    Serves stale cache when the refresh fails; None only with no cache at all.
     """
     conn = _conn()
     conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
@@ -1145,7 +1145,7 @@ def fetch_sse_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
         return pd.read_json(io.StringIO(r["data"]), orient="split",
                             dtype=False, convert_dates=False)
 
-    if row and not force_refresh and time.time() - row["saved_at"] < _INDEX_TTL:
+    if row and not force_refresh:
         conn.close()
         return _from_row(row)
 
@@ -1177,11 +1177,12 @@ def fetch_sse_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
 
 
 def fetch_qvix_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
-    """VIX恐慌指数（50ETF期权QVIX，中国版VIX）daily close, cache-first (12h TTL).
+    """VIX恐慌指数（50ETF期权QVIX，中国版VIX）daily close, cache-first.
 
-    Columns: date (ISO str), close. Same stale-cache contract as
-    fetch_sse_daily. CBOE VIX has no akshare source here, so the A股 analog
-    (optbbs QVIX) is used.
+    No time-based expiry — same contract as fetch_sse_daily: only refreshed
+    when force_refresh=True (the daily 跑批). Columns: date (ISO str), close.
+    CBOE VIX has no akshare source here, so the A股 analog (optbbs QVIX) is
+    used.
     """
     conn = _conn()
     conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
@@ -1194,7 +1195,7 @@ def fetch_qvix_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
         return pd.read_json(io.StringIO(r["data"]), orient="split",
                             dtype=False, convert_dates=False)
 
-    if row and not force_refresh and time.time() - row["saved_at"] < _INDEX_TTL:
+    if row and not force_refresh:
         conn.close()
         return _from_row(row)
 
@@ -1219,6 +1220,34 @@ def fetch_qvix_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
         df = _from_row(row)
     conn.close()
     return df
+
+
+def index_daily_saved_at(key: str) -> Optional[float]:
+    """Unix time index_daily_cache[key] ('sse' or 'qvix') was last written,
+    or None if never fetched. Used as an st.cache_data cache-busting key so
+    the app picks up a fresh 跑批 write immediately rather than on a timer."""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
+                 "key TEXT PRIMARY KEY, data TEXT, saved_at REAL)")
+    row = conn.execute(
+        "SELECT saved_at FROM index_daily_cache WHERE key = ?", (key,)
+    ).fetchone()
+    conn.close()
+    return row["saved_at"] if row else None
+
+
+def fetch_qvix_now() -> tuple:
+    """盘中最新 QVIX(optbbs 分钟接口最后一笔)。同 notify_qvix.py 的
+    _qvix_now(),供页面展示实时数字用。返回 (qvix, "HH:MM:SS"),失败为
+    (None, None)。"""
+    try:
+        d = _fetch_with_timeout(ak.index_option_50etf_min_qvix)
+        d = d.dropna(subset=["qvix"])
+        last = d.iloc[-1]
+        return float(last["qvix"]), str(last["time"])
+    except Exception as e:
+        logger.debug("QVIX intraday fetch failed: %s", e)
+        return None, None
 
 
 # ── Daily-batch pipeline ──────────────────────────────────────────────────────

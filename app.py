@@ -161,13 +161,18 @@ def load_fund_metrics(code: str, rf: float):
     return fetcher.compute_sharpe_for_fund(code, rf=rf)
 
 
-@st.cache_data(ttl=12 * 3600, show_spinner="正在加载上证指数数据…")
-def load_sse_daily():
+@st.cache_data(ttl=300, show_spinner=False)
+def load_qvix_now():
+    return fetcher.fetch_qvix_now()
+
+
+@st.cache_data(show_spinner="正在加载上证指数数据…")
+def load_sse_daily(cache_key):
     return fetcher.fetch_sse_daily()
 
 
-@st.cache_data(ttl=12 * 3600, show_spinner="正在加载VIX恐慌指数数据…")
-def load_qvix_daily():
+@st.cache_data(show_spinner="正在加载VIX恐慌指数数据…")
+def load_qvix_daily(cache_key):
     return fetcher.fetch_qvix_daily()
 
 
@@ -275,6 +280,11 @@ for _c in ("ret_1m", "ret_3m", "ret_6m", "ret_1y"):
     if _c in fund_df.columns:
         fund_df[_c] = pd.to_numeric(fund_df[_c], errors="coerce")
 
+# ── 当前 QVIX(盘中,5分钟缓存) ────────────────────────────────────────────────
+_qvix_now, _qvix_now_t = load_qvix_now()
+if _qvix_now is not None:
+    st.caption(f"🌡️ 当前QVIX {_qvix_now:.2f}（{_qvix_now_t} 更新）")
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_table, tab_detail, tab_sim, tab_sse = st.tabs(
     ["📋 基金列表", "🔍 基金详情", "💰 模拟盘", "📈 上证指数"])
@@ -330,7 +340,7 @@ with tab_table:
     # 的 aria-label 解析出日期(streamlit 1.50 固定为英文,如 "Choose
     # Wednesday, July 16th 2026. It's available."),给上证跌超1%的交易日画
     # 红色下划线,悬浮显示当日跌幅。日历关闭时选择器查不到任何格子,零开销。
-    _sse_marks = load_sse_daily()
+    _sse_marks = load_sse_daily(fetcher.index_daily_saved_at("sse"))
     if _sse_marks is not None and not _sse_marks.empty:
         _mk_pct = pd.to_numeric(_sse_marks["pct"], errors="coerce")
         _mk = _sse_marks[_mk_pct <= -1.0]
@@ -856,7 +866,7 @@ with tab_sim:
         def _toast_if_sse_drop(_d):
             # 主要操作信号：落到沪指跌超1%的日子就提示——空仓时没有
             # 持仓图表可看，这条提示是唯一入口。
-            _sse0 = load_sse_daily()
+            _sse0 = load_sse_daily(fetcher.index_daily_saved_at("sse"))
             if _sse0 is not None and not _sse0.empty:
                 _row0 = _sse0[_sse0["date"] == _d]
                 if (not _row0.empty and pd.notna(_row0["pct"].iloc[0])
@@ -1013,7 +1023,7 @@ with tab_sim:
         m5.metric("总收益率", f"{total_pnl / simulator.INITIAL_CAPITAL * 100:+.2f}%")
         # 沪指 stays visible even with no holdings — it's the operating
         # signal; without it an empty-portfolio day hides whether 上证 fell.
-        _sse_all = load_sse_daily()
+        _sse_all = load_sse_daily(fetcher.index_daily_saved_at("sse"))
         if _sse_all is not None and not _sse_all.empty:
             _upto = _sse_all[_sse_all["date"] <= sim_date]
             if not _upto.empty:
@@ -1095,7 +1105,7 @@ with tab_sim:
                     hoverformat="%Y-%m-%d", tickformat="%Y-%m-%d",
                     dtick=max(1, _span_d // 8) * 86400000)
 
-                _add_sse_drop_bands(fig_ret, load_sse_daily(),
+                _add_sse_drop_bands(fig_ret, load_sse_daily(fetcher.index_daily_saved_at("sse")),
                                     _rdates.min(), _rdates.max())
 
                 # Max drawdown since each position's buy date, from the same
@@ -1285,7 +1295,7 @@ with tab_sim:
 
 # ─── Tab 4: SSE index ────────────────────────────────────────────────────────
 with tab_sse:
-    sse_df = load_sse_daily()
+    sse_df = load_sse_daily(fetcher.index_daily_saved_at("sse"))
     if sse_df is None or sse_df.empty:
         st.warning("上证指数数据获取失败，请稍后重试。")
     else:
@@ -1346,7 +1356,7 @@ with tab_sse:
         # incomparable with index points, so it never shares the left scale.
         qvix_view = None
         if _show_vix:
-            _qvix = load_qvix_daily()
+            _qvix = load_qvix_daily(fetcher.index_daily_saved_at("qvix"))
             if _qvix is not None and not _qvix.empty:
                 qvix_view = _qvix.copy()
                 qvix_view["date"] = pd.to_datetime(qvix_view["date"])
