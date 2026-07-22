@@ -1,56 +1,21 @@
 name: QVIX 恐慌指数推送
 
 on:
-  schedule:
-    # GitHub 的 schedule 高峰期会迟到几十分钟到数小时,甚至整次丢弃,
-    # 且整点/整刻最拥挤。对策:大幅提前 + 避开整刻 + 双 cron 兜底,
-    # 脚本内 WAIT_UNTIL_CST 精确睡到北京 14:40 再取数推送。
-    - cron: "47 4 * * 1-5"   # 主:04:47 UTC = 北京 12:47
-    - cron: "20 6 * * 1-5"   # 兜底:06:20 UTC = 北京 14:20
-  workflow_dispatch: {}   # 手动触发测试用(手动跑不等待、不去重,立即推)
+  # GitHub 自己的 schedule 触发器高峰期会迟到几十分钟到数小时甚至整次丢弃
+  # (实测撞过:预定北京 12:47,实际 15:25 才启动,邮件跟着晚点到收盘后才发,
+  # 完全失去"盘中"提醒的意义)。改由外部精确定时服务(如 cron-job.org)在
+  # 北京 14:40 直接调 GitHub API 触发本工作流的 workflow_dispatch——这条
+  # 触发路径不走那条拥堵的 schedule 队列,秒级启动,不再需要脚本内"提前
+  # 启动+睡到点"的补偿或多重 cron 兜底去重。
+  workflow_dispatch: {}
 
 permissions:
   contents: write   # gh release upload 需要(回写刷新后的 QVIX 缓存)
 
 jobs:
-  guard:
-    # 双 cron 去重:同一天已有更早的定时运行在排队/在跑/已成功,本次就退出。
-    # 已失败的不拦,兜底运行顺带充当重试。手动触发不经过去重。
-    runs-on: ubuntu-latest
-    outputs:
-      go: ${{ steps.check.outputs.go }}
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: 去重检查
-        id: check
-        run: |
-          if [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "go=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          today=$(date -u +%Y-%m-%d)
-          blockers=$(gh run list --repo "$GITHUB_REPOSITORY" \
-              --workflow notify-qvix.yml --event schedule --limit 10 \
-              --json databaseId,status,conclusion,createdAt \
-            | jq --arg today "$today" --argjson self "${{ github.run_id }}" \
-                '[.[] | select(.databaseId != $self)
-                      | select(.databaseId < $self)
-                      | select(.createdAt | startswith($today))
-                      | select(.status == "queued" or .status == "in_progress"
-                               or .conclusion == "success")] | length')
-          if [ "$blockers" -gt 0 ]; then
-            echo "今天已有 $blockers 个定时运行在排队/在跑/已成功,本次跳过"
-            echo "go=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "go=true" >> "$GITHUB_OUTPUT"
-          fi
-
   notify:
-    needs: guard
-    if: needs.guard.outputs.go == 'true'
     runs-on: ubuntu-latest
-    # 主 cron 北京 12:47 启动后要睡到 14:40(约 113 分钟),45 分钟会被杀
-    timeout-minutes: 150
+    timeout-minutes: 10
     env:
       FUND_ANALYZER_DATA: ${{ github.workspace }}/.data
       GH_TOKEN: ${{ github.token }}
@@ -73,7 +38,6 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: 506804924@qq.com
-          WAIT_UNTIL_CST: ${{ github.event_name == 'schedule' && '14:40' || '' }}
         run: python notify_qvix.py
       - name: 回传刷新后的数据库(仅当本次成功拿到新 QVIX 数据)
         if: success()

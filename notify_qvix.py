@@ -5,8 +5,12 @@
 缓存(截至昨日)算,是否触发由收件人自己看。新浪实时行情仅用于判断
 当天是否交易日。
 
-跑在 GitHub Actions(见 .github/workflows/notify-qvix.yml),邮件经
-QQ 邮箱 SMTP 直发(自发自收,手机 QQ 邮箱 App 即时提醒),凭据从环境变量读:
+跑在 GitHub Actions(见 .github/workflows/notify-qvix.yml),由外部定时
+服务(如 cron-job.org)在北京 14:40 直接调 GitHub API 触发
+workflow_dispatch——不用 GitHub 自己的 schedule 触发器,那个高峰期能
+迟到几小时(实测撞过),脚本这边也就不用再自带"睡到点"的补偿逻辑。
+邮件经 QQ 邮箱 SMTP 直发(自发自收,手机 QQ 邮箱 App 即时提醒),凭据从
+环境变量读:
   SMTP_USER  发件 QQ 邮箱地址
   SMTP_PASS  QQ 邮箱 SMTP 授权码(设置→账号→开启SMTP服务→生成授权码)
   MAIL_TO    收件人,缺省同 SMTP_USER
@@ -18,7 +22,6 @@ import datetime as dt
 import logging
 import os
 import sys
-import time
 from zoneinfo import ZoneInfo
 
 import requests
@@ -76,8 +79,8 @@ def _threshold(today: str):
 
     force_refresh=True:QVIX 收盘价源发布常常晚于 06:00 跑批(实测某次
     到 06:45 都还没出前一日收盘,得等到 9 点多),不强制刷新就一直用
-    跑批时抓到的旧值,直到次日跑批才补上。这里 12:47/14:20 运行,早已
-    过了发布延迟,顺带当天内自愈,不用等第二天。"""
+    跑批时抓到的旧值,直到次日跑批才补上。这里 14:40 运行,早已过了
+    发布延迟,顺带当天内自愈,不用等第二天。"""
     q = fetcher.fetch_qvix_daily(force_refresh=True)
     if q is None:
         return None
@@ -88,23 +91,7 @@ def _threshold(today: str):
                  .quantile(0.95).iloc[-1])
 
 
-def _wait_until_cst():
-    """WAIT_UNTIL_CST=HH:MM 时睡到北京时间该时刻(已过则立即继续)。
-    给 GitHub Actions 用:cron 有分钟级抖动,提前启动、脚本内精确对时。"""
-    target = os.environ.get("WAIT_UNTIL_CST", "").strip()
-    if not target:
-        return
-    hh, mm = map(int, target.split(":"))
-    now = dt.datetime.now(_CST)
-    goal = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    delta = (goal - now).total_seconds()
-    if delta > 0:
-        log.info("等待至北京时间 %s(%.0f 秒)…", target, delta)
-        time.sleep(delta)
-
-
 def main():
-    _wait_until_cst()
     today = dt.datetime.now(_CST).strftime("%Y-%m-%d")
     quote_date = _sse_quote_date()
     if quote_date != today:
