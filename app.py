@@ -281,7 +281,11 @@ for _c in ("ret_1m", "ret_3m", "ret_6m", "ret_1y"):
         fund_df[_c] = pd.to_numeric(fund_df[_c], errors="coerce")
 
 # ── 当前 QVIX(盘中,5分钟缓存) ────────────────────────────────────────────────
-_qvix_now, _qvix_now_t = load_qvix_now()
+# 装饰性小字,拉取失败(接口变更/限流/部署过渡态等)绝不能带崩整页。
+try:
+    _qvix_now, _qvix_now_t = load_qvix_now()
+except Exception:
+    _qvix_now, _qvix_now_t = None, None
 if _qvix_now is not None:
     st.caption(f"🌡️ 当前QVIX {_qvix_now:.2f}（{_qvix_now_t} 更新）")
 
