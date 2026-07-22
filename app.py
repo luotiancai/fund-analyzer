@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import time
+from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -27,6 +28,17 @@ except Exception:
 
 import fetcher
 import simulator
+
+_CST = ZoneInfo("Asia/Shanghai")
+
+
+def _fmt_cst(ts: float, fmt: str) -> str:
+    """Unix ts → 北京时间字符串,不依赖服务器自身时区(云端容器多半是
+    UTC,time.localtime() 直接用会把 UTC 挂钟时间当北京时间显示,差 8
+    小时却还显得"合理"——比如 22:45 UTC 写成"指标数据更新于…22:45",
+    用户按北京时间读就觉得是昨晚,其实是当天早上6点多)。"""
+    return dt.datetime.fromtimestamp(ts, tz=_CST).strftime(fmt)
+
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -430,7 +442,7 @@ with tab_table:
             _age_h = (time.time() - _last_update) / 3600
             _fresh = "🟢" if _age_h < 30 else "🟠"
             st.caption(
-                f"{_fresh} 指标数据更新于 {time.strftime('%Y-%m-%d %H:%M', time.localtime(_last_update))}"
+                f"{_fresh} 指标数据更新于 {_fmt_cst(_last_update, '%Y-%m-%d %H:%M')}"
                 f"（{_age_h:.0f} 小时前）"
             )
         else:
@@ -467,7 +479,7 @@ with tab_table:
         if _hit is not None:
             table, _fmeta, _fsaved = _hit
             st.caption(
-                f"⚡ 本次筛选命中缓存（{time.strftime('%Y-%m-%d %H:%M', time.localtime(_fsaved))} 计算）"
+                f"⚡ 本次筛选命中缓存（{_fmt_cst(_fsaved, '%Y-%m-%d %H:%M')} 计算）"
                 f" · 共 {_fmeta.get('total', 0):,} 条匹配，显示前 {len(table)} 条"
             )
 
@@ -959,8 +971,7 @@ with tab_sim:
                     st.caption(
                         f"{_a['start_date']} ~ {_a['current_date']} · "
                         f"{_a['n_trades']} 笔交易 · 存于 "
-                        + time.strftime("%m-%d %H:%M",
-                                        time.localtime(_a["saved_at"])))
+                        + _fmt_cst(_a["saved_at"], "%m-%d %H:%M"))
                     a1, a2, a3 = st.columns(3)
                     if a1.button("载入", key=f"arch_load_{_a['id']}",
                                  use_container_width=True):
