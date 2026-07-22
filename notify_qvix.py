@@ -72,8 +72,13 @@ def _qvix_now():
 
 def _threshold(today: str):
     """滚动3年95分位阈值,窗口截至昨日——显式剔除今天的行,
-    防止 optbbs 日线接口盘中吐出当天数据混进分位窗口。"""
-    q = fetcher.fetch_qvix_daily()
+    防止 optbbs 日线接口盘中吐出当天数据混进分位窗口。
+
+    force_refresh=True:QVIX 收盘价源发布常常晚于 06:00 跑批(实测某次
+    到 06:45 都还没出前一日收盘,得等到 9 点多),不强制刷新就一直用
+    跑批时抓到的旧值,直到次日跑批才补上。这里 12:47/14:20 运行,早已
+    过了发布延迟,顺带当天内自愈,不用等第二天。"""
+    q = fetcher.fetch_qvix_daily(force_refresh=True)
     if q is None:
         return None
     q = q[q["date"] < today]
