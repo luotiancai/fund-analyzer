@@ -24,10 +24,15 @@
     公式此时退化成外推而非真正的插值,数学上仍然成立(官方 QVIX 遇到
     同样情况大概率也是同样处理),只是不如"30天被近月/次近月夹住"时
     直觉。
-  - 每次现算要并发发起近 50 个单合约实时报价请求(新浪逐合约接口,没
-    有批量接口可用),偏"抓取密集型",这是免费数据源的结构性限制,不是
-    实现取巧——只在 optbbs 失败时才触发、结果缓存5分钟,可以接受但要
-    知道这个成本。
+  - 每次现算要发起近 50 个单合约实时报价请求(新浪逐合约接口,没有批量
+    接口可用),偏"抓取密集型",这是免费数据源的结构性限制,不是实现
+    取巧。请求之间做了错峰启动(_parallel_fetch 的 stagger 参数)而不是
+    瞬间并发炸出去——新浪这类接口的反爬限流通常按瞬时并发连接数识别,
+    实测 optbbs 全天不可用时这条备用路径会被高频触发(每5分钟一次),
+    错峰能把"看起来像爬虫"的特征降下来,代价是单次现算耗时从约2秒
+    涨到约5~8秒。只在 optbbs 失败时才触发、结果缓存5分钟,可以接受
+    但要知道这个成本;如果新浪那边还是限流,_fetch_chain 会在日志里
+    留下"只拿到 X/Y 个合约"的记录,可以顺着排查。
 算出来的数量级和走势应该跟官方 QVIX 一致,但不保证分毫不差——报价取中
 还是取最新成交、零买价的裁剪时机等实现细节,不同实现之间本来就会有出入。
 """
@@ -50,12 +55,19 @@ _CST = ZoneInfo("Asia/Shanghai")
 _UNDERLYING = "510050"
 
 
-def _parallel_fetch(items, fn, timeout=8):
+def _parallel_fetch(items, fn, timeout=12, stagger=0.04):
     """对 items 并发跑 fn(item),daemon 线程、共享超时预算,超时的直接丢弃。
     不用 concurrent.futures.ThreadPoolExecutor——它的 worker 线程不是
     daemon,会被 atexit 钩子 join,一次性脚本(GitHub Actions)进程退出时
-    被晾着的慢线程拖住(同 fetcher._fetch_with_timeout 的理由)。返回收集
-    到的结果列表,顺序不保证,超时/失败的直接跳过。"""
+    被晾着的慢线程拖住(同 fetcher._fetch_with_timeout 的理由)。
+
+    stagger:每个请求线程错开这么多秒启动,不是瞬间炸出几十个连接——
+    新浪这类免费接口的反爬限流通常按"瞬时并发连接数"识别爬虫,不是按
+    全天总量,近50个合约同一瞬间发请求比全天分散发更容易触发限流/临时
+    封IP(实测撞过:早上重启后能用,挂了几小时后又不行了,很可能就是
+    optbbs 全天不可用导致这条备用路径高频触发、把新浪那边打出限流)。
+    错峰对总耗时影响很小——大部分请求早在错峰启动完之前就已经拿到
+    结果了。返回收集到的结果列表,顺序不保证,超时/失败的直接跳过。"""
     results = []
     lock = threading.Lock()
 
@@ -68,11 +80,14 @@ def _parallel_fetch(items, fn, timeout=8):
             with lock:
                 results.append(r)
 
-    threads = [threading.Thread(target=_run, args=(it,), daemon=True)
-               for it in items]
-    for t in threads:
-        t.start()
     deadline = time.time() + timeout
+    threads = []
+    for it in items:
+        t = threading.Thread(target=_run, args=(it,), daemon=True)
+        threads.append(t)
+        t.start()
+        if stagger and time.time() < deadline:
+            time.sleep(stagger)
     for t in threads:
         remaining = deadline - time.time()
         if remaining > 0:
@@ -196,7 +211,13 @@ def _fetch_chain(month_str: str) -> pd.DataFrame:
         return {"kind": kind, "strike": float(vals["行权价"]),
                 "bid": bid, "mid": mid}
 
-    rows = _parallel_fetch(codes, _fetch_one, timeout=8)
+    rows = _parallel_fetch(codes, _fetch_one)
+    if len(rows) < len(codes):
+        # 拿到的合约数明显少于请求数,大概率是新浪那边限流/连接被拒——
+        # 留个可见记录,不然这种"部分失败"不报异常,只是悄悄少几行数据,
+        # 排查起来无从下手。
+        log.warning("QVIX %s 月合约行情只拿到 %d/%d 个,可能被限流",
+                    month_str, len(rows), len(codes))
     return pd.DataFrame(rows)
 
 
@@ -274,12 +295,14 @@ def compute_qvix() -> Optional[tuple]:
     try:
         expiries = _two_expiries(now.date())
         if expiries is None:
+            log.warning("QVIX 自算失败:到期月份探测拿不到近月/次近月")
             return None
         (near_ms, near_date, _), (next_ms, next_date, _) = expiries
 
         T1, N1 = _years_to_expiry(near_date, now)
         T2, N2 = _years_to_expiry(next_date, now)
         if T1 <= 0 or T2 <= T1:
+            log.warning("QVIX 自算失败:到期时间异常 T1=%.4f T2=%.4f", T1, T2)
             return None
 
         curve = _shibor_curve()
@@ -292,6 +315,10 @@ def compute_qvix() -> Optional[tuple]:
         near = _term_variance(near_chain, r1, T1)
         nxt = _term_variance(next_chain, r2, T2)
         if near is None or nxt is None:
+            log.warning("QVIX 自算失败:%s月合约%d个报价/%s月合约%d个报价,"
+                       "方差算不出来(near=%s, next=%s)",
+                       near_ms, len(near_chain), next_ms, len(next_chain),
+                       near is not None, nxt is not None)
             return None
         sigma1, _, _ = near
         sigma2, _, _ = nxt
@@ -301,13 +328,15 @@ def compute_qvix() -> Optional[tuple]:
         w2 = (n30 - N1) / (N2 - N1)
         sigma2_30 = (T1 * sigma1 * w1 + T2 * sigma2 * w2) * (365.0 / n30)
         if sigma2_30 <= 0:
+            log.warning("QVIX 自算失败:插值方差非正 sigma2_30=%.6f", sigma2_30)
             return None
         vix = float(100.0 * np.sqrt(sigma2_30))
         # 粗粒度合理性校验:历史 QVIX 大致落在个位数到三位数以内,离谱的
         # 结果多半是报价缺失/行权价选取出错,宁可返回 None 也不展示假数。
         if not (1.0 < vix < 150.0):
+            log.warning("QVIX 自算失败:结果 %.2f 超出合理区间,判为脏数据", vix)
             return None
         return round(vix, 2), now.strftime("%H:%M:%S")
     except Exception as e:
-        log.debug("self-computed QVIX failed: %s", e)
+        log.warning("self-computed QVIX failed: %s", e)
         return None

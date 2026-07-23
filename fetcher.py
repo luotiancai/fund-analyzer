@@ -1250,17 +1250,22 @@ def fetch_qvix_now() -> tuple:
         last = d.iloc[-1]
         return float(last["qvix"]), str(last["time"]), "optbbs"
     except Exception as e:
-        logger.debug("QVIX intraday fetch (optbbs) failed: %s", e)
+        # warning 而不是 debug:默认日志配置下 debug 基本不会落地到任何
+        # 地方,云端出问题时翻日志会是空的——这两条失败路径值得看见。
+        logger.warning("QVIX intraday fetch (optbbs) failed: %s", e)
 
     try:
         import qvix_calc   # 延迟导入:qvix_calc 反过来 import fetcher,
                             # 模块顶层互相 import 会循环失败。
-        r = _fetch_with_timeout(qvix_calc.compute_qvix, timeout=20)
+        # 自算路径本身有并发请求错峰(见 qvix_calc._parallel_fetch),
+        # timeout 相应放宽,给错峰启动+两个到期月份链路各自的请求留够
+        # 余量,不要因为外层超时先一步掐断。
+        r = _fetch_with_timeout(qvix_calc.compute_qvix, timeout=40)
         if r is not None:
             qvix, qtime = r
             return qvix, qtime, "self"
     except Exception as e:
-        logger.debug("QVIX intraday fetch (self-computed) failed: %s", e)
+        logger.warning("QVIX intraday fetch (self-computed) failed: %s", e)
 
     return None, None, None
 
