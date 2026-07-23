@@ -9,10 +9,27 @@
 方法论: 近月+次近月期权,用 put-call parity 反推远期价格 F,K0 取不
 超过 F 的最大行权价,以 K0 为界选虚值认沽(K<K0)+虚值认购(K>K0)+K0
 处认购认沽均价,按 1/K² 加权求和,再按到期时间插值成 30 天期方差。
-用日历天数近似替代 CBOE 原版的分钟精度(误差可忽略);无风险利率复用
-fetcher.get_risk_free_rate()(1年期国债收益率,不按期限精确插值,近似)。
-算出来的数量级和走势应该跟官方 QVIX 一致,但不保证分毫不差——不同
-实现细节(报价取中还是取最新成交、零买价的裁剪时机等)本身就会有出入。
+到期时间精确到秒(到期日15:00收盘 - 当前时刻,数学上等价于 CBOE 白皮书
+按分钟分段累加的写法);无风险利率按 SHIBOR 期限结构对近月/次近月各自
+的剩余天数线性插值(而不是不分期限统一用一个1年期利率),取不到 SHIBOR
+时退回 fetcher.get_risk_free_rate()(1年期国债收益率)。
+
+已知跟官方方法论的差距,均为有意识的取舍而非疏漏:
+  - 风险利率用 SHIBOR(银行间同业拆借利率,含银行信用风险)而非 CBOE
+    原版用的短期国债收益率(纯无风险)——境内没有可比的短期限国债收益
+    率曲线,SHIBOR 是量化定价里通行的替代,概念上不完全等价但业内公认
+    可用。
+  - 50ETF期权只有月度合约、没有周合约,每月合约到期换月后的头几天,
+    目标的30天期限会落在近月合约到期日之前(即 N30 < N1),标准插值
+    公式此时退化成外推而非真正的插值,数学上仍然成立(官方 QVIX 遇到
+    同样情况大概率也是同样处理),只是不如"30天被近月/次近月夹住"时
+    直觉。
+  - 每次现算要并发发起近 50 个单合约实时报价请求(新浪逐合约接口,没
+    有批量接口可用),偏"抓取密集型",这是免费数据源的结构性限制,不是
+    实现取巧——只在 optbbs 失败时才触发、结果缓存5分钟,可以接受但要
+    知道这个成本。
+算出来的数量级和走势应该跟官方 QVIX 一致,但不保证分毫不差——报价取中
+还是取最新成交、零买价的裁剪时机等实现细节,不同实现之间本来就会有出入。
 """
 
 import datetime as dt
@@ -61,6 +78,63 @@ def _parallel_fetch(items, fn, timeout=8):
         if remaining > 0:
             t.join(remaining)
     return results
+
+
+_SHIBOR_TENOR_DAYS = [
+    ("O/N", 1), ("1W", 7), ("2W", 14), ("1M", 30),
+    ("3M", 90), ("6M", 180), ("9M", 270), ("1Y", 365),
+]
+
+
+def _shibor_curve() -> Optional[list]:
+    """今天最新一行 SHIBOR 各期限报价(年化小数),按天数排序,供插值用。
+    量化定价里给短期限期权算无风险利率,SHIBOR 是境内通行的替代——
+    A股期权到期通常只有一两个月,用 fetcher.get_risk_free_rate() 那个
+    统一的1年期国债收益率给近月/次近月共用不够精确;这里多一次请求
+    (免费、约0.5秒)换成按各自期限插值。取不到时调用方回退到那个
+    1年期利率。"""
+    try:
+        df = fetcher.ak.macro_china_shibor_all()
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    row = df.iloc[-1]
+    pts = []
+    for tenor, days in _SHIBOR_TENOR_DAYS:
+        col = f"{tenor}-定价"
+        if col in row.index and pd.notna(row[col]):
+            pts.append((float(days), float(row[col]) / 100.0))
+    pts.sort()
+    return pts if len(pts) >= 2 else None
+
+
+def _rate_for_days(curve: Optional[list], days: float, fallback: float) -> float:
+    """SHIBOR 期限结构线性插值;超出曲线两端用端点值(不外推),曲线
+    拿不到时用 fallback(1年期国债收益率)。"""
+    if not curve:
+        return fallback
+    if days <= curve[0][0]:
+        return curve[0][1]
+    if days >= curve[-1][0]:
+        return curve[-1][1]
+    for (d0, r0), (d1, r1) in zip(curve, curve[1:]):
+        if d0 <= days <= d1:
+            w = (days - d0) / (d1 - d0)
+            return r0 + w * (r1 - r0)
+    return fallback
+
+
+def _years_to_expiry(expiry_date: str, now: dt.datetime):
+    """到期日当天15:00(收盘,期权停止交易的时刻)到 now 的精确年数/天数。
+    直接拿 datetime 相减取秒级精度,数学上等价于 CBOE 白皮书里"当天剩余
+    分钟+到期日分钟+中间整天分钟"分段累加的写法,只是实现更直接;不是
+    对分钟精度的近似,是同一个数字的另一种算法。返回 (年, 天),天带
+    小数,交易日当天/临近到期时不会是整数。"""
+    y, m, d = map(int, expiry_date.split("-"))
+    settle = dt.datetime(y, m, d, 15, 0, 0, tzinfo=_CST)
+    frac_days = (settle - now).total_seconds() / 86400.0
+    return frac_days / 365.0, frac_days
 
 
 def _next_month_str(base: dt.date, offset: int) -> str:
@@ -201,23 +275,30 @@ def compute_qvix() -> Optional[tuple]:
         expiries = _two_expiries(now.date())
         if expiries is None:
             return None
-        (near_ms, _, near_days), (next_ms, _, next_days) = expiries
+        (near_ms, near_date, _), (next_ms, next_date, _) = expiries
 
-        r = fetcher.get_risk_free_rate()
-        T1, T2 = near_days / 365.0, next_days / 365.0
+        T1, N1 = _years_to_expiry(near_date, now)
+        T2, N2 = _years_to_expiry(next_date, now)
+        if T1 <= 0 or T2 <= T1:
+            return None
+
+        curve = _shibor_curve()
+        fallback_r = fetcher.get_risk_free_rate()
+        r1 = _rate_for_days(curve, N1, fallback_r)
+        r2 = _rate_for_days(curve, N2, fallback_r)
 
         near_chain = _fetch_chain(near_ms)
         next_chain = _fetch_chain(next_ms)
-        near = _term_variance(near_chain, r, T1)
-        nxt = _term_variance(next_chain, r, T2)
+        near = _term_variance(near_chain, r1, T1)
+        nxt = _term_variance(next_chain, r2, T2)
         if near is None or nxt is None:
             return None
         sigma1, _, _ = near
         sigma2, _, _ = nxt
 
         n30 = 30.0
-        w1 = (next_days - n30) / (next_days - near_days)
-        w2 = (n30 - near_days) / (next_days - near_days)
+        w1 = (N2 - n30) / (N2 - N1)
+        w2 = (n30 - N1) / (N2 - N1)
         sigma2_30 = (T1 * sigma1 * w1 + T2 * sigma2 * w2) * (365.0 / n30)
         if sigma2_30 <= 0:
             return None
