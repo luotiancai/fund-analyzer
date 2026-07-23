@@ -43,6 +43,7 @@ def main():
     parser = argparse.ArgumentParser(description="批量重算历史QVIX(上交所官方数据源)")
     parser.add_argument("--years", type=int, default=10, help="回算最近几年,默认10")
     parser.add_argument("--start", type=str, default=None, help="起始日期 YYYY-MM-DD,优先于 --years")
+    parser.add_argument("--end", type=str, default=None, help="截止日期 YYYY-MM-DD,默认今天(补历史缺口时用,避免重跑已有区间)")
     parser.add_argument("--delay", type=float, default=0.15, help="每个交易日请求间隔秒数,别对官方接口太猛")
     args = parser.parse_args()
 
@@ -50,11 +51,13 @@ def main():
     today = dt.datetime.now(_CST).date()
     start = (dt.datetime.strptime(args.start, "%Y-%m-%d").date()
              if args.start else today.replace(year=today.year - args.years))
+    end = (dt.datetime.strptime(args.end, "%Y-%m-%d").date()
+           if args.end else today)
 
     log.info("拉交易日历…")
     cal = fetcher.ak.tool_trade_date_hist_sina()
     cal["trade_date"] = pd.to_datetime(cal["trade_date"]).dt.date
-    dates = sorted(d for d in cal["trade_date"] if start <= d <= today)
+    dates = sorted(d for d in cal["trade_date"] if start <= d <= end)
     log.info("共 %d 个交易日(%s ~ %s)", len(dates), dates[0], dates[-1])
 
     log.info("拉50ETF历史价格…")
@@ -105,7 +108,8 @@ def main():
     log.info("重算滚动3年95分位恐慌阈值…")
     hist = fetcher.load_qvix_self_history()
     hist = hist.sort_values("date").reset_index(drop=True)
-    hist["threshold"] = hist["qvix"].rolling(720, min_periods=240).quantile(0.95)
+    # min_periods=700(接近满3年,留约20天容错,理由同 fetcher.update_qvix_self_daily)
+    hist["threshold"] = hist["qvix"].rolling(720, min_periods=700).quantile(0.95)
     fetcher.save_qvix_self_threshold(hist["date"].tolist(), hist["threshold"].tolist())
 
     log.info("✅ 完成,写入 %d 条(成功%d 失败%d),总耗时 %.1f 分钟",

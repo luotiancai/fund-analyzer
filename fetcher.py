@@ -1348,7 +1348,13 @@ def update_qvix_self_daily() -> tuple:
     hist = load_qvix_self_history()
     if hist is not None:
         hist = hist.sort_values("date").reset_index(drop=True)
-        hist["threshold"] = hist["qvix"].rolling(720, min_periods=240).quantile(0.95)
+        # min_periods=700(不是240):阈值要接近满3年数据才给值,不足3年
+        # 宁可空着也不用不完整窗口凑数——早期用240(约1年)会让阈值在头
+        # 两年里被少量样本撑出来的分位数带偏,不够稳。不用严格720:历史
+        # 里偶发接口失败/数据缺失(约1.6%的交易日),真设成720会导致
+        # 720天窗口只要出现过一天缺失就整个失真成NaN,700留了约20天的
+        # 容错,仍然远比240严格。
+        hist["threshold"] = hist["qvix"].rolling(720, min_periods=700).quantile(0.95)
         save_qvix_self_threshold(hist["date"].tolist(), hist["threshold"].tolist())
     return vix, note
 
