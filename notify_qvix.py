@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """每个交易日 14:40 邮件推送:盘中 QVIX 与恐慌阈值(滚动3年95分位)。
 
-只报数不做判定:QVIX 取自 fetcher.fetch_qvix_now()(优先 optbbs 分钟
-接口最新一笔,挂了退到自算备用值,见 qvix_calc.py),阈值用日线缓存
-(截至昨日)算,是否触发由收件人自己看。新浪实时行情仅用于判断当天
-是否交易日。
+只报数不做判定:QVIX 取自 fetcher.fetch_qvix_now()(上交所期权实时
+行情自算,不再用 optbbs,见 qvix_calc.py 顶部说明),阈值取自
+fetcher.qvix_self_history 表(同样是自算历史,截至昨日),是否触发由
+收件人自己看。新浪实时行情仅用于判断当天是否交易日。
 
 跑在 GitHub Actions(见 .github/workflows/notify-qvix.yml),由外部定时
 服务(如 cron-job.org)在北京 14:40 直接调 GitHub API 触发
@@ -66,22 +66,21 @@ def _sse_quote_date():
     return r.text.split('"')[1].split(",")[30]
 
 
-def _threshold(today: str):
-    """滚动3年95分位阈值,窗口截至昨日——显式剔除今天的行,
-    防止 optbbs 日线接口盘中吐出当天数据混进分位窗口。
+def _threshold():
+    """滚动3年95分位阈值,从自算历史(qvix_self_history)现取最新一条。
 
-    force_refresh=True:QVIX 收盘价源发布常常晚于 06:00 跑批(实测某次
-    到 06:45 都还没出前一日收盘,得等到 9 点多),不强制刷新就一直用
-    跑批时抓到的旧值,直到次日跑批才补上。这里 14:40 运行,早已过了
-    发布延迟,顺带当天内自愈,不用等第二天。"""
-    q = fetcher.fetch_qvix_daily(force_refresh=True)
-    if q is None:
+    先调 update_qvix_self_daily() 补一次"最近一个已收盘交易日":上交所
+    官方数据源发布也有延迟(实测过收盘3小时后仍未发布),06:00 跑批时
+    大概率还没发布,这里 14:40 运行,早已过了发布延迟,顺带当天内自愈,
+    不用等次日跑批。"""
+    fetcher.update_qvix_self_daily()
+    hist = fetcher.load_qvix_self_history()
+    if hist is None:
         return None
-    q = q[q["date"] < today]
-    if len(q) < 240:
+    row = hist.dropna(subset=["threshold"])
+    if row.empty:
         return None
-    return float(q["close"].rolling(720, min_periods=240)
-                 .quantile(0.95).iloc[-1])
+    return float(row["threshold"].iloc[-1])
 
 
 def main():
@@ -91,19 +90,18 @@ def main():
         log.info("非交易日(行情日期 %s),跳过", quote_date)
         return
 
-    qvix, qtime, qsrc = fetcher.fetch_qvix_now()
+    qvix, qtime = fetcher.fetch_qvix_now()
     if qvix is None:
-        log.error("QVIX 拿不到值(optbbs 和自算备用都失败)")
+        log.error("QVIX 自算失败,拿不到值")
         sys.exit(1)
-    thr = _threshold(today)
+    thr = _threshold()
     if thr is None:
         log.error("阈值计算失败")
         sys.exit(1)
 
-    src_note = "" if qsrc == "optbbs" else "（自算备用值,optbbs 数据源当时不可用）"
     title = f"QVIX {qvix:.2f} / 阈值 {thr:.2f}"
     body = (f"{today} {qtime}\n\n"
-            f"盘中 QVIX:{qvix:.2f}{src_note}\n"
+            f"盘中 QVIX:{qvix:.2f}\n"
             f"恐慌阈值(3年95分位):{thr:.2f}\n")
 
     try:

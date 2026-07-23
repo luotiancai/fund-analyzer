@@ -61,23 +61,32 @@ def main():
                  summary["funds"], summary["backfilled"], summary["appended"],
                  summary["patched"], summary["failed"], summary["recomputed"])
 
-    # ── 指数/恐慌指数刷新 + 动态恐慌阈值 ────────────────────────────────────
-    # 强刷上证与 QVIX 缓存(app 侧 12h TTL 直接命中),并按滚动 3 年 95 分位
-    # 计算当日恐慌阈值,把「是否触发 B 点」直接打进日志。
-    log.info("刷新指数缓存(上证 / QVIX)…")
+    # ── 指数刷新 + QVIX自算 + 动态恐慌阈值 ──────────────────────────────────
+    # 上证指数刷新照旧(app 侧无过期时间,只在这里force_refresh才变)。QVIX
+    # 不再用 optbbs——那是免费QVIX源里唯一一家,却发布延迟常年到次日上午、
+    # 还偶发整天返回空值,而且历史极端行情日交叉验证对不上(见
+    # qvix_calc.py 顶部说明),已不再信任。改用
+    # fetcher.update_qvix_self_daily():上交所官方期权风险指标现算,写入
+    # 独立的 qvix_self_history 表,阈值也是照这份自算历史现算的。
+    log.info("刷新指数缓存(上证)+ 自算QVIX…")
     try:
         sse = fetcher.fetch_sse_daily(force_refresh=True)
-        qvix = fetcher.fetch_qvix_daily(force_refresh=True)
-        if sse is not None and qvix is not None and len(qvix) >= 240:
-            thr = float(qvix["close"].rolling(720, min_periods=240)
-                        .quantile(0.95).iloc[-1])
-            q_last = float(qvix["close"].iloc[-1])
+        vix, note = fetcher.update_qvix_self_daily()
+        hist = fetcher.load_qvix_self_history()
+        thr = None
+        if hist is not None:
+            row = hist.dropna(subset=["threshold"])
+            if not row.empty:
+                thr = float(row["threshold"].iloc[-1])
+        if sse is not None and vix is not None and thr is not None:
             s_last = sse.iloc[-1]
-            triggered = q_last > thr
-            log.info("   上证 %s 收 %.0f(%+.2f%%) · QVIX %.2f · 恐慌阈值(3年95分位) %.2f%s",
+            triggered = vix > thr
+            log.info("   上证 %s 收 %.0f(%+.2f%%) · QVIX(自算) %.2f · 恐慌阈值(3年95分位) %.2f%s",
                      s_last["date"], s_last["close"], s_last["pct"],
-                     q_last, thr,
+                     vix, thr,
                      " · 🔔 B点触发(QVIX破阈值)" if triggered else "")
+        elif vix is None:
+            log.warning("   QVIX 自算未成功: %s", note)
     except Exception as e:
         log.warning("   指数刷新失败(不影响基金跑批): %s", e)
 

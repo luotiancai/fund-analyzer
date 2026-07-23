@@ -184,8 +184,10 @@ def load_sse_daily(cache_key):
 
 
 @st.cache_data(show_spinner="正在加载VIX恐慌指数数据…")
-def load_qvix_daily(cache_key):
-    return fetcher.fetch_qvix_daily()
+def load_qvix_self(cache_key):
+    """自算QVIX历史(qvix_self_history表,上交所官方期权风险指标反推,
+    不是 optbbs)。"""
+    return fetcher.load_qvix_self_history()
 
 
 # 1y max drawdown as it stood on the buy date (window: buy_date-365d → buy_date),
@@ -295,12 +297,11 @@ for _c in ("ret_1m", "ret_3m", "ret_6m", "ret_1y"):
 # ── 当前 QVIX(盘中,5分钟缓存) ────────────────────────────────────────────────
 # 装饰性小字,拉取失败(接口变更/限流/部署过渡态等)绝不能带崩整页。
 try:
-    _qvix_now, _qvix_now_t, _qvix_now_src = load_qvix_now()
+    _qvix_now, _qvix_now_t = load_qvix_now()
 except Exception:
-    _qvix_now, _qvix_now_t, _qvix_now_src = None, None, None
+    _qvix_now, _qvix_now_t = None, None
 if _qvix_now is not None:
-    _qvix_now_note = "" if _qvix_now_src == "optbbs" else "，自算备用值"
-    st.caption(f"🌡️ 当前QVIX {_qvix_now:.2f}（{_qvix_now_t} 更新{_qvix_now_note}）")
+    st.caption(f"🌡️ 当前QVIX {_qvix_now:.2f}（{_qvix_now_t} 更新，自算）")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_table, tab_detail, tab_sim, tab_sse = st.tabs(
@@ -1368,13 +1369,16 @@ with tab_sse:
             hovertemplate="收盘 %{y:,.2f} · 日涨跌 %{customdata[0]:+.2f}%"
                           "<extra></extra>")
 
-        # VIX恐慌指数（QVIX）on a secondary right axis: levels (~15–40) are
-        # incomparable with index points, so it never shares the left scale.
+        # VIX恐慌指数（QVIX，自算）on a secondary right axis: levels (~15–40)
+        # are incomparable with index points, so it never shares the left
+        # scale. 数据源:qvix_self_history(上交所官方期权风险指标反推,
+        # 不是 optbbs——见 qvix_calc.py 顶部说明),阈值列已经是现算好的
+        # 滚动3年95分位,不用在这里重算。
         qvix_view = None
         if _show_vix:
-            _qvix = load_qvix_daily(fetcher.index_daily_saved_at("qvix"))
+            _qvix = load_qvix_self(fetcher.qvix_self_history_last_date())
             if _qvix is not None and not _qvix.empty:
-                qvix_view = _qvix.copy()
+                qvix_view = _qvix.dropna(subset=["qvix"]).copy()
                 qvix_view["date"] = pd.to_datetime(qvix_view["date"])
                 qvix_view = qvix_view[
                     (qvix_view["date"] >= view["date"].min())
@@ -1386,8 +1390,8 @@ with tab_sse:
             fig_sse.data[0].name = "上证指数"
             fig_sse.data[0].showlegend = True
             fig_sse.add_trace(go.Scatter(
-                x=qvix_view["date"], y=qvix_view["close"],
-                name="VIX恐慌指数(QVIX)", yaxis="y2",
+                x=qvix_view["date"], y=qvix_view["qvix"],
+                name="VIX恐慌指数(QVIX,自算)", yaxis="y2",
                 line=dict(color="#f28e2b", width=1.3),
                 hovertemplate="VIX %{y:.2f}<extra></extra>"))
             # Default (right-side vertical) legend keeps clear of the
@@ -1395,19 +1399,9 @@ with tab_sse:
             fig_sse.update_layout(
                 yaxis2=dict(title="VIX恐慌指数", overlaying="y", side="right",
                             showgrid=False))
-            # 动态恐慌阈值(滚动3年95分位)。QVIX 水位随时代漂移(2015 年
-            # 中位 37 vs 2023 年 16),固定 30 在高波动年代整年误触、低波动
-            # 年代永不触发;95 分位在 1~5 年窗口全域稳健(敏感性网格实测),
-            # 3 年窗口兼顾"记住常态"与"跟上时代"。
-            _qfull = _qvix.copy()
-            _qfull["date"] = pd.to_datetime(_qfull["date"])
-            _qfull["thr"] = _qfull["close"].rolling(
-                720, min_periods=240).quantile(0.95)
-            _thr_view = _qfull[(_qfull["date"] >= view["date"].min())
-                               & (_qfull["date"] <= view["date"].max())]
-            if _thr_view["thr"].notna().any():
+            if "threshold" in qvix_view.columns and qvix_view["threshold"].notna().any():
                 fig_sse.add_trace(go.Scatter(
-                    x=_thr_view["date"], y=_thr_view["thr"],
+                    x=qvix_view["date"], y=qvix_view["threshold"],
                     name="恐慌阈值(3年95分位)", yaxis="y2",
                     line=dict(color="#8e44ad", width=1.2, dash="dash"),
                     hovertemplate="恐慌阈值 %{y:.2f}<extra></extra>"))
@@ -1439,7 +1433,7 @@ with tab_sse:
             if qvix_view is not None:
                 _q = qvix_view.assign(
                     日期=qvix_view["date"].dt.strftime("%Y-%m-%d"),
-                    **{"VIX恐慌指数": qvix_view["close"].round(2)})
+                    **{"VIX恐慌指数": qvix_view["qvix"].round(2)})
                 _tbl = _tbl.merge(_q[["日期", "VIX恐慌指数"]],
                                   on="日期", how="left")
             st.dataframe(_tbl, use_container_width=True, height=420)

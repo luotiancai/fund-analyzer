@@ -1,10 +1,19 @@
-"""自算 QVIX(CBOE VIX 白皮书方法论,用上交所50ETF期权实时行情现算)。
+"""自算 QVIX(CBOE VIX 白皮书方法论)。两条独立路径,共享同一套核心公式
+(_term_variance/K0选取/1-K²加权/30天插值),数据来源不同:
 
-只是 fetcher.fetch_qvix_now() 的备用路径:optbbs 分钟接口(1.optbbs.com)
-是免费公开数据里唯一的现成 QVIX 源,挂掉/返回空值时没有第二家可切换
-(akshare 里所有 QVIX 变体——50/300/500ETF等9个——背后都是同一个站)。
-这里改为自己用期权真实报价按标准公式现算,不依赖任何第三方已经算好
-的指标。
+  ① compute_qvix() ——盘中实时值。用上交所50ETF期权的新浪实时报价
+     (bid/ask)现算。fetcher.fetch_qvix_now() 用这个。
+  ② compute_qvix_for_date() ——收盘后的历史/日线值。实时买卖价查不到
+     历史,改用上交所官方期权风险指标接口(option_risk_indicator_sse,
+     2015-02-09起可查)已经算好的隐含波动率反推 Black-Scholes 理论价格
+     再代入同一套公式。backfill_qvix_history.py(一次性批量回算)和
+     fetcher.update_qvix_self_daily()(每日跑批增量更新)都用这个。
+
+起因:optbbs(1.optbbs.com,唯一免费QVIX源,akshare里所有QVIX变体背后
+都是这一家)偶发返回整天空值、日线收盘价发布常年延迟到次日上午,而且
+某个历史极端行情日(2026-03-23,上证单日-3.63%)的官方发布收盘值
+(42.16)用①②两条独立路径交叉验证怎么都对不上(都落在~23),怀疑那天
+的发布值本身有误——已不再信任 optbbs,全面改用自算。
 
 方法论: 近月+次近月期权,用 put-call parity 反推远期价格 F,K0 取不
 超过 F 的最大行权价,以 K0 为界选虚值认沽(K<K0)+虚值认购(K>K0)+K0
@@ -39,6 +48,8 @@
 
 import datetime as dt
 import logging
+import math
+import re
 import threading
 import time
 from typing import Optional
@@ -150,6 +161,44 @@ def _years_to_expiry(expiry_date: str, now: dt.datetime):
     settle = dt.datetime(y, m, d, 15, 0, 0, tzinfo=_CST)
     frac_days = (settle - now).total_seconds() / 86400.0
     return frac_days / 365.0, frac_days
+
+
+def expiry_date_for_yymm(yymm: str) -> dt.date:
+    """'2604' 这种到期月代码 → 该月第4个周三(50ETF期权标准到期日规则)。
+    供历史回算用:未来月份走 fetcher.ak.option_sse_expire_day_sina 直接
+    查到期日,但那个接口只认还没到期的月份,回算历史(backfill_qvix_history.py)
+    只能靠这条规则自己算,不依赖任何实时接口。"""
+    year = 2000 + int(yymm[:2])
+    month = int(yymm[2:])
+    weds = []
+    d = 1
+    while True:
+        try:
+            date = dt.date(year, month, d)
+        except ValueError:
+            break
+        if date.weekday() == 2:
+            weds.append(date)
+        d += 1
+    return weds[3]
+
+
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs_price(kind: str, S: float, K: float, T: float, r: float, sigma: float):
+    """Black-Scholes 价格,供历史回算用:上交所官方风险指标接口只给隐含
+    波动率、不给报价,拿官方 IV 反推回价格(数学上就是官方算 IV 时用的
+    同一个模型倒着走一遍),再喂给 _term_variance 走标准 CBOE 公式。
+    sigma<=0 或 T<=0 时返回 None(数据缺失/已到期)。"""
+    if sigma is None or sigma <= 0 or T <= 0:
+        return None
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    if kind == "C":
+        return S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)
+    return K * math.exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1)
 
 
 def _next_month_str(base: dt.date, offset: int) -> str:
@@ -340,3 +389,156 @@ def compute_qvix() -> Optional[tuple]:
     except Exception as e:
         log.warning("self-computed QVIX failed: %s", e)
         return None
+
+
+# ── 历史/日线自算(收盘后,上交所官方期权风险指标反推) ────────────────────────
+# 用于 backfill_qvix_history.py(一次性批量回算)和
+# fetcher.update_qvix_self_daily()(每日跑批增量更新)共用。
+
+# 510050C2604M02900: 标的 + C/P + 到期月(YYMM) + 调整标记(M=普通,
+# A/B..=分红调整) + 行权价×1000。只用 M(普通合约),调整合约的行权价
+# 跟标的除权前后对不上,排除掉更干净。
+_CONTRACT_RE = re.compile(r"^510050([CP])(\d{4})([A-Z])(\d{5})$")
+_MIN_ROLL_DAYS = 7   # 近月剩余不足这么多天就跳到下两个月(标准VIX规则)
+
+
+def spot_price_for_date(target_date: dt.date) -> Optional[float]:
+    """指定交易日 510050 收盘价;当天数据还没发布/非交易日返回 None。"""
+    try:
+        df = fetcher.ak.fund_etf_hist_sina(symbol="sh510050")
+    except Exception:
+        return None
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    row = df[df["date"] == target_date]
+    return float(row["close"].iloc[0]) if not row.empty else None
+
+
+def shibor_curve_for_date(target_date: dt.date) -> Optional[list]:
+    """指定交易日的 SHIBOR 期限结构,格式同 _shibor_curve()。当天没有
+    发布返回 None(调用方回退到 fetcher.get_risk_free_rate())。"""
+    try:
+        df = fetcher.ak.macro_china_shibor_all()
+    except Exception:
+        return None
+    df["日期"] = pd.to_datetime(df["日期"]).dt.date
+    row = df[df["日期"] == target_date]
+    if row.empty:
+        return None
+    row = row.iloc[0]
+    pts = []
+    for tenor, days in _SHIBOR_TENOR_DAYS:
+        col = f"{tenor}-定价"
+        if col in row.index and pd.notna(row[col]):
+            pts.append((float(days), float(row[col]) / 100.0))
+    pts.sort()
+    return pts if len(pts) >= 2 else None
+
+
+def _listed_expiries(df, target_date: dt.date):
+    """当天数据里实际出现过的到期月代码 → (到期日期, 剩余自然天数),
+    按剩余天数升序;只看普通(非分红调整)合约。"""
+    out = {}
+    for cid in df["CONTRACT_ID"]:
+        m = _CONTRACT_RE.match(cid)
+        if not m or m.group(3) != "M":
+            continue
+        yymm = m.group(2)
+        if yymm in out:
+            continue
+        try:
+            expiry = expiry_date_for_yymm(yymm)
+        except Exception:
+            continue
+        days = (expiry - target_date).days
+        if days > 0:
+            out[yymm] = (expiry, days)
+    return sorted(out.items(), key=lambda kv: kv[1][1])
+
+
+def _pick_near_next(listed):
+    usable = [x for x in listed if x[1][1] >= _MIN_ROLL_DAYS]
+    if len(usable) < 2:
+        return None
+    return usable[0], usable[1]
+
+
+def _build_chain_from_risk_indicator(df, yymm: str, S: float, T: float, r: float):
+    rows = []
+    for _, row in df.iterrows():
+        m = _CONTRACT_RE.match(row["CONTRACT_ID"])
+        if not m or m.group(3) != "M" or m.group(2) != yymm:
+            continue
+        sigma = row["IMPLC_VOLATLTY"]
+        if pd.isna(sigma):
+            continue
+        strike = int(m.group(4)) / 1000.0
+        price = bs_price(m.group(1), S, strike, T, r, float(sigma))
+        if price is None or price <= 0:
+            continue
+        rows.append({"kind": m.group(1), "strike": strike, "bid": price, "mid": price})
+    return pd.DataFrame(rows)
+
+
+def _fetch_risk_indicator_with_retry(date_str: str, attempts: int = 3):
+    for i in range(attempts):
+        try:
+            return fetcher.ak.option_risk_indicator_sse(date=date_str)
+        except Exception:
+            if i == attempts - 1:
+                raise
+            time.sleep(1.0)
+
+
+def compute_qvix_for_date(target_date: dt.date, spot: Optional[float] = None,
+                           shibor_curve: Optional[list] = None) -> tuple:
+    """算某个收盘后交易日的QVIX(上交所官方期权风险指标反推,不依赖
+    optbbs)。spot/shibor_curve 不传时现查当天的(单天用;批量回算时
+    调用方应该一次性拉整段历史自己传,不然每天都要重新拉一遍全history)。
+    失败返回 (None, 原因字符串)。"""
+    if spot is None:
+        spot = spot_price_for_date(target_date)
+    if spot is None:
+        return None, "拿不到50ETF当日收盘价(可能还没发布/非交易日)"
+    if shibor_curve is None:
+        shibor_curve = shibor_curve_for_date(target_date)
+
+    date_str = target_date.strftime("%Y%m%d")
+    try:
+        df = _fetch_risk_indicator_with_retry(date_str)
+    except Exception as e:
+        return None, f"接口失败: {e}"
+    if df is None or df.empty:
+        return None, "当天无数据(非交易日/上市前/尚未发布)"
+    df = df[df["CONTRACT_ID"].str.startswith("510050")]
+    if df.empty:
+        return None, "当天无50ETF期权数据"
+
+    listed = _listed_expiries(df, target_date)
+    picked = _pick_near_next(listed)
+    if picked is None:
+        return None, "找不到满足条件的近月/次近月(合约月份不足)"
+    (near_ms, (_, near_days)), (next_ms, (_, next_days)) = picked
+
+    T1, T2 = near_days / 365.0, next_days / 365.0
+    r1 = _rate_for_days(shibor_curve, near_days, 0.02)
+    r2 = _rate_for_days(shibor_curve, next_days, 0.02)
+
+    near_chain = _build_chain_from_risk_indicator(df, near_ms, spot, T1, r1)
+    next_chain = _build_chain_from_risk_indicator(df, next_ms, spot, T2, r2)
+    near = _term_variance(near_chain, r1, T1)
+    nxt = _term_variance(next_chain, r2, T2)
+    if near is None or nxt is None:
+        return None, "方差算不出来(合约或IV数据不足)"
+    sigma1, _, _ = near
+    sigma2, _, _ = nxt
+
+    n30 = 30.0
+    w1 = (next_days - n30) / (next_days - near_days)
+    w2 = (n30 - near_days) / (next_days - near_days)
+    sigma2_30 = (T1 * sigma1 * w1 + T2 * sigma2 * w2) * (365.0 / n30)
+    if sigma2_30 <= 0:
+        return None, "插值方差非正"
+    vix = 100.0 * (sigma2_30 ** 0.5)
+    if not (1.0 < vix < 150.0):
+        return None, f"结果 {vix:.2f} 超出合理区间,判为脏数据"
+    return round(vix, 2), None

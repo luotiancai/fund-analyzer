@@ -12,6 +12,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -29,6 +30,7 @@ class _LazyAkshare:
 ak = _LazyAkshare()
 
 logger = logging.getLogger(__name__)
+_CST = ZoneInfo("Asia/Shanghai")
 
 # The DB lives on the WSL-native filesystem (ext4), NOT the project dir: the
 # project sits on /mnt/c where every SQLite I/O crosses the 9p protocol —
@@ -1237,37 +1239,118 @@ def index_daily_saved_at(key: str) -> Optional[float]:
 
 
 def fetch_qvix_now() -> tuple:
-    """盘中最新 QVIX。优先用 optbbs 分钟接口(1.optbbs.com)——免费公开
-    数据里唯一现成的 QVIX 源,akshare 里所有 QVIX 变体背后都是这一家,
-    没有第二家可切换。它偶尔会挂/吐空数据(实测过整天返回空值),这时
-    退到用上交所50ETF期权实时行情自算(qvix_calc.compute_qvix,CBOE
-    VIX 白皮书方法论)兜底——量级和走势应该跟 optbbs 一致,但不保证
-    分毫不差。返回 (qvix, "HH:MM:SS", source),source 是
-    "optbbs"/"self";两条路都失败时是 (None, None, None)。"""
-    try:
-        d = _fetch_with_timeout(ak.index_option_50etf_min_qvix)
-        d = d.dropna(subset=["qvix"])
-        last = d.iloc[-1]
-        return float(last["qvix"]), str(last["time"]), "optbbs"
-    except Exception as e:
-        # warning 而不是 debug:默认日志配置下 debug 基本不会落地到任何
-        # 地方,云端出问题时翻日志会是空的——这两条失败路径值得看见。
-        logger.warning("QVIX intraday fetch (optbbs) failed: %s", e)
+    """盘中最新 QVIX——上交所50ETF期权实时行情自算(qvix_calc.compute_qvix,
+    CBOE VIX 白皮书方法论),不再用 optbbs(1.optbbs.com)。
 
+    optbbs 曾经是这里的主路径,但它是免费QVIX源里唯一的现成选择、没有
+    第二家可切换,而且实测过整天返回空值、历史日线数据的极端行情日
+    (2026-03-23)交叉验证也对不上标准方法论算出来的值(见 qvix_calc.py
+    顶部说明)——已经不再信任,全面改用自算。
+
+    返回 (qvix, "HH:MM:SS"),失败为 (None, None)。"""
     try:
         import qvix_calc   # 延迟导入:qvix_calc 反过来 import fetcher,
                             # 模块顶层互相 import 会循环失败。
-        # 自算路径本身有并发请求错峰(见 qvix_calc._parallel_fetch),
-        # timeout 相应放宽,给错峰启动+两个到期月份链路各自的请求留够
-        # 余量,不要因为外层超时先一步掐断。
+        # 请求错峰(见 qvix_calc._parallel_fetch)让单次现算要5~8秒,
+        # timeout 留够余量,不要因为外层超时先一步掐断。
         r = _fetch_with_timeout(qvix_calc.compute_qvix, timeout=40)
         if r is not None:
-            qvix, qtime = r
-            return qvix, qtime, "self"
+            return r
     except Exception as e:
         logger.warning("QVIX intraday fetch (self-computed) failed: %s", e)
 
-    return None, None, None
+    return None, None
+
+
+def save_qvix_self_history(rows: list) -> None:
+    """写入/覆盖自算QVIX历史(backfill_qvix_history.py 用)。跟 optbbs 的
+    index_daily_cache 是两张独立的表,互不覆盖——这样optbbs的值和自算值
+    可以并排比对,而不是自算结果把optbbs历史顶替掉。rows 是
+    [{"date","qvix","note"}, ...]。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS qvix_self_history ("
+                 "date TEXT PRIMARY KEY, qvix REAL, note TEXT)")
+    conn.executemany(
+        "INSERT OR REPLACE INTO qvix_self_history (date, qvix, note) "
+        "VALUES (?, ?, ?)",
+        [(r["date"], r.get("qvix"), r.get("note")) for r in rows])
+    conn.commit()
+    conn.close()
+
+
+def qvix_self_history_last_date() -> Optional[str]:
+    """qvix_self_history 里最新一条的日期(字符串),给 app.py 当
+    st.cache_data 的缓存key用——新一天数据写进来,这个值就变,缓存自然
+    失效,不用等TTL。没有数据时返回 None。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS qvix_self_history ("
+                 "date TEXT PRIMARY KEY, qvix REAL, note TEXT)")
+    row = conn.execute(
+        "SELECT MAX(date) AS d FROM qvix_self_history").fetchone()
+    conn.close()
+    return row["d"] if row and row["d"] else None
+
+
+def load_qvix_self_history() -> Optional[pd.DataFrame]:
+    """读取自算QVIX历史,按日期排序;没有数据时返回 None。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS qvix_self_history ("
+                 "date TEXT PRIMARY KEY, qvix REAL, note TEXT)")
+    df = pd.read_sql("SELECT * FROM qvix_self_history ORDER BY date", conn)
+    conn.close()
+    return df if not df.empty else None
+
+
+def save_qvix_self_threshold(dates: list, thresholds: list) -> None:
+    """把滚动3年95分位恐慌阈值写回 qvix_self_history 的 threshold 列
+    (按自算QVIX序列现算的,不是套用optbbs那条历史算出来的阈值)。"""
+    conn = _conn()
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(qvix_self_history)")]
+    if "threshold" not in cols:
+        conn.execute("ALTER TABLE qvix_self_history ADD COLUMN threshold REAL")
+    conn.executemany(
+        "UPDATE qvix_self_history SET threshold = ? WHERE date = ?",
+        [(t, d) for d, t in zip(dates, thresholds)])
+    conn.commit()
+    conn.close()
+
+
+def update_qvix_self_daily() -> tuple:
+    """收盘后重算"最近一个已收盘交易日"的自算QVIX,写入 qvix_self_history
+    并重算滚动3年95分位阈值。update_daily.py(06:00)和 notify_qvix.py
+    (14:40)都调这个,取代原来基于 optbbs 的 fetch_qvix_daily(force_refresh=True)。
+
+    目标日期不是"今天"——06:00 时今天还没开盘,14:40 时今天还没收盘,
+    两边其实都是在补"上一个交易日"的数据,天然幂等(INSERT OR REPLACE),
+    重复调用无副作用。上交所官方接口本身也有发布延迟(实测过收盘3小时后
+    仍未发布),这天万一还没发布,下一次调用(次日/当天晚些)自然会
+    补上,调用方不需要关心这件事。
+
+    返回 (qvix_value_or_None, note)。"""
+    import qvix_calc
+    today = datetime.now(_CST).date()
+    try:
+        cal = ak.tool_trade_date_hist_sina()
+        cal["trade_date"] = pd.to_datetime(cal["trade_date"]).dt.date
+        prior = cal[cal["trade_date"] < today]["trade_date"]
+        target = prior.max()
+    except Exception as e:
+        logger.warning("QVIX 每日自算:拉交易日历失败 %s", e)
+        return None, f"交易日历拉取失败: {e}"
+
+    vix, note = qvix_calc.compute_qvix_for_date(target)
+    save_qvix_self_history([{"date": target.isoformat(), "qvix": vix, "note": note}])
+    if vix is None:
+        logger.warning("QVIX 每日自算(%s)失败: %s", target, note)
+    else:
+        logger.info("QVIX 每日自算(%s) = %.2f", target, vix)
+
+    hist = load_qvix_self_history()
+    if hist is not None:
+        hist = hist.sort_values("date").reset_index(drop=True)
+        hist["threshold"] = hist["qvix"].rolling(720, min_periods=240).quantile(0.95)
+        save_qvix_self_threshold(hist["date"].tolist(), hist["threshold"].tolist())
+    return vix, note
 
 
 # ── Daily-batch pipeline ──────────────────────────────────────────────────────
