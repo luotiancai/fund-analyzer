@@ -1237,17 +1237,32 @@ def index_daily_saved_at(key: str) -> Optional[float]:
 
 
 def fetch_qvix_now() -> tuple:
-    """盘中最新 QVIX(optbbs 分钟接口最后一笔)。同 notify_qvix.py 的
-    _qvix_now(),供页面展示实时数字用。返回 (qvix, "HH:MM:SS"),失败为
-    (None, None)。"""
+    """盘中最新 QVIX。优先用 optbbs 分钟接口(1.optbbs.com)——免费公开
+    数据里唯一现成的 QVIX 源,akshare 里所有 QVIX 变体背后都是这一家,
+    没有第二家可切换。它偶尔会挂/吐空数据(实测过整天返回空值),这时
+    退到用上交所50ETF期权实时行情自算(qvix_calc.compute_qvix,CBOE
+    VIX 白皮书方法论)兜底——量级和走势应该跟 optbbs 一致,但不保证
+    分毫不差。返回 (qvix, "HH:MM:SS", source),source 是
+    "optbbs"/"self";两条路都失败时是 (None, None, None)。"""
     try:
         d = _fetch_with_timeout(ak.index_option_50etf_min_qvix)
         d = d.dropna(subset=["qvix"])
         last = d.iloc[-1]
-        return float(last["qvix"]), str(last["time"])
+        return float(last["qvix"]), str(last["time"]), "optbbs"
     except Exception as e:
-        logger.debug("QVIX intraday fetch failed: %s", e)
-        return None, None
+        logger.debug("QVIX intraday fetch (optbbs) failed: %s", e)
+
+    try:
+        import qvix_calc   # 延迟导入:qvix_calc 反过来 import fetcher,
+                            # 模块顶层互相 import 会循环失败。
+        r = _fetch_with_timeout(qvix_calc.compute_qvix, timeout=20)
+        if r is not None:
+            qvix, qtime = r
+            return qvix, qtime, "self"
+    except Exception as e:
+        logger.debug("QVIX intraday fetch (self-computed) failed: %s", e)
+
+    return None, None, None
 
 
 # ── Daily-batch pipeline ──────────────────────────────────────────────────────

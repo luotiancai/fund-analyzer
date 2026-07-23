@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """每个交易日 14:40 邮件推送:盘中 QVIX 与恐慌阈值(滚动3年95分位)。
 
-只报数不做判定:QVIX 取 optbbs 分钟接口的最新一笔(实时),阈值用日线
-缓存(截至昨日)算,是否触发由收件人自己看。新浪实时行情仅用于判断
-当天是否交易日。
+只报数不做判定:QVIX 取自 fetcher.fetch_qvix_now()(优先 optbbs 分钟
+接口最新一笔,挂了退到自算备用值,见 qvix_calc.py),阈值用日线缓存
+(截至昨日)算,是否触发由收件人自己看。新浪实时行情仅用于判断当天
+是否交易日。
 
 跑在 GitHub Actions(见 .github/workflows/notify-qvix.yml),由外部定时
 服务(如 cron-job.org)在北京 14:40 直接调 GitHub API 触发
@@ -65,14 +66,6 @@ def _sse_quote_date():
     return r.text.split('"')[1].split(",")[30]
 
 
-def _qvix_now():
-    """盘中最新 QVIX(optbbs 分钟接口最后一笔)。"""
-    d = fetcher.ak.index_option_50etf_min_qvix()
-    d = d.dropna(subset=["qvix"])
-    last = d.iloc[-1]
-    return float(last["qvix"]), str(last["time"])
-
-
 def _threshold(today: str):
     """滚动3年95分位阈值,窗口截至昨日——显式剔除今天的行,
     防止 optbbs 日线接口盘中吐出当天数据混进分位窗口。
@@ -98,15 +91,19 @@ def main():
         log.info("非交易日(行情日期 %s),跳过", quote_date)
         return
 
-    qvix, qtime = _qvix_now()
+    qvix, qtime, qsrc = fetcher.fetch_qvix_now()
+    if qvix is None:
+        log.error("QVIX 拿不到值(optbbs 和自算备用都失败)")
+        sys.exit(1)
     thr = _threshold(today)
     if thr is None:
         log.error("阈值计算失败")
         sys.exit(1)
 
+    src_note = "" if qsrc == "optbbs" else "（自算备用值,optbbs 数据源当时不可用）"
     title = f"QVIX {qvix:.2f} / 阈值 {thr:.2f}"
     body = (f"{today} {qtime}\n\n"
-            f"盘中 QVIX:{qvix:.2f}\n"
+            f"盘中 QVIX:{qvix:.2f}{src_note}\n"
             f"恐慌阈值(3年95分位):{thr:.2f}\n")
 
     try:
