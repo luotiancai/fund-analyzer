@@ -1224,6 +1224,101 @@ def fetch_qvix_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     return df
 
 
+# VHSI(恒指波幅指数,港股版VIX)历史数据有个大坑:新浪源2014-09-24之后
+# 整段空白到2018-04-30(仅1个孤立数据点),再空白到2021-03-18才恢复连续
+# 每日更新——2015-2020这6年基本没有可用数据,不是偶发缺失,是整段没有。
+# 用之前必须先砍掉这段空窗,否则滚动阈值窗口会横跨一大截空数据。HSI
+# (恒生指数)本身没有这个问题(2013-08起逐年完整,已核实)。
+_VHSI_START = "2021-03-18"
+
+
+def fetch_hsi_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
+    """恒生指数 daily history, cache-first——跟 fetch_sse_daily 同一套
+    契约(index_daily_cache 表, key='hsi', 无过期时间, 只在 force_refresh
+    时刷新)。数据源新浪 stock_hk_index_daily_sina(symbol='HSI'),2013-08
+    起逐年完整、无缺口(已核实)。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
+                 "key TEXT PRIMARY KEY, data TEXT, saved_at REAL)")
+    row = conn.execute(
+        "SELECT data, saved_at FROM index_daily_cache WHERE key='hsi'"
+    ).fetchone()
+
+    def _from_row(r):
+        return pd.read_json(io.StringIO(r["data"]), orient="split",
+                            dtype=False, convert_dates=False)
+
+    if row and not force_refresh:
+        conn.close()
+        return _from_row(row)
+
+    df = None
+    try:
+        raw = _fetch_with_timeout(lambda: ak.stock_hk_index_daily_sina(symbol="HSI"))
+        df = pd.DataFrame({
+            "date": pd.to_datetime(raw["date"]).dt.strftime("%Y-%m-%d"),
+            "close": pd.to_numeric(raw["close"], errors="coerce"),
+        }).dropna(subset=["date", "close"])
+        df["pct"] = df["close"].pct_change() * 100.0
+        df = df[df["date"] >= INDEX_START].reset_index(drop=True)
+    except Exception as e:
+        logger.debug("HSI index fetch failed: %s", e)
+
+    if df is not None and not df.empty:
+        conn.execute(
+            "INSERT OR REPLACE INTO index_daily_cache (key, data, saved_at) "
+            "VALUES ('hsi', ?, ?)",
+            (df.to_json(orient="split", force_ascii=False), time.time()))
+        conn.commit()
+    elif row:
+        df = _from_row(row)
+    conn.close()
+    return df
+
+
+def fetch_vhsi_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
+    """VHSI(恒指波幅指数,港股版VIX)daily close, cache-first——同上契约,
+    key='vhsi'。数据源新浪 stock_hk_index_daily_sina(symbol='VHSI'),
+    只保留 _VHSI_START(2021-03-18)起的数据(见该常量说明,更早的整段
+    缺失砍掉)。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
+                 "key TEXT PRIMARY KEY, data TEXT, saved_at REAL)")
+    row = conn.execute(
+        "SELECT data, saved_at FROM index_daily_cache WHERE key='vhsi'"
+    ).fetchone()
+
+    def _from_row(r):
+        return pd.read_json(io.StringIO(r["data"]), orient="split",
+                            dtype=False, convert_dates=False)
+
+    if row and not force_refresh:
+        conn.close()
+        return _from_row(row)
+
+    df = None
+    try:
+        raw = _fetch_with_timeout(lambda: ak.stock_hk_index_daily_sina(symbol="VHSI"))
+        df = pd.DataFrame({
+            "date": pd.to_datetime(raw["date"]).dt.strftime("%Y-%m-%d"),
+            "close": pd.to_numeric(raw["close"], errors="coerce"),
+        }).dropna(subset=["date", "close"])
+        df = df[df["date"] >= _VHSI_START].reset_index(drop=True)
+    except Exception as e:
+        logger.debug("VHSI fetch failed: %s", e)
+
+    if df is not None and not df.empty:
+        conn.execute(
+            "INSERT OR REPLACE INTO index_daily_cache (key, data, saved_at) "
+            "VALUES ('vhsi', ?, ?)",
+            (df.to_json(orient="split", force_ascii=False), time.time()))
+        conn.commit()
+    elif row:
+        df = _from_row(row)
+    conn.close()
+    return df
+
+
 def index_daily_saved_at(key: str) -> Optional[float]:
     """Unix time index_daily_cache[key] ('sse' or 'qvix') was last written,
     or None if never fetched. Used as an st.cache_data cache-busting key so

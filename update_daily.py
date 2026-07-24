@@ -68,9 +68,11 @@ def main():
     # qvix_calc.py 顶部说明),已不再信任。改用
     # fetcher.update_qvix_self_daily():上交所官方期权风险指标现算,写入
     # 独立的 qvix_self_history 表,阈值也是照这份自算历史现算的。
-    log.info("刷新指数缓存(上证)+ 自算QVIX…")
+    log.info("刷新指数缓存(上证/恒生/VHSI)+ 自算QVIX…")
     try:
         sse = fetcher.fetch_sse_daily(force_refresh=True)
+        fetcher.fetch_hsi_daily(force_refresh=True)
+        fetcher.fetch_vhsi_daily(force_refresh=True)
         vix, note = fetcher.update_qvix_self_daily()
         hist = fetcher.load_qvix_self_history()
         thr = None

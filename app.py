@@ -214,6 +214,34 @@ def load_qvix_self(cache_key):
     return fetcher.load_qvix_self_history()
 
 
+@st.cache_data(show_spinner="正在加载恒生指数数据…")
+def load_hsi_daily(cache_key):
+    return fetcher.fetch_hsi_daily()
+
+
+@st.cache_data(show_spinner="正在加载VHSI恒指波幅指数数据…")
+def load_vhsi_daily(cache_key):
+    """VHSI(恒指波幅指数,港股版VIX)——新浪源,只保留2021-03-18起的数据
+    (fetcher._VHSI_START,更早的整段缺失已砍掉,见该常量说明)。"""
+    return fetcher.fetch_vhsi_daily()
+
+
+@st.cache_data(show_spinner="正在计算VHSI恐慌阈值…")
+def load_vhsi_threshold(cache_key):
+    """VHSI滚动2年90分位阈值,跟QVIX那套口径一致(minp_ratio=0.97),
+    独立现算,只用于图上叠加展示。"""
+    hist = fetcher.fetch_vhsi_daily()
+    if hist is None or hist.empty:
+        return None
+    hist = hist.sort_values("date").reset_index(drop=True)
+    hist["date"] = pd.to_datetime(hist["date"])
+    hist["close"] = pd.to_numeric(hist["close"], errors="coerce")
+    window, minp = 490, int(490 * 0.97)
+    out = hist[["date"]].copy()
+    out["threshold"] = hist["close"].rolling(window, min_periods=minp).quantile(0.90)
+    return out
+
+
 # 1y max drawdown as it stood on the buy date (window: buy_date-365d → buy_date),
 # on the corrected daily-return growth index (nav_series 的 ret 列) so dividend
 # NAV resets don't count as drops, while build-up-period fake-zero growth rates
@@ -328,8 +356,8 @@ if _qvix_now is not None:
     st.caption(f"🌡️ 当前QVIX {_qvix_now:.2f}（{_qvix_now_t} 更新，自算）")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_table, tab_detail, tab_sim, tab_sse = st.tabs(
-    ["📋 基金列表", "🔍 基金详情", "💰 模拟盘", "📈 上证指数"])
+tab_table, tab_detail, tab_sim, tab_sse, tab_hsi = st.tabs(
+    ["📋 基金列表", "🔍 基金详情", "💰 模拟盘", "📈 上证指数", "🇭🇰 恒生指数"])
 
 # ─── Tab 1: Table ────────────────────────────────────────────────────────────
 with tab_table:
@@ -1649,3 +1677,130 @@ with tab_sse:
                     "同期上证": st.column_config.Column(width="small"),
                     "备注": st.column_config.Column(width="large"),
                 })
+
+# ─── Tab 5: 恒生指数 ─────────────────────────────────────────────────────────
+# 跟上证指数tab同一套画法, 标的换成恒生指数(HSI)+VHSI(恒指波幅指数,
+# 港股版VIX,方法论同CBOE VIX白皮书,标的换成恒生指数期权)。数据源都是
+# 新浪 stock_hk_index_daily_sina, 不是自算——不像QVIX那样自己拿期权
+# 反推, 这里没有对应的境内期权数据源, 直接用新浪现成的官方指数。VHSI
+# 只从2021-03-18起保留(见 fetcher._VHSI_START, 更早整段缺失已砍掉),
+# 阈值固定滚动2年90分位(跟QVIX当前标准口径一致, minp_ratio=0.97), 只有
+# 一条线, 不像上证tab那样有多组可选——没有必要在这里重复验证一遍
+# 窗口/分位组合, 就用已经在QVIX上验证过的这一组。
+with tab_hsi:
+    hsi_df = load_hsi_daily(fetcher.index_daily_saved_at("hsi"))
+    if hsi_df is None or hsi_df.empty:
+        st.warning("恒生指数数据获取失败，请稍后重试。")
+    else:
+        hsi_all = hsi_df.copy()
+        hsi_all["date"] = pd.to_datetime(hsi_all["date"])
+        hsi_all = hsi_all.sort_values("date").reset_index(drop=True)
+
+        _hsi_ranges = {"近1月": 30, "近3月": 91, "近6月": 182,
+                       "近1年": 365, "近3年": 365 * 3, "近5年": 365 * 5,
+                       "全部": None}
+        _c_rng2, _c_vhsi = st.columns([5, 1])
+        with _c_rng2:
+            _rng2 = st.radio("时间区间", list(_hsi_ranges.keys()), index=3,
+                             horizontal=True, key="hsi_range")
+        with _c_vhsi:
+            _show_vhsi = st.checkbox("VHSI恐慌指数", value=True,
+                                     key="hsi_vhsi",
+                                     help="恒指波幅指数（港股版VIX），右轴，"
+                                          "叠加滚动2年90分位阈值线")
+
+        _days2 = _hsi_ranges[_rng2]
+        if _days2 is None:
+            view2 = hsi_all
+        else:
+            _start2 = hsi_all["date"].max() - pd.Timedelta(days=_days2)
+            _older2 = hsi_all[hsi_all["date"] <= _start2]
+            view2 = hsi_all.loc[_older2.index[-1]:] if not _older2.empty else hsi_all
+
+        _latest2 = hsi_all.iloc[-1]
+        _chg2 = (_latest2["close"] / view2["close"].iloc[0] - 1.0) * 100.0
+        _peak2 = view2["close"].cummax()
+        _mdd2 = float(((_peak2 - view2["close"]) / _peak2).max() * 100.0)
+        h1, h2, h3, h4 = st.columns(4)
+        h1.metric("最新收盘", f"{_latest2['close']:,.2f}",
+                  f"{_latest2['pct']:+.2f}%（当日）")
+        h2.metric(f"{_rng2}涨跌幅", f"{_chg2:+.2f}%")
+        h3.metric(f"{_rng2}最大回撤", f"{_mdd2:.2f}%")
+        h4.metric("数据日期", _latest2["date"].strftime("%Y-%m-%d"))
+
+        fig_hsi = px.line(
+            view2, x="date", y="close",
+            title=f"恒生指数走势（{_rng2}）",
+            labels={"date": "日期", "close": "收盘点位"},
+            height=420,
+        )
+        fig_hsi.update_traces(
+            customdata=view2[["pct"]],
+            hovertemplate="收盘 %{y:,.2f} · 日涨跌 %{customdata[0]:+.2f}%"
+                          "<extra></extra>")
+
+        vhsi_view = None
+        if _show_vhsi:
+            _vhsi = load_vhsi_daily(fetcher.index_daily_saved_at("vhsi"))
+            if _vhsi is not None and not _vhsi.empty:
+                vhsi_view = _vhsi.dropna(subset=["close"]).copy()
+                vhsi_view["date"] = pd.to_datetime(vhsi_view["date"])
+                vhsi_view["close"] = pd.to_numeric(vhsi_view["close"], errors="coerce")
+                vhsi_view = vhsi_view[
+                    (vhsi_view["date"] >= view2["date"].min())
+                    & (vhsi_view["date"] <= view2["date"].max())]
+            if vhsi_view is None or vhsi_view.empty:
+                st.caption("⚠️ VHSI恐慌指数数据暂不可用"
+                          "（2021-03-18前无可用数据）")
+                vhsi_view = None
+        if vhsi_view is not None:
+            fig_hsi.data[0].name = "恒生指数"
+            fig_hsi.data[0].showlegend = True
+            fig_hsi.add_trace(go.Scatter(
+                x=vhsi_view["date"], y=vhsi_view["close"],
+                name="VHSI恐慌指数", yaxis="y2",
+                line=dict(color="#f28e2b", width=1.3),
+                hovertemplate="VHSI %{y:.2f}<extra></extra>"))
+            fig_hsi.update_layout(
+                yaxis2=dict(title="VHSI恐慌指数", overlaying="y", side="right",
+                            showgrid=False))
+            _vhsi_thr = load_vhsi_threshold(fetcher.index_daily_saved_at("vhsi"))
+            if _vhsi_thr is not None:
+                _thr_view2 = _vhsi_thr[
+                    (_vhsi_thr["date"] >= view2["date"].min())
+                    & (_vhsi_thr["date"] <= view2["date"].max())].dropna(subset=["threshold"])
+                if not _thr_view2.empty:
+                    fig_hsi.add_trace(go.Scatter(
+                        x=_thr_view2["date"], y=_thr_view2["threshold"],
+                        name="恐慌阈值(2年90%)", yaxis="y2",
+                        line=dict(color="#8e44ad", width=1.2, dash="dash"),
+                        hovertemplate="阈值(2年90%) %{y:.2f}<extra></extra>"))
+
+        fig_hsi.update_layout(
+            hovermode="x unified", hoverdistance=-1, spikedistance=-1)
+        _span_d2 = max((view2["date"].max() - view2["date"].min()).days, 1)
+        fig_hsi.update_xaxes(
+            showspikes=True, spikemode="across", spikesnap="data",
+            spikedash="dot", spikethickness=1,
+            hoverformat="%Y-%m-%d", tickformat="%Y-%m-%d",
+            dtick=max(1, _span_d2 // 8) * 86400000)
+        fig_hsi.update_yaxes(
+            showspikes=True, spikemode="across", spikesnap="data",
+            spikedash="dot", spikethickness=1)
+        st.plotly_chart(fig_hsi, use_container_width=True)
+
+        with st.expander("📄 每日数据（当前区间）"):
+            _hsi_table = view2.sort_values("date", ascending=False).reset_index(drop=True)
+            _tbl2 = pd.DataFrame({
+                "日期": _hsi_table["date"].dt.strftime("%Y-%m-%d"),
+                "收盘点位": _hsi_table["close"].round(2),
+                "日涨跌(%)": pd.to_numeric(_hsi_table["pct"],
+                                         errors="coerce").round(2),
+            })
+            if vhsi_view is not None:
+                _v = vhsi_view.assign(
+                    日期=vhsi_view["date"].dt.strftime("%Y-%m-%d"),
+                    **{"VHSI恐慌指数": vhsi_view["close"].round(2)})
+                _tbl2 = _tbl2.merge(_v[["日期", "VHSI恐慌指数"]],
+                                    on="日期", how="left")
+            st.dataframe(_tbl2, use_container_width=True, height=420)
