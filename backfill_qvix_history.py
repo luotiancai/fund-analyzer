@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
-"""一次性批量重算近10年QVIX历史,不依赖optbbs——用上交所官方期权风险
-指标接口(option_risk_indicator_sse,官方数据,2015-02-09起可查)反推
-每个历史交易日的隐含波动率指数,写入独立的 qvix_self_history 表(跟
-optbbs 的 index_daily_cache 互不覆盖,方便并排比对)。
+"""一次性批量重算QVIX历史,不依赖optbbs——用上交所官方期权风险指标接口
+(option_risk_indicator_sse,官方数据,2015-02-09起可查)反推每个历史
+交易日的隐含波动率指数,写入独立的 qvix_self_history 表(跟 optbbs 的
+index_daily_cache 互不覆盖,方便并排比对)。
 
 起因:optbbs(唯一免费QVIX源)偶发返回整天空值、日线收盘价发布常年
 延迟到次日上午,而且某个历史极端行情日(2026-03-23,上证单日-3.63%)
 的官方发布收盘值(42.16)用标准CBOE公式配合上交所官方IV反推价格交叉
 验证怎么都对不上(两条独立路径都落在~23),怀疑那天的发布值本身有误。
-干脆自己按标准方法论把近10年历史全部重算一遍,全面不再依赖 optbbs。
+干脆自己按标准方法论把历史重算一遍,全面不再依赖 optbbs。
+
+数据只保留2018年起(_MIN_DATE):50ETF期权2015-02-09刚上市那两三年
+合约稀少、流动性薄,2015-2017年计算失败率高达4.5%(2018年起只有
+0.67%),算出来的值标准差是后面正常年份的2倍以上,还出现过单日跳变
+24个点这种即使按2015股灾真实暴跌算也偏离常理的情况——判断为早期
+数据噪声偏大、不可信,经确认后整段丢弃不用,阈值滚动窗口也相应只从
+2018年起算(用户决策,2026-07-24)。--start 传更早的日期无效,会被
+钳到 _MIN_DATE。
 
 实际计算逻辑在 qvix_calc.compute_qvix_for_date() 里(跟每日跑批增量
 更新 fetcher.update_qvix_self_daily() 共用同一套实现),这里只是批量
 循环 + 提前一次性拉好整段历史(50ETF价格、SHIBOR)避免每天重复拉取。
 
 用法:
-  python3 backfill_qvix_history.py                # 近10年
-  python3 backfill_qvix_history.py --years 5      # 近5年
-  python3 backfill_qvix_history.py --start 2020-01-01
+  python3 backfill_qvix_history.py                # 2018年至今全量
+  python3 backfill_qvix_history.py --start 2024-01-01
 """
 
 import argparse
@@ -38,11 +45,16 @@ log = logging.getLogger("backfill_qvix_history")
 
 _CST = ZoneInfo("Asia/Shanghai")
 
+# 2015-2017数据噪声偏大(见模块docstring),不再回算/保留——早于这个日期
+# 的请求一律钳到这里。
+_MIN_DATE = dt.date(2018, 1, 1)
+
 
 def main():
     parser = argparse.ArgumentParser(description="批量重算历史QVIX(上交所官方数据源)")
-    parser.add_argument("--years", type=int, default=10, help="回算最近几年,默认10")
-    parser.add_argument("--start", type=str, default=None, help="起始日期 YYYY-MM-DD,优先于 --years")
+    parser.add_argument("--start", type=str, default=None,
+                        help=f"起始日期 YYYY-MM-DD,默认{_MIN_DATE.isoformat()};"
+                             f"早于此日期会被钳到{_MIN_DATE.isoformat()}(2015-2017数据判定为噪声,不再使用)")
     parser.add_argument("--end", type=str, default=None, help="截止日期 YYYY-MM-DD,默认今天(补历史缺口时用,避免重跑已有区间)")
     parser.add_argument("--delay", type=float, default=0.15, help="每个交易日请求间隔秒数,别对官方接口太猛")
     args = parser.parse_args()
@@ -50,7 +62,11 @@ def main():
     fetcher.init_db()
     today = dt.datetime.now(_CST).date()
     start = (dt.datetime.strptime(args.start, "%Y-%m-%d").date()
-             if args.start else today.replace(year=today.year - args.years))
+             if args.start else _MIN_DATE)
+    if start < _MIN_DATE:
+        log.warning("起始日期%s早于%s,已钳到%s(2015-2017数据判定为噪声,见模块docstring)",
+                    start, _MIN_DATE, _MIN_DATE)
+        start = _MIN_DATE
     end = (dt.datetime.strptime(args.end, "%Y-%m-%d").date()
            if args.end else today)
 
