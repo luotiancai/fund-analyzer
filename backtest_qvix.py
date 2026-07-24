@@ -211,9 +211,20 @@ def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97)
     sse["close"] = pd.to_numeric(sse["close"], errors="coerce")
     sse = sse.sort_values("date").reset_index(drop=True)
 
+    # 冠军排名要看"近3月涨幅",净值库(fund_nav_daily)实测最早只到
+    # 2020-01-02(不是曾经以为的2018-01,那是旧注释,已过时)——早于
+    # "库起点+91天"的信号日虽然 fetcher.ANCHOR_GRACE_DAYS=10 的宽限期
+    # 偶尔能让某天擦边通过(2020-03-24 精确压线10天),但那是"近3月"窗口
+    # 被截断到只有81天的假数据,不能真实代表冠军排名,直接从信号池剔除,
+    # 不指望宽限期兜底(宽限期本是为容忍个别基金上市日不对齐设计的,不
+    # 该被整个数据库的起点边界借用)。
+    _nav_floor = conn.execute("SELECT MIN(date) FROM fund_nav_daily").fetchone()[0]
+    _signal_floor = pd.Timestamp(_nav_floor) + pd.Timedelta(days=91)
+    print(f"净值库起点 {_nav_floor}, 近3月冠军窗口最早可信信号日 {_signal_floor.date()}")
+
     # Signal days: QVIX > threshold
     signals = qvix[(qvix["close"] > qvix["thr"]) & (qvix["thr"].notna())]
-    signals = signals[signals["date"] >= pd.Timestamp("2018-01-01")]  # 净值库起点2018-01,冠军窗口自适应
+    signals = signals[signals["date"] >= _signal_floor]
     print(f"信号日(QVIX > 阈值): {len(signals)} 天")
     signal_map = {row["date"]: row["thr"] for _, row in signals.iterrows()}
 
@@ -221,7 +232,7 @@ def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97)
     position = None
 
     # 逐交易日走: 持仓时每天检查双止损线, 空仓(或当天刚卖出)遇信号日则买入
-    all_days = sse[sse["date"] >= pd.Timestamp("2018-01-01")]
+    all_days = sse[sse["date"] >= _signal_floor]
 
     for _, day_row in all_days.iterrows():
         day = day_row["date"]
