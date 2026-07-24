@@ -10,7 +10,7 @@
   逐交易日检查, 先到先卖(双线在买入日锁定, 与 app.py 复盘口径一致)
   波动率比值 = 基金日收益率std / 大盘日收益率std(纯波动对比, 不按相关系数加权)
 """
-import sys, os, time, sqlite3, io
+import sys, os, time, sqlite3, io, re
 import numpy as np
 import pandas as pd
 from datetime import timedelta
@@ -33,12 +33,21 @@ NAV_ANOMALIES = {
 }
 
 # ── 阈值组合回测参考快照(2026-07-24, 数据/规则变了要重跑, 别当成结论)──
+# 下面这张窗口×分位表是在加相关系数过滤(min_corr)和持有期基金排除
+# 之前跑的旧快照, 只对比不同 window/pct 组合、不涉及 min_corr, 数字
+# 现在跟当前默认参数(min_corr=0.6)对不上——2年90%用当前全部规则重算
+# 后是 11笔/6胜5负54.5%/+204.06%/平均67天/+11.97%, 见 app.py 上证tab
+# 「策略复盘」表(已改用这组当前标准结果)。2年95%/3年90%/3年95%这三组
+# 还没用 min_corr=0.6 重新跑过, 如果要用就先重跑, 不要直接拿下面这张
+# 表当结论。
+#
 # QVIX 只用2018年起数据(2015-2017判定为期权刚上市时流动性薄、噪声偏
 # 大, 已从 qvix_self_history 整段删除, 见 fetcher.py); 信号池下限按
 # fund_nav_daily 实测起点(2020-01-02)+91天动态算, 不再借宽限期凑数
 # (见 run_backtest 里 _signal_floor 那段)。已排除海外/QDII基金。
-# 命令: python3 backtest_qvix.py --window 490 --pct 0.90 (2年90%类推,
-#       1年=250天/2年=490天/3年=720天)
+# 命令: python3 backtest_qvix.py --window 490 --pct 0.90 --min-corr none
+#       (2年90%类推, 1年=250天/2年=490天/3年=720天; 不加 --min-corr
+#       则现在默认套 0.6 过滤, 跟下表数字不一致)
 #
 #   窗口  分位   笔数  胜率        累计收益(费后复利)  平均持有  平均收益(费后)
 #   2年   90%    11   7/11=63.6%   +139.68%           59天      +9.54%
@@ -84,6 +93,17 @@ NAV_ANOMALIES = {
 # 2024-09-27 西部利得新动力混合C(673073)      混合型-灵活  2.35 22.77 10.70 4.55  +25.77%  2024-10-09 +3.03%(费后+2.53%)  0.5  +9.5%  5.9% +5.5%  大盘6.6%>=4.6%
 # 2024-10-09 广发北证50成份指数C(017513)      指数型-股票  3.11 22.84 14.21 4.57  +63.61%  2024-11-22 +36.90%             0.0 +46.8% 11.6% +0.3%  大盘5.9%>=4.6%
 # 2025-04-07 鹏华碳中和主题混合C(016531)       混合型-偏股  4.88 24.28 23.70 4.86  +54.70%  2025-12-16 +31.06%             0.0 +62.5% 21.4% +23.5% 大盘5.1%>=4.9%
+
+
+# 有持有期限制的基金(买入后锁定期内不能赎回, 名称里常见"N年/N个月/N天
+# 持有(期)"、"滚动持有"、"定期开放"、"封闭式/封闭运作")——策略的止损
+# 逻辑要求随时能在触发回撤线那天卖出, 选到这类基金实际上赎不出来,
+# 回测里的"卖出"是假的, 必须整批排除出冠军候选池。没有专门的 type
+# 字段能区分, 只能从基金名称正则匹配(已核对覆盖 fund_list 全部3258条
+# 含"持有"字样的基金, 0条漏网)。
+_HOLD_PERIOD_RE = re.compile(
+    r"(\d+|[一二两三四五六七八九十]+)\s*(年|个月|月|天)(滚动)?持有"
+    r"|持有期|定期开放|封闭式|封闭运作|滚动持有")
 
 
 def _apply_nav_anomaly(code, date, nav):
@@ -143,7 +163,32 @@ def _has_stale_catchup(conn, code, window_start, window_end):
     return False
 
 
-def find_champion_on_date(conn, asof_date, exclude_codes=None):
+def _corr_with_market(conn, sse_df, code, window_start, window_end):
+    """基金近3月窗口日收益率与上证指数日收益率的相关系数(Pearson).
+
+    数据不够(<20个共同交易日)返回 None, 由调用方决定怎么处理(通常当
+    "过不了筛选"处理, 而不是当0分——0是"完全不相关", 数据不够是"不
+    知道", 两者含义不同)。
+    """
+    df = pd.read_sql_query(
+        "SELECT date, nav FROM fund_nav_daily WHERE code=? AND date>=? AND date<=? ORDER BY date",
+        conn, params=(code, window_start.strftime("%Y-%m-%d"), window_end.strftime("%Y-%m-%d")))
+    if len(df) < 20:
+        return None
+    df["date"] = pd.to_datetime(df["date"])
+    df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
+    df["ret"] = df["nav"].pct_change()
+    sse_w = sse_df[(sse_df["date"] >= window_start) & (sse_df["date"] <= window_end)].copy()
+    sse_w["ret"] = pd.to_numeric(sse_w["close"], errors="coerce").pct_change()
+    m = df.merge(sse_w[["date", "ret"]], on="date", suffixes=("_f", "_m")).dropna()
+    if len(m) < 20:
+        return None
+    c = m["ret_f"].corr(m["ret_m"])
+    return None if pd.isna(c) else c
+
+
+def find_champion_on_date(conn, asof_date, exclude_codes=None,
+                          sse_df=None, min_corr=None):
     """找 asof_date 当天视角下的近3月冠军(排除 exclude_codes). 返回 (code, ret_3m).
 
     复用 fetcher.compute_metrics_asof——按日收益率连乘计算区间收益(正确
@@ -158,6 +203,14 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None):
     与 QVIX/大盘走势脱钩, 选入冠军池会削弱大盘回撤线对该笔仓位的意义。
     命中净值僵化-补涨模式(见 _has_stale_catchup)的基金也一并跳过, 逐个
     往下找下一名, 直到选出一个数据正常的真实冠军。
+
+    sse_df/min_corr 是可选的"共振"过滤: 只在 min_corr 给了值时生效,
+    要求候选基金近3月日收益率与上证指数的相关系数 >= min_corr, 不够
+    格的也跳过、接着往下一名找。起因: 单纯按涨幅排名选出的冠军有时
+    是跟大盘走势脱钩的独立行情(某主题炒作), 恐慌信号的"大盘回撤线"
+    止损对这种仓位保护意义有限, 涨得快跌得也快时说不清是不是大盘
+    共振行情。相关系数用近3月(与排名同一窗口)日收益率算, 数据不够
+    (<20个交易日)按不通过处理。
     """
     metrics = fetcher.compute_metrics_asof(asof_date, cols={"ret_3m"})
     if not metrics:
@@ -177,6 +230,10 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None):
     for code in sorted(candidates, key=candidates.get, reverse=True):
         if _has_stale_catchup(conn, code, window_start, window_end):
             continue
+        if min_corr is not None:
+            c = _corr_with_market(conn, sse_df, code, window_start, window_end)
+            if c is None or c < min_corr:
+                continue
         return code, round(candidates[code], 2)
     return None, 0
 
@@ -225,10 +282,17 @@ def get_fund_nav_after(conn, code, from_date):
             for r in rows if r[1]]
 
 
-def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97):
+def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97,
+                 min_corr: float = 0.6):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
-    的 700/720 那套道理)。默认 720/0.95 是当前线上在用的参数。"""
+    的 700/720 那套道理)。默认 720/0.95 是当前线上在用的参数。
+
+    min_corr: 冠军候选与上证指数近3月相关系数门槛, 见
+    find_champion_on_date 的 sse_df/min_corr 说明。默认0.6(已用2年90%
+    这组实测过0.5/0.6/0.7三档, 0.6综合表现最好, 2026-07-24定为标准
+    参数, 见下面"阈值组合回测参考快照")。传 None 则不过滤, 退回纯按
+    涨幅排名的旧逻辑。"""
     conn = get_conn()
 
     # Load fund names and types from JSON cache
@@ -247,6 +311,9 @@ def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97)
     # 冠军候选池(如"指数型-海外股票"的广发道琼斯石油指数C, 之前只过滤
     # "QDII"字样漏掉了这类, 类型字符串里没有QDII三个字但同样跟踪境外)
     qdii_codes = {c for c, t in fund_types.items() if ("QDII" in t or "海外" in t)}
+    # 有持有期锁定的基金也排除(见 _HOLD_PERIOD_RE 定义处说明)
+    hold_codes = {c for c, n in fund_names.items() if _HOLD_PERIOD_RE.search(n)}
+    exclude_codes = qdii_codes | hold_codes
 
     # Load QVIX —— 自算(qvix_self_history,上交所官方期权风险指标反推,
     # 不再是 optbbs 的 index_daily_cache)。阈值按传入的 window/pct 现算,
@@ -348,7 +415,8 @@ def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97)
         # ── Step 2: 空仓(含当天刚卖出)且为信号日时买入 ──
         if position is None and day in signal_map:
             threshold = signal_map[day]
-            code, ret_3m = find_champion_on_date(conn, day_str, qdii_codes)
+            code, ret_3m = find_champion_on_date(conn, day_str, exclude_codes,
+                                                 sse_df=sse, min_corr=min_corr)
             if code is None:
                 continue
 
@@ -480,10 +548,15 @@ def main():
     parser = argparse.ArgumentParser(description="QVIX恐慌信号回测")
     parser.add_argument("--window", type=int, default=720, help="滚动窗口(交易日),默认720(约3年)")
     parser.add_argument("--pct", type=float, default=0.95, help="分位数,默认0.95")
+    parser.add_argument("--min-corr", type=lambda s: None if s.lower() == "none" else float(s),
+                        default=0.6,
+                        help="冠军候选与上证指数近3月相关系数门槛,默认0.6"
+                             "(2026-07-24实测定档,见 run_backtest 说明);"
+                             "传 none 关掉过滤,退回纯按涨幅排名")
     args = parser.parse_args()
 
     t0 = time.time()
-    trades = run_backtest(window=args.window, pct=args.pct)
+    trades = run_backtest(window=args.window, pct=args.pct, min_corr=args.min_corr)
     elapsed = time.time() - t0
 
     if not trades:
