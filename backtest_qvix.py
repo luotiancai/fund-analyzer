@@ -188,8 +188,9 @@ def _corr_with_market(conn, sse_df, code, window_start, window_end):
 
 
 def find_champion_on_date(conn, asof_date, exclude_codes=None,
-                          sse_df=None, min_corr=None):
-    """找 asof_date 当天视角下的近3月冠军(排除 exclude_codes). 返回 (code, ret_3m).
+                          sse_df=None, min_corr=None,
+                          ret_col="ret_3m", pick="top"):
+    """找 asof_date 当天视角下排名第一的标的(排除 exclude_codes). 返回 (code, ret).
 
     复用 fetcher.compute_metrics_asof——按日收益率连乘计算区间收益(正确
     处理分红除权,不会像 end_nav/anchor_nav-1 那样被除权日的净值跳水拉低),
@@ -198,26 +199,32 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
     (T日决策只能看到T-1日收盘净值), 与 app.py「基金列表」页"截至日期"
     筛选完全同口径, 已用 2020-07-16 001644 vs 009163 交叉验证过。
 
-    exclude_codes 用于剔除 QDII 等跟踪境外市场、与大盘弱相关的基金——
-    策略买入逻辑建立在"大盘恐慌信号→买入国内动量最强标的"上, QDII 收益
-    与 QVIX/大盘走势脱钩, 选入冠军池会削弱大盘回撤线对该笔仓位的意义。
-    命中净值僵化-补涨模式(见 _has_stale_catchup)的基金也一并跳过, 逐个
-    往下找下一名, 直到选出一个数据正常的真实冠军。
+    ret_col: 排名依据的区间收益列, "ret_1m"(近1月,30天)或"ret_3m"
+    (近3月,91天), 见 fetcher.RETURN_DAYS。pick="top" 选该列最高的
+    (动量/冠军), pick="bottom" 选最低的(跌幅最大/反转候选)——起因:
+    实测11次QVIX恐慌信号里有7次是"近3月跌幅最大的20只"反弹幅度反而
+    超过"近3月涨幅最大的20只"(2026-07-24分析, 恐慌信号触发点本身就是
+    刚经历过一轮下跌, 涨得最猛的常是提前跑赢、比较拥挤的仓位, 跌得
+    最惨的反而容易报复性反弹), pick="bottom" 就是把这个反转假设直接
+    做成候选规则去回测验证。
 
-    sse_df/min_corr 是可选的"共振"过滤: 只在 min_corr 给了值时生效,
-    要求候选基金近3月日收益率与上证指数的相关系数 >= min_corr, 不够
-    格的也跳过、接着往下一名找。起因: 单纯按涨幅排名选出的冠军有时
-    是跟大盘走势脱钩的独立行情(某主题炒作), 恐慌信号的"大盘回撤线"
-    止损对这种仓位保护意义有限, 涨得快跌得也快时说不清是不是大盘
-    共振行情。相关系数用近3月(与排名同一窗口)日收益率算, 数据不够
-    (<20个交易日)按不通过处理。
+    exclude_codes 用于剔除 QDII 等跟踪境外市场的基金——策略买入逻辑
+    建立在"大盘恐慌信号→买入国内标的"上, QDII 收益与 QVIX/大盘走势
+    脱钩, 选入会削弱大盘回撤线对该笔仓位的意义。命中净值僵化-补涨
+    模式(见 _has_stale_catchup)的基金也一并跳过, 逐个往下找下一名,
+    直到选出一个数据正常的真实候选。
+
+    sse_df/min_corr 是可选的"共振"过滤(默认不启用, 2026-07-24实测
+    对当前策略已无必要, 见 run_backtest 说明): 给了 min_corr 才生效,
+    要求候选与上证近3月日收益率相关系数 >= min_corr, 不够格的跳过、
+    接着往下一名找。
     """
-    metrics = fetcher.compute_metrics_asof(asof_date, cols={"ret_3m"})
+    metrics = fetcher.compute_metrics_asof(asof_date, cols={ret_col})
     if not metrics:
         return None, 0
     candidates = {
-        c: m["ret_3m"] for c, m in metrics.items()
-        if m.get("ret_3m") is not None
+        c: m[ret_col] for c, m in metrics.items()
+        if m.get(ret_col) is not None
         and (not exclude_codes or c not in exclude_codes)
     }
     if not candidates:
@@ -225,9 +232,9 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
 
     end = pd.Timestamp(asof_date)
     window_end = end - timedelta(days=1)
-    window_start = end - timedelta(days=101)
+    window_start = end - timedelta(days=fetcher.RETURN_DAYS[ret_col] + 10)
 
-    for code in sorted(candidates, key=candidates.get, reverse=True):
+    for code in sorted(candidates, key=candidates.get, reverse=(pick == "top")):
         if _has_stale_catchup(conn, code, window_start, window_end):
             continue
         if min_corr is not None:
@@ -283,16 +290,28 @@ def get_fund_nav_after(conn, code, from_date):
 
 
 def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97,
-                 min_corr: float = 0.6):
+                 min_corr: float = None, ret_col: str = "ret_3m", pick: str = "bottom"):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
     的 700/720 那套道理)。默认 720/0.95 是当前线上在用的参数。
 
     min_corr: 冠军候选与上证指数近3月相关系数门槛, 见
-    find_champion_on_date 的 sse_df/min_corr 说明。默认0.6(已用2年90%
-    这组实测过0.5/0.6/0.7三档, 0.6综合表现最好, 2026-07-24定为标准
-    参数, 见下面"阈值组合回测参考快照")。传 None 则不过滤, 退回纯按
-    涨幅排名的旧逻辑。"""
+    find_champion_on_date 的 sse_df/min_corr 说明。2026-07-24 起默认
+    改回 None(不过滤)——之前用2年90%实测0.5/0.6/0.7三档定过0.6, 但
+    后面被 ret_col/pick 这条反转策略取代, 相关系数过滤对新逻辑没有
+    实测过、也没有继续保留的理由, 显式关掉。仍保留参数只是为了不删掉
+    这条已验证过有效的机制, 以后想重新启用可以传 0.6。
+
+    ret_col/pick: 排名依据("ret_1m"近1月/"ret_3m"近3月)和方向
+    ("top"=选最高即冠军/动量, "bottom"=选最低即跌幅最大/反转候选)。
+    2026-07-24 起标准策略定为 ret_col="ret_3m"+pick="bottom"(近3月
+    跌幅最大)——用2年90%信号实测: 冠军/动量(相关系数≥0.6版本)11笔
+    最大亏损-9.40%/平均亏损-5.37%; 近3月跌幅最大12笔最大亏损仅
+    -4.81%/平均亏损-1.72%, 亏损明显更可控, 机制上能解释(这批候选
+    普遍波动率比值低、回撤控制线天然更窄, 且已经跌透、下跌空间有限),
+    不依赖某一笔运气好的极端案例(该案例是021528财通成长优选混合C
+    +140.23%, 剔除它后累计收益仍不差, 亏损可控这个结论不受影响)。
+    见 find_champion_on_date 同名参数说明。"""
     conn = get_conn()
 
     # Load fund names and types from JSON cache
@@ -318,7 +337,8 @@ def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97,
     # Load QVIX —— 自算(qvix_self_history,上交所官方期权风险指标反推,
     # 不再是 optbbs 的 index_daily_cache)。阈值按传入的 window/pct 现算,
     # 不用表里预存的那一列(那一列固定是线上用的720/0.95)。
-    print(f"加载数据... (窗口={window}天, 分位={pct})")
+    print(f"加载数据... (窗口={window}天, 分位={pct}, 排名依据={ret_col}, "
+          f"方向={pick}, 相关系数门槛={min_corr})")
     qvix = fetcher.load_qvix_self_history()
     qvix = qvix.rename(columns={"qvix": "close"})
     qvix["date"] = pd.to_datetime(qvix["date"])
@@ -398,7 +418,7 @@ def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97,
                     "恐慌阈值": round(position["threshold"], 2),
                     "回撤控制线(%)": round(position["fund_dd_limit"], 2),
                     "大盘回撤线(%)": round(position["sse_dd_limit"], 2),
-                    "冠军近3月涨幅(前日口径)": f"+{position['ret_3m']:.2f}%",
+                    "冠军近3月涨幅(前日口径)": f"{position['ret_3m']:+.2f}%",
                     "卖出日": day.strftime("%Y-%m-%d"),
                     "期间最高": f"+{(position['peak_nav']/position['buy_nav']-1)*100:.1f}%",
                     "期间最大回撤": f"{max_dd:.1f}%",
@@ -416,7 +436,8 @@ def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97,
         if position is None and day in signal_map:
             threshold = signal_map[day]
             code, ret_3m = find_champion_on_date(conn, day_str, exclude_codes,
-                                                 sse_df=sse, min_corr=min_corr)
+                                                 sse_df=sse, min_corr=min_corr,
+                                                 ret_col=ret_col, pick=pick)
             if code is None:
                 continue
 
@@ -549,14 +570,23 @@ def main():
     parser.add_argument("--window", type=int, default=720, help="滚动窗口(交易日),默认720(约3年)")
     parser.add_argument("--pct", type=float, default=0.95, help="分位数,默认0.95")
     parser.add_argument("--min-corr", type=lambda s: None if s.lower() == "none" else float(s),
-                        default=0.6,
-                        help="冠军候选与上证指数近3月相关系数门槛,默认0.6"
-                             "(2026-07-24实测定档,见 run_backtest 说明);"
-                             "传 none 关掉过滤,退回纯按涨幅排名")
+                        default=None,
+                        help="冠军候选与上证指数近3月相关系数门槛,默认不启用"
+                             "(2026-07-24起改回默认关闭,见 run_backtest 说明);"
+                             "传具体数值(如0.6)启用")
+    parser.add_argument("--lookback", choices=["1m", "3m"], default="3m",
+                        help="排名依据的区间,默认3m(近3月,91天);"
+                             "1m=近1月(30天)")
+    parser.add_argument("--pick", choices=["top", "bottom"], default="bottom",
+                        help="默认bottom=选区间跌幅最大(反转候选,"
+                             "2026-07-24定为标准策略);"
+                             "top=选区间涨幅最高(冠军/动量,旧逻辑)")
     args = parser.parse_args()
 
+    _ret_col = "ret_1m" if args.lookback == "1m" else "ret_3m"
     t0 = time.time()
-    trades = run_backtest(window=args.window, pct=args.pct, min_corr=args.min_corr)
+    trades = run_backtest(window=args.window, pct=args.pct, min_corr=args.min_corr,
+                          ret_col=_ret_col, pick=args.pick)
     elapsed = time.time() - t0
 
     if not trades:
