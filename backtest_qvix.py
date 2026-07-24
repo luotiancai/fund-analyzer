@@ -172,7 +172,10 @@ def get_fund_nav_after(conn, code, from_date):
             for r in rows if r[1]]
 
 
-def run_backtest():
+def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97):
+    """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
+    多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
+    的 700/720 那套道理)。默认 720/0.95 是当前线上在用的参数。"""
     conn = get_conn()
 
     # Load fund names and types from JSON cache
@@ -187,15 +190,22 @@ def run_backtest():
             fund_names[c] = item.get("name", c)
             fund_types[c] = item.get("type", "")
 
-    # QDII 跟踪境外市场, 与 QVIX/大盘恐慌-反弹逻辑脱钩, 排除出冠军候选池
-    qdii_codes = {c for c, t in fund_types.items() if "QDII" in t}
+    # QDII/海外指数型跟踪境外市场, 与 QVIX/大盘恐慌-反弹逻辑脱钩, 排除出
+    # 冠军候选池(如"指数型-海外股票"的广发道琼斯石油指数C, 之前只过滤
+    # "QDII"字样漏掉了这类, 类型字符串里没有QDII三个字但同样跟踪境外)
+    qdii_codes = {c for c, t in fund_types.items() if ("QDII" in t or "海外" in t)}
 
-    # Load QVIX with threshold
-    print("加载数据...")
-    qvix = load_cached_json(conn, "qvix")
+    # Load QVIX —— 自算(qvix_self_history,上交所官方期权风险指标反推,
+    # 不再是 optbbs 的 index_daily_cache)。阈值按传入的 window/pct 现算,
+    # 不用表里预存的那一列(那一列固定是线上用的720/0.95)。
+    print(f"加载数据... (窗口={window}天, 分位={pct})")
+    qvix = fetcher.load_qvix_self_history()
+    qvix = qvix.rename(columns={"qvix": "close"})
+    qvix["date"] = pd.to_datetime(qvix["date"])
     qvix["close"] = pd.to_numeric(qvix["close"], errors="coerce")
     qvix = qvix.sort_values("date").reset_index(drop=True)
-    qvix["thr"] = qvix["close"].rolling(720, min_periods=240).quantile(0.95)
+    minp = int(window * minp_ratio)
+    qvix["thr"] = qvix["close"].rolling(window, min_periods=minp).quantile(pct)
 
     sse = load_cached_json(conn, "sse")
     sse["close"] = pd.to_numeric(sse["close"], errors="coerce")
@@ -402,8 +412,14 @@ def _apply_chain_fees(trades):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="QVIX恐慌信号回测")
+    parser.add_argument("--window", type=int, default=720, help="滚动窗口(交易日),默认720(约3年)")
+    parser.add_argument("--pct", type=float, default=0.95, help="分位数,默认0.95")
+    args = parser.parse_args()
+
     t0 = time.time()
-    trades = run_backtest()
+    trades = run_backtest(window=args.window, pct=args.pct)
     elapsed = time.time() - t0
 
     if not trades:
@@ -412,7 +428,7 @@ def main():
 
     df = pd.DataFrame(trades)
     print(f"\n{'='*110}")
-    print(f"回测结果: {len(df)} 笔交易, 耗时 {elapsed:.0f}s")
+    print(f"回测结果(窗口={args.window} 分位={args.pct}): {len(df)} 笔交易, 耗时 {elapsed:.0f}s")
     print(f"{'='*110}\n")
 
     completed = df[~df["卖出原因"].str.contains("持仓中")]

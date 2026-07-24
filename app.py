@@ -183,6 +183,33 @@ def load_sse_daily(cache_key):
     return fetcher.fetch_sse_daily()
 
 
+_QVIX_THR_COMBOS = [
+    ("1年99%", 250, 0.99, "#e15759"),
+    ("2年95%", 490, 0.95, "#59a14f"),
+    ("3年95%", 720, 0.95, "#8e44ad"),
+    ("5年90%", 1200, 0.90, "#4e79a7"),
+]
+
+
+@st.cache_data(show_spinner="正在计算候选恐慌阈值…")
+def load_qvix_threshold_combos(cache_key):
+    """按 backtest_qvix.py 同一套口径(minp_ratio=0.97)现算几组候选滚动
+    阈值(窗口×分位),供上证指数图勾选叠加对比——与线上生产阈值列(720/
+    0.95,minp=700,fetcher.update_qvix_self_daily 里精确维护)算法一致但
+    独立现算,只用于图上对比展示,不影响生产阈值/策略复盘本身。"""
+    hist = fetcher.load_qvix_self_history()
+    if hist is None or hist.empty:
+        return None
+    hist = hist.sort_values("date").reset_index(drop=True)
+    hist["date"] = pd.to_datetime(hist["date"])
+    hist["qvix"] = pd.to_numeric(hist["qvix"], errors="coerce")
+    out = hist[["date"]].copy()
+    for label, window, pct, _color in _QVIX_THR_COMBOS:
+        minp = int(window * 0.97)
+        out[label] = hist["qvix"].rolling(window, min_periods=minp).quantile(pct)
+    return out
+
+
 @st.cache_data(show_spinner="正在加载VIX恐慌指数数据…")
 def load_qvix_self(cache_key):
     """自算QVIX历史(qvix_self_history表,上交所官方期权风险指标反推,
@@ -1335,6 +1362,12 @@ with tab_sse:
             _show_vix = st.checkbox("VIX恐慌指数", value=True,
                                     key="sse_vix",
                                     help="50ETF期权QVIX（中国版VIX），右轴")
+        _thr_selected = []
+        if _show_vix:
+            _thr_selected = st.multiselect(
+                "叠加恐慌阈值线(可勾选对比不同窗口/分位组合)",
+                [c[0] for c in _QVIX_THR_COMBOS], default=["3年95%"],
+                key="sse_thr_combos")
 
         # Window slice keeps the anchor row (last close on/before the window
         # start) so the period change is measured against the true base point —
@@ -1372,8 +1405,9 @@ with tab_sse:
         # VIX恐慌指数（QVIX，自算）on a secondary right axis: levels (~15–40)
         # are incomparable with index points, so it never shares the left
         # scale. 数据源:qvix_self_history(上交所官方期权风险指标反推,
-        # 不是 optbbs——见 qvix_calc.py 顶部说明),阈值列已经是现算好的
-        # 滚动3年95分位,不用在这里重算。
+        # 不是 optbbs——见 qvix_calc.py 顶部说明)。阈值线改为现算的多组
+        # 候选(_QVIX_THR_COMBOS,见上方 load_qvix_threshold_combos),不再
+        # 只画表里固定的生产阈值列,方便勾选对比。
         qvix_view = None
         if _show_vix:
             _qvix = load_qvix_self(fetcher.qvix_self_history_last_date())
@@ -1399,12 +1433,25 @@ with tab_sse:
             fig_sse.update_layout(
                 yaxis2=dict(title="VIX恐慌指数", overlaying="y", side="right",
                             showgrid=False))
-            if "threshold" in qvix_view.columns and qvix_view["threshold"].notna().any():
-                fig_sse.add_trace(go.Scatter(
-                    x=qvix_view["date"], y=qvix_view["threshold"],
-                    name="恐慌阈值(3年95分位)", yaxis="y2",
-                    line=dict(color="#8e44ad", width=1.2, dash="dash"),
-                    hovertemplate="恐慌阈值 %{y:.2f}<extra></extra>"))
+            if _thr_selected:
+                _thr_combos_df = load_qvix_threshold_combos(
+                    fetcher.qvix_self_history_last_date())
+                if _thr_combos_df is not None:
+                    _thr_view = _thr_combos_df[
+                        (_thr_combos_df["date"] >= view["date"].min())
+                        & (_thr_combos_df["date"] <= view["date"].max())]
+                    for _label, _window, _pct, _color in _QVIX_THR_COMBOS:
+                        if _label not in _thr_selected:
+                            continue
+                        _line = _thr_view.dropna(subset=[_label])
+                        if _line.empty:
+                            continue
+                        fig_sse.add_trace(go.Scatter(
+                            x=_line["date"], y=_line[_label],
+                            name=f"恐慌阈值({_label})", yaxis="y2",
+                            line=dict(color=_color, width=1.2, dash="dash"),
+                            hovertemplate=f"阈值({_label}) " +
+                                          "%{y:.2f}<extra></extra>"))
 
         if _show_bands:
             _add_sse_drop_bands(fig_sse, sse_df,
