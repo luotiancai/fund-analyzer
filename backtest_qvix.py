@@ -288,7 +288,7 @@ def get_fund_nav_after(conn, code, from_date):
 
 def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97,
                  min_corr: float = None, ret_col: str = "ret_3m", pick: str = "bottom",
-                 min_vol_ratio: float = 1.5):
+                 min_vol_ratio: float = 1.5, dd_divisor: float = 5.0):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
     的 700/720 那套道理)。默认 720/0.95 是当前线上在用的参数。
@@ -330,7 +330,11 @@ def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97,
     假设不成立。之前排除港股通时漏选(其实是漏排除)的"国泰中证港股通
     科技ETF发起联接C"(2022年10-12月港股互联网超跌反弹段选中, +31.54%)
     现在正常保留在候选池里, 也是这版收益明显更好的原因之一。
-    见 find_champion_on_date 同名参数说明。"""
+    见 find_champion_on_date 同名参数说明。
+
+    dd_divisor: 回撤线除数——基金回撤控制线=阈值/dd_divisor×波动率比值,
+    大盘回撤线=阈值/dd_divisor。默认5.0(线上在用口径), 可传4/6等回测
+    更宽/更窄的止损带对效果的影响。"""
     conn = get_conn()
 
     # Load fund names and types from JSON cache
@@ -359,7 +363,8 @@ def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97,
     # 不再是 optbbs 的 index_daily_cache)。阈值按传入的 window/pct 现算,
     # 不用表里预存的那一列(那一列固定是线上用的720/0.95)。
     print(f"加载数据... (窗口={window}天, 分位={pct}, 排名依据={ret_col}, "
-          f"方向={pick}, 相关系数门槛={min_corr}, 波动率比值下限={min_vol_ratio})")
+          f"方向={pick}, 相关系数门槛={min_corr}, 波动率比值下限={min_vol_ratio}, "
+          f"回撤线除数={dd_divisor})")
     qvix = fetcher.load_qvix_self_history()
     qvix = qvix.rename(columns={"qvix": "close"})
     qvix["date"] = pd.to_datetime(qvix["date"])
@@ -481,7 +486,7 @@ def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97,
                 actual_buy_date = day
 
             beta = compute_beta(conn, sse, code, day_str)
-            fund_dd_limit = threshold / 5.0 * beta
+            fund_dd_limit = threshold / dd_divisor * beta
 
             # SSE peak at buy (从买入日开始追踪, 不是历史最高)
             sse_on_buy = sse[sse["date"] <= actual_buy_date]
@@ -502,7 +507,7 @@ def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97,
                 "ret_3m": ret_3m,
                 "beta": beta,
                 "fund_dd_limit": fund_dd_limit,
-                "sse_dd_limit": threshold / 5.0,
+                "sse_dd_limit": threshold / dd_divisor,
                 "threshold": threshold,
                 "nav_map": nav_map,
             }
@@ -608,13 +613,18 @@ def main():
                         default=1.5,
                         help="候选波动率比值下限,默认1.5(2026-07-24定档,"
                              "见 run_backtest 说明);传 none 关掉过滤")
+    parser.add_argument("--dd-divisor", type=float, default=5.0,
+                        help="回撤线除数,默认5.0(线上口径:基金线=阈值/除数×"
+                             "波动率比值,大盘线=阈值/除数);传4=更宽止损带,"
+                             "6=更窄止损带")
     args = parser.parse_args()
 
     _ret_col = "ret_1m" if args.lookback == "1m" else "ret_3m"
     t0 = time.time()
     trades = run_backtest(window=args.window, pct=args.pct, min_corr=args.min_corr,
                           ret_col=_ret_col, pick=args.pick,
-                          min_vol_ratio=args.min_vol_ratio)
+                          min_vol_ratio=args.min_vol_ratio,
+                          dd_divisor=args.dd_divisor)
     elapsed = time.time() - t0
 
     if not trades:

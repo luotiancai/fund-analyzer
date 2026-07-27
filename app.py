@@ -1387,12 +1387,6 @@ with tab_sse:
             _show_vix = st.checkbox("VIX恐慌指数", value=True,
                                     key="sse_vix",
                                     help="50ETF期权QVIX（中国版VIX），右轴")
-        _thr_selected = []
-        if _show_vix:
-            _thr_selected = st.multiselect(
-                "叠加恐慌阈值线(可勾选对比不同窗口/分位组合)",
-                [c[0] for c in _QVIX_THR_COMBOS], default=["2年90%"],
-                key="sse_thr_combos")
 
         # Window slice keeps the anchor row (last close on/before the window
         # start) so the period change is measured against the true base point —
@@ -1430,9 +1424,9 @@ with tab_sse:
         # VIX恐慌指数（QVIX，自算）on a secondary right axis: levels (~15–40)
         # are incomparable with index points, so it never shares the left
         # scale. 数据源:qvix_self_history(上交所官方期权风险指标反推,
-        # 不是 optbbs——见 qvix_calc.py 顶部说明)。阈值线改为现算的多组
-        # 候选(_QVIX_THR_COMBOS,见上方 load_qvix_threshold_combos),不再
-        # 只画表里固定的生产阈值列,方便勾选对比。
+        # 不是 optbbs——见 qvix_calc.py 顶部说明)。阈值线现算
+        # (_QVIX_THR_COMBOS,见上方 load_qvix_threshold_combos)——候选
+        # 组合已收敛到只剩标准的2年90%一组,不再提供勾选,随VIX直接画。
         qvix_view = None
         if _show_vix:
             _qvix = load_qvix_self(fetcher.qvix_self_history_last_date())
@@ -1458,25 +1452,22 @@ with tab_sse:
             fig_sse.update_layout(
                 yaxis2=dict(title="VIX恐慌指数", overlaying="y", side="right",
                             showgrid=False))
-            if _thr_selected:
-                _thr_combos_df = load_qvix_threshold_combos(
-                    fetcher.qvix_self_history_last_date())
-                if _thr_combos_df is not None:
-                    _thr_view = _thr_combos_df[
-                        (_thr_combos_df["date"] >= view["date"].min())
-                        & (_thr_combos_df["date"] <= view["date"].max())]
-                    for _label, _window, _pct, _color in _QVIX_THR_COMBOS:
-                        if _label not in _thr_selected:
-                            continue
-                        _line = _thr_view.dropna(subset=[_label])
-                        if _line.empty:
-                            continue
-                        fig_sse.add_trace(go.Scatter(
-                            x=_line["date"], y=_line[_label],
-                            name=f"恐慌阈值({_label})", yaxis="y2",
-                            line=dict(color=_color, width=1.2, dash="dash"),
-                            hovertemplate=f"阈值({_label}) " +
-                                          "%{y:.2f}<extra></extra>"))
+            _thr_combos_df = load_qvix_threshold_combos(
+                fetcher.qvix_self_history_last_date())
+            if _thr_combos_df is not None:
+                _thr_view = _thr_combos_df[
+                    (_thr_combos_df["date"] >= view["date"].min())
+                    & (_thr_combos_df["date"] <= view["date"].max())]
+                for _label, _window, _pct, _color in _QVIX_THR_COMBOS:
+                    _line = _thr_view.dropna(subset=[_label])
+                    if _line.empty:
+                        continue
+                    fig_sse.add_trace(go.Scatter(
+                        x=_line["date"], y=_line[_label],
+                        name=f"恐慌阈值({_label})", yaxis="y2",
+                        line=dict(color=_color, width=1.2, dash="dash"),
+                        hovertemplate=f"阈值({_label}) " +
+                                      "%{y:.2f}<extra></extra>"))
 
         if _show_bands:
             _add_sse_drop_bands(fig_sse, sse_df,
