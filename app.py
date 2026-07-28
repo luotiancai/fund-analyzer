@@ -1607,6 +1607,11 @@ with tab_sse:
                 "类型": ["混合型-灵活", "指数型-股票", "混合型-灵活",
                         "混合型-偏股", "混合型-灵活", "混合型-偏股",
                         "混合型-灵活", "混合型-偏股"],
+                # 买入日当时已披露的最新一期季报规模(as-of, 无未来函数),
+                # 即策略选基那天实际能看到的规模。全部≥5000万门槛(最小
+                # 汇丰晋信0.93亿, 正好<1亿, 故1亿档会把它换掉)。
+                "买入时规模(亿)": [1.33, 1.70, 3.92, 0.93,
+                                 1.31, 1.80, 1.36, 5.52],
                 "波动率比值(近3月)": [1.73, 2.19, 3.20, 2.11,
                                    1.93, 1.81, 3.41, 2.49],
                 "恐慌阈值": [26.33, 23.24, 22.28, 22.28,
@@ -1676,6 +1681,7 @@ with tab_sse:
                     "买入日": st.column_config.Column(width="small"),
                     "近3月跌幅最大标的(C类全市场,按前一交易日榜单)": st.column_config.Column(width="medium"),
                     "类型": st.column_config.Column(width="small"),
+                    "买入时规模(亿)": st.column_config.Column(width="small"),
                     "波动率比值(近3月)": st.column_config.Column(width="small"),
                     "恐慌阈值": st.column_config.Column(width="small"),
                     "回撤控制线(%)": st.column_config.Column(width="small"),
