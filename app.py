@@ -379,7 +379,8 @@ with tab_table:
     # applies at once when 「开始筛选」 is pressed (expensive as-of recomputes stay
     # off until then). Until the first submit, the defaults below are in effect.
     with st.form("filter_form"):
-        col_f1, col_f2, col_f3, col_f4, col_f5 = st.columns([3, 1, 1, 1, 1.2])
+        col_f1, col_f2, col_f3, col_f4, col_f6, col_f5 = st.columns(
+            [3, 1, 1, 1, 1, 1.2])
         with col_f1:
             selected_types = st.multiselect(
                 "基金类型筛选（不选则显示全部）",
@@ -398,6 +399,15 @@ with tab_table:
             max_dd = st.number_input(
                 "所选区间最大回撤率 %", value=None, min_value=0.0, step=1.0,
                 placeholder="不限",
+            )
+        with col_f6:
+            min_aum = st.number_input(
+                "最低规模（亿）", value=0.5, min_value=0.0, step=0.5,
+                help="剔除规模低于此值的基金（默认0.5亿=5000万）。规模太小"
+                     "（几十万~几千万）的迷你/僵尸基金净值容易被单笔申赎搅动"
+                     "失真、经理也不上心。按截至日期当时已披露的最新季报规模"
+                     "判定；查不到规模的基金保留、在「规模(亿)」列显示 —。"
+                     "设 0 = 不限。",
             )
         with col_f5:
             asof_date = st.date_input(
@@ -523,11 +533,15 @@ with tab_table:
         _fparams = {
             "types": sorted(selected_types), "period": period_label,
             "min_ret": min_ret, "max_dd": max_dd, "asof": _asof_iso,
+            # 规模下限(亿):0/None 视为不限,归一化成 None 免得 0 与不限各占
+            # 一个缓存键。
+            "min_aum": (min_aum if min_aum and min_aum > 0 else None),
             # Bumped when the filter rules change (v3: exclude funds younger
             # than the *selected* period window; v4-v6: exclude 债券/固收/偏债
             # types, is_bond 逐步收敛为「含债或固收」; v7: 回撤改按校正收益
-            # 复利口径,与模拟盘一致), so stale cached results never get served.
-            "rule_ver": 7,
+            # 复利口径,与模拟盘一致; v8: 新增「最低规模」过滤 + 规模(亿)列),
+            # so stale cached results never get served.
+            "rule_ver": 8,
             # Combines the Sharpe/drawdown recompute timestamp with the fund
             # list's own saved_at: the in-app update button refreshes the list
             # (fresh returns) but skips recompute_all, so last_update_time()
@@ -634,6 +648,22 @@ with tab_table:
                 dd_pct = pd.to_numeric(display[mdd_col], errors="coerce") * 100
                 display = display[dd_pct.isna() | (dd_pct <= max_dd)]
 
+            # ── 规模过滤 + 规模(亿)列 ─────────────────────────────────────────
+            # 规模按「截至日期当时已披露的最新季报」取(as-of, 无未来函数;
+            # 快照模式用 asof_date, 实时用今天), 纯读 fund_scale_hist(每晚
+            # update_daily 刷新)、不联网。已知规模 < 门槛的剔除; 查不到规模的
+            # 保留(在列里显示为空)——避免规模库尚未覆盖到的基金被误杀, 与
+            # 回测里「未知即跳过」略有不同(那边是无人值守选基, 这里用户能
+            # 自己看着 — 的行取舍)。
+            _aum_ref = (asof_date if asof_mode
+                        else dt.date.today()).strftime("%Y-%m-%d")
+            _aum_map = fetcher.funds_aum_asof(
+                display["code"].dropna().tolist(), _aum_ref)
+            display["_aum"] = display["code"].map(_aum_map)
+            if min_aum and min_aum > 0:
+                _known_small = display["_aum"].notna() & (display["_aum"] < min_aum)
+                display = display[~_known_small]
+
             # Build the presentation table inside the spinner too, so the loading
             # animation covers everything between the click and the rendered rows.
             ret_label = f"{period_label}收益率(%)"
@@ -643,6 +673,7 @@ with tab_table:
             table["基金代码"] = display.get("code")
             table["基金名称"] = display.get("name")
             table["类型"] = display.get("type")
+            table["规模(亿)"] = pd.to_numeric(display.get("_aum"), errors="coerce").round(2)
             if ret_col in display.columns:
                 table[ret_label] = pd.to_numeric(display[ret_col], errors="coerce").round(2)
             if sharpe_col and sharpe_col in display.columns:

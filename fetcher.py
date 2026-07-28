@@ -164,6 +164,18 @@ def init_db():
             index_code TEXT NOT NULL,
             saved_at   REAL NOT NULL
         );
+        -- 基金季度规模(期末净资产)历史,来自 pingzhongdata 的
+        -- Data_fluctuationScale。一支基金一季一行,aum 单位亿元,publish_date
+        -- 是该季报的估算披露日(季报quarter_end+滞后天数,见 _SCALE_PUB_LAG),
+        -- 供回测/选基按"信号日当时能看到的最新一期"取规模、避免未来函数。
+        CREATE TABLE IF NOT EXISTS fund_scale_hist (
+            code         TEXT NOT NULL,
+            quarter_end  TEXT NOT NULL,   -- ISO yyyy-mm-dd(季末)
+            aum          REAL,            -- 期末净资产,亿元
+            publish_date TEXT NOT NULL,   -- 估算披露日 ISO yyyy-mm-dd
+            saved_at     REAL NOT NULL,
+            PRIMARY KEY (code, quarter_end)
+        ) WITHOUT ROWID;
     """)
     # Add per-period max-drawdown / Sharpe / return columns (migration for
     # existing DBs). Returns are recomputed locally from stored NAV because the
@@ -645,6 +657,145 @@ def _fetch_nav_full(code: str) -> Optional[pd.DataFrame]:
     except Exception as e:
         logger.debug("full NAV fetch failed for %s: %s", code, e)
         return None
+
+
+# ── 基金季度规模(AUM)历史 ────────────────────────────────────────────────────
+# pingzhongdata 的 Data_fluctuationScale(期末净资产,亿元)。规模是季度数据、
+# 有披露滞后:季报(3/9月末)约15个工作日内披露,半年报(6月末)60天,年报(12
+# 月末)90天。存 publish_date=季末+滞后天数(留buffer),这样按信号日取"当时
+# 真正能看到的最新一期",避免用到尚未披露的数据(未来函数)。
+_SCALE_PUB_LAG = {3: 25, 6: 62, 9: 25, 12: 92}  # 季末月 → 披露滞后(日历日)
+SCALE_TTL = 7 * 24 * 3600  # 规模季度数据,一周内不重复抓
+
+
+def _scale_publish_date(quarter_end: str) -> str:
+    lag = _SCALE_PUB_LAG.get(int(quarter_end[5:7]), 92)
+    return (pd.Timestamp(quarter_end) + pd.Timedelta(days=lag)).strftime("%Y-%m-%d")
+
+
+def load_fund_scale_hist(code: str) -> pd.DataFrame:
+    """基金季度规模历史(升序),列: quarter_end, aum(亿元), publish_date。
+    库里没有则返回空 DataFrame(不触发网络,调用方决定是否 fetch)。"""
+    conn = _conn()
+    df = pd.read_sql_query(
+        "SELECT quarter_end, aum, publish_date FROM fund_scale_hist "
+        "WHERE code=? ORDER BY quarter_end", conn, params=(code,))
+    conn.close()
+    return df
+
+
+def fetch_fund_scale_hist(code: str, force_refresh: bool = False) -> pd.DataFrame:
+    """基金季度规模历史(cache-first)。库里有且未过期(<SCALE_TTL)直接用,
+    否则从东财 F10「规模变动」接口(type=gmbd)抓全历史、整段 upsert 进
+    fund_scale_hist。用 gmbd 而非 pingzhongdata 的 Data_fluctuationScale:
+    后者只给最近约5个季度, 回测到2022-2024年的老基金会整段查不到规模。
+    返回列: quarter_end, aum(亿元), publish_date(升序)。"""
+    conn = _conn()
+    if not force_refresh:
+        meta = conn.execute(
+            "SELECT MAX(saved_at) AS s FROM fund_scale_hist WHERE code=?",
+            (code,)).fetchone()
+        if meta and meta["s"] and (time.time() - meta["s"]) < SCALE_TTL:
+            conn.close()
+            return load_fund_scale_hist(code)
+    conn.close()
+
+    rows = []
+    try:
+        r = requests.get(
+            _EM_F10_URL,
+            params={"type": "gmbd", "code": code, "page": 1, "rt": "0.1"},
+            headers={"Referer": f"https://fundf10.eastmoney.com/gmbd_{code}.html",
+                     "User-Agent": "Mozilla/5.0"},
+            timeout=20)
+        # content 是双引号包起来的表格 HTML(内部只用单引号,无转义双引号),
+        # 后面还跟别的字段, 所以非贪婪匹配到第一个闭合双引号即为整张表。
+        m = re.search(r'content:"(.*?)"', r.text, re.DOTALL)
+        html = m.group(1) if m else ""
+        # 表列: 日期 | 期间申购 | 期间赎回 | 期末总份额 | 期末净资产(亿元) | 净资产变动率
+        for tr in re.findall(r"<tr>(.*?)</tr>", html, re.DOTALL):
+            tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.DOTALL)
+            if len(tds) < 5:
+                continue
+            qe = tds[0].strip()
+            if not re.match(r"\d{4}-\d{2}-\d{2}", qe):
+                continue
+            try:
+                aum = float(tds[4].strip())
+            except ValueError:
+                continue  # "---" 等占位(尚未披露该期净资产)
+            rows.append((code, qe, aum, _scale_publish_date(qe), time.time()))
+        time.sleep(0.15)  # 只在真·网络取数(缓存未命中)时限速, 防批量抓被封
+    except Exception as e:
+        logger.debug("scale fetch failed for %s: %s", code, e)
+
+    if rows:
+        conn = _conn()
+        conn.executemany(
+            "INSERT OR REPLACE INTO fund_scale_hist "
+            "(code, quarter_end, aum, publish_date, saved_at) VALUES (?, ?, ?, ?, ?)",
+            rows)
+        conn.commit()
+        conn.close()
+    return load_fund_scale_hist(code)
+
+
+def fund_aum_asof(code: str, date, fetch_if_missing: bool = True) -> Optional[float]:
+    """信号日 date 当时能看到的最新一期基金规模(亿元);无可用数据返回 None。
+    只用 publish_date <= date 的季度,避免用到尚未披露的规模(未来函数)。"""
+    df = load_fund_scale_hist(code)
+    if df.empty and fetch_if_missing:
+        df = fetch_fund_scale_hist(code)
+    if df.empty:
+        return None
+    dstr = pd.Timestamp(date).strftime("%Y-%m-%d")
+    avail = df[df["publish_date"] <= dstr]
+    return float(avail["aum"].iloc[-1]) if not avail.empty else None
+
+
+def funds_aum_asof(codes: list, date) -> dict:
+    """批量版 fund_aum_asof: 一次 SQL 取多只基金在 date 当时可见的最新一期
+    规模(亿元)。返回 {code: aum 或 None}(codes 里查不到的也给 None)。纯读
+    库、不触发网络, 供 app 列表按需给整页基金标规模。"""
+    if not codes:
+        return {}
+    dstr = pd.Timestamp(date).strftime("%Y-%m-%d")
+    conn = _conn()
+    # 每只取 publish_date<=date 里 quarter_end 最大的那期(= 当时最新已披露)。
+    # 先 GROUP BY 求每只的最新季末, 再 join 回取该期 aum(比逐行相关子查询快)。
+    rows = conn.execute(
+        "SELECT f.code, f.aum FROM fund_scale_hist f "
+        "JOIN (SELECT code, MAX(quarter_end) AS mq FROM fund_scale_hist "
+        "      WHERE publish_date <= ? GROUP BY code) t "
+        "  ON f.code = t.code AND f.quarter_end = t.mq", (dstr,)).fetchall()
+    conn.close()
+    got = {r["code"]: r["aum"] for r in rows}
+    return {c: got.get(c) for c in codes}
+
+
+def refresh_scale_hist(codes: Optional[list] = None,
+                       progress: Optional[Callable] = None) -> int:
+    """批量刷新基金季度规模(cache-first: SCALE_TTL 内已抓过的跳过)。codes
+    默认取所有有净值历史的基金(即候选池)。规模是季度数据, 平时绝大多数
+    命中缓存、几乎零网络; 只有新基金/过期的才真抓。返回实际发生网络抓取
+    的只数。由 update_daily.py 每日调用(不放进 run_pipeline, 免得拖慢
+    in-app「🔄 更新数据」按钮)。"""
+    if codes is None:
+        codes = sorted(list_nav_codes())
+    conn = _conn()
+    fresh = {r["code"] for r in conn.execute(
+        "SELECT code FROM fund_scale_hist GROUP BY code "
+        "HAVING MAX(saved_at) > ?", (time.time() - SCALE_TTL,))}
+    conn.close()
+    fetched = 0
+    total = len(codes)
+    for i, code in enumerate(codes):
+        if code not in fresh:
+            fetch_fund_scale_hist(code)  # 内部 upsert + 0.15s 限速
+            fetched += 1
+        if progress:
+            progress("刷新规模", i + 1, total)
+    return fetched
 
 
 def fetch_nav(code: str) -> Optional[pd.DataFrame]:

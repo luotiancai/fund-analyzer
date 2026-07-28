@@ -61,6 +61,15 @@ def main():
                  summary["funds"], summary["backfilled"], summary["appended"],
                  summary["patched"], summary["failed"], summary["recomputed"])
 
+        # 基金季度规模刷新(供选基/回测的规模门槛用)。cache-first, 7天内
+        # 已抓的跳过, 平时几乎零网络; 只有新基金/过期的才真抓。
+        try:
+            n = fetcher.refresh_scale_hist(
+                progress=lambda p, d, t: _log_progress(p, d, t))
+            log.info("   基金规模刷新完成(本次实抓 %d 只)", n)
+        except Exception as e:
+            log.warning("   基金规模刷新失败(不影响主流程): %s", e)
+
     # ── 指数刷新 + QVIX自算 + 动态恐慌阈值 ──────────────────────────────────
     # 上证指数刷新照旧(app 侧无过期时间,只在这里force_refresh才变)。QVIX
     # 不再用 optbbs——那是免费QVIX源里唯一一家,却发布延迟常年到次日上午、
