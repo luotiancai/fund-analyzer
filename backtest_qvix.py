@@ -173,7 +173,7 @@ def _corr_with_market(conn, sse_df, code, window_start, window_end):
 def find_champion_on_date(conn, asof_date, exclude_codes=None,
                           sse_df=None, min_corr=None,
                           ret_col="ret_3m", pick="top", min_vol_ratio=None,
-                          min_aum=None):
+                          min_aum=None, require_drop=True):
     """找 asof_date 当天视角下排名第一的标的(排除 exclude_codes). 返回 (code, ret).
 
     复用 fetcher.compute_metrics_asof——按日收益率连乘计算区间收益(正确
@@ -233,12 +233,13 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
     window_start = end - timedelta(days=fetcher.RETURN_DAYS[ret_col] + 10)
 
     for code in sorted(candidates, key=candidates.get, reverse=(pick == "top")):
-        if pick == "bottom" and candidates[code] >= 0:
+        if require_drop and pick == "bottom" and candidates[code] >= 0:
             # 候选按跌幅从深到浅排, 走到这里说明真正下跌的候选(连同
             # 能同时满足 min_vol_ratio 等其他条件的)已经找完了, 剩下
             # 全是涨的——不是超跌反转的局, 今天不操作, 不退而求其次去
             # 买涨幅最小的那个(那样就不是"跌幅最大"策略了, 是变相的
-            # "涨幅倒数第一", 意义不一样)。
+            # "涨幅倒数第一", 意义不一样)。require_drop=False 时关掉这条,
+            # 照买跌幅最大(涨幅最小)那个, 用于回测「去掉不操作规则」的效果。
             break
         if _has_stale_catchup(conn, code, window_start, window_end):
             continue
@@ -309,7 +310,7 @@ def get_fund_nav_after(conn, code, from_date):
 def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  min_corr: float = None, ret_col: str = "ret_3m", pick: str = "bottom",
                  min_vol_ratio: float = 1.5, dd_divisor: float = 5.0,
-                 min_aum: float = 0.5):
+                 min_aum: float = 0.5, require_drop: bool = True):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
     的 475/490 那套道理)。默认 490/0.90 是当前线上在用的参数
@@ -497,7 +498,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                                                  sse_df=sse, min_corr=min_corr,
                                                  ret_col=ret_col, pick=pick,
                                                  min_vol_ratio=min_vol_ratio,
-                                                 min_aum=min_aum)
+                                                 min_aum=min_aum,
+                                                 require_drop=require_drop)
             if code is None:
                 continue
 
@@ -624,6 +626,33 @@ def _apply_chain_fees(trades):
             del t[k]
 
 
+def summarize_trades(trades: list) -> dict:
+    """从 run_backtest 的 trades 汇总关键指标(只算已完成、剔除持仓中的)。
+    供 main() 打印与 update_daily 跑批落库共用, 口径一致。"""
+    df = pd.DataFrame(trades)
+    summary = {"total_trades": len(df)}
+    if df.empty:
+        return summary
+    completed = df[~df["卖出原因"].str.contains("持仓中")]
+    if completed.empty:
+        return summary
+    rets = completed["费后收益"]
+    days = completed["持有天数"]
+    wins = rets[rets > 0]
+    summary.update({
+        "completed": int(len(completed)),
+        "wins": int(len(wins)),
+        "win_rate": round(len(wins) / len(completed) * 100, 1),
+        "total_ret": round(float(((1 + rets / 100).prod() - 1) * 100), 2),
+        "total_fee": round(float(completed["手续费%"].sum()), 1),
+        "avg_hold_days": round(float(days.mean()), 0),
+        "avg_ret": round(float(rets.mean()), 2),
+        "best": round(float(rets.max()), 2),
+        "worst": round(float(rets.min()), 2),
+    })
+    return summary
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="QVIX恐慌信号回测")
@@ -656,6 +685,14 @@ def main():
                         help="基金规模下限(亿元,信号日当时能看到的最新季报口径),"
                              "默认0.5=5000万(2026-07-28标准);1=1亿;传none关闭。"
                              "低于门槛或查不到规模的候选跳过、往下一名找")
+    parser.add_argument("--no-require-drop", action="store_true",
+                        help="关掉「跌幅耗尽即不操作」规则:信号日即便所有候选都"
+                             "是正收益也照买跌幅最大(涨幅最小)那个。默认保留该"
+                             "规则(标准策略:没有真正下跌的标的当天就不买)")
+    parser.add_argument("--save", action="store_true",
+                        help="把本次回测明细+汇总写入 DB(strategy_backtest),"
+                             "供 app「策略回测」tab 读取展示。一般只对标准参数"
+                             "(默认参数, 不加实验性开关)执行, 别用魔改参数覆盖")
     args = parser.parse_args()
 
     _ret_col = "ret_1m" if args.lookback == "1m" else "ret_3m"
@@ -664,7 +701,8 @@ def main():
                           ret_col=_ret_col, pick=args.pick,
                           min_vol_ratio=args.min_vol_ratio,
                           dd_divisor=args.dd_divisor,
-                          min_aum=args.min_aum)
+                          min_aum=args.min_aum,
+                          require_drop=not args.no_require_drop)
     elapsed = time.time() - t0
 
     if not trades:
@@ -676,23 +714,16 @@ def main():
     print(f"回测结果(窗口={args.window} 分位={args.pct}): {len(df)} 笔交易, 耗时 {elapsed:.0f}s")
     print(f"{'='*110}\n")
 
-    completed = df[~df["卖出原因"].str.contains("持仓中")]
-    if not completed.empty:
-        # 用费后收益算累计
-        rets = completed["费后收益"]
-        days = completed["持有天数"]
-        wins = rets[rets > 0]
-        losses = rets[rets <= 0]
-        total_ret = ((1 + rets / 100).prod() - 1) * 100
-        total_fee = completed["手续费%"].sum()
-        print(f"已完成: {len(completed)} 笔")
-        print(f"  胜率: {len(wins)}/{len(completed)} = {len(wins)/len(completed)*100:.1f}%")
-        print(f"  累计收益(费后复利): {total_ret:+.2f}%")
-        print(f"  累计手续费: {total_fee:.1f}%")
-        print(f"  平均持有: {days.mean():.0f} 天")
-        print(f"  平均收益(费后): {rets.mean():+.2f}%")
-        print(f"  最佳: {rets.max():+.2f}%")
-        print(f"  最差: {rets.min():+.2f}%")
+    summary = summarize_trades(trades)
+    if summary.get("completed"):
+        print(f"已完成: {summary['completed']} 笔")
+        print(f"  胜率: {summary['wins']}/{summary['completed']} = {summary['win_rate']:.1f}%")
+        print(f"  累计收益(费后复利): {summary['total_ret']:+.2f}%")
+        print(f"  累计手续费: {summary['total_fee']:.1f}%")
+        print(f"  平均持有: {summary['avg_hold_days']:.0f} 天")
+        print(f"  平均收益(费后): {summary['avg_ret']:+.2f}%")
+        print(f"  最佳: {summary['best']:+.2f}%")
+        print(f"  最差: {summary['worst']:+.2f}%")
 
     # 输出表格
     display_cols = ["买入日", "冠军(C类全市场,按前一交易日榜单)", "类型",
@@ -700,6 +731,14 @@ def main():
                     "冠军近3月涨幅(前日口径)", "卖出日", "持有收益",
                     "手续费%", "期间最高", "期间最大回撤", "同期上证", "卖出原因"]
     print(f"\n{df[display_cols].to_string(index=False)}")
+
+    if args.save:
+        params = {"window": args.window, "pct": args.pct,
+                  "lookback": args.lookback, "pick": args.pick,
+                  "min_vol_ratio": args.min_vol_ratio, "dd_divisor": args.dd_divisor,
+                  "min_aum": args.min_aum, "require_drop": not args.no_require_drop}
+        fetcher.save_backtest_result(trades, summary, params)
+        print("\n✅ 已写入 DB(strategy_backtest), app「策略回测」tab 可读取")
 
 
 if __name__ == "__main__":

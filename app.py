@@ -364,8 +364,8 @@ with _c_qvix_txt:
         st.caption("🌡️ 当前QVIX 暂不可用（点右侧🔄重试）")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_table, tab_detail, tab_sim, tab_sse, tab_hsi = st.tabs(
-    ["📋 基金列表", "🔍 基金详情", "💰 模拟盘", "📈 上证指数", "🇭🇰 恒生指数"])
+tab_table, tab_detail, tab_sim, tab_bt, tab_sse, tab_hsi = st.tabs(
+    ["📋 基金列表", "🔍 基金详情", "💰 模拟盘", "📊 策略回测", "📈 上证指数", "🇭🇰 恒生指数"])
 
 # ─── Tab 1: Table ────────────────────────────────────────────────────────────
 with tab_table:
@@ -1400,6 +1400,52 @@ with tab_sim:
                         file_name=f"模拟盘交易记录_{sim_date}.csv",
                         mime="text/csv",
                     )
+
+# ─── Tab: 策略回测 ────────────────────────────────────────────────────────────
+# 回测要跑几百秒、不能在页面里实时算, 这里只读 strategy_backtest 表(由
+# backtest_qvix.py --save / update_daily 跑批写入)展示最新一次标准策略的
+# 交易明细与汇总。
+with tab_bt:
+    st.subheader("QVIX恐慌信号反转策略 · 历史回测")
+    st.caption(
+        "标准策略：QVIX 破「滚动2年90分位」恐慌阈值当天买入 · 标的取前一交易日"
+        "「近3月跌幅最大」的C类基金(反转候选) · 候选须满足 波动率比值≥1.5(振幅"
+        "强于大盘) 且 规模≥5000万 · 当天若没有真正下跌(近3月负收益)的合格标的"
+        "则不操作 · 卖出用双回撤止损线(基金线=阈值/5×波动率比值，大盘线=阈值/5，"
+        "先到先卖)。费后收益已扣赎回费。"
+    )
+    _bt = fetcher.load_backtest_result()
+    if _bt is None:
+        st.info("尚未生成回测数据。运行 `python3 backtest_qvix.py --save` 或等每日跑批生成。")
+    else:
+        _bt_df, _bt_sum, _bt_params, _bt_saved = _bt
+        _bt_age_h = (time.time() - _bt_saved) / 3600
+        _fresh = "🟢" if _bt_age_h < 30 else "🟠"
+        st.caption(
+            f"{_fresh} 回测数据生成于 {_fmt_cst(_bt_saved, '%Y-%m-%d %H:%M')}"
+            f"（{_bt_age_h:.0f} 小时前）· 随净值/QVIX每日跑批刷新"
+        )
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("交易笔数", f"{_bt_sum.get('completed', _bt_sum.get('total_trades', 0))} 笔")
+        c2.metric("胜率", f"{_bt_sum.get('win_rate', 0):.1f}%",
+                  f"{_bt_sum.get('wins', 0)}/{_bt_sum.get('completed', 0)} 胜")
+        c3.metric("累计收益(费后复利)", f"{_bt_sum.get('total_ret', 0):+.1f}%")
+        c4.metric("平均单笔(费后)", f"{_bt_sum.get('avg_ret', 0):+.1f}%",
+                  f"最差 {_bt_sum.get('worst', 0):+.2f}%")
+
+        _bt_cols = ["买入日", "冠军(C类全市场,按前一交易日榜单)", "类型",
+                    "波动率比值(近3月)", "恐慌阈值", "回撤控制线(%)", "大盘回撤线(%)",
+                    "冠军近3月涨幅(前日口径)", "卖出日", "持有收益",
+                    "期间最高", "期间最大回撤", "同期上证", "卖出原因"]
+        _bt_show = _bt_df[[c for c in _bt_cols if c in _bt_df.columns]].rename(
+            columns={"冠军(C类全市场,按前一交易日榜单)": "标的(近3月跌幅最大)",
+                     "波动率比值(近3月)": "波动率比值"})
+        st.dataframe(_bt_show, use_container_width=True, height=460, hide_index=True)
+        st.caption(
+            "⚠️ 回测为历史复盘、非未来收益承诺，样本仅"
+            f" {_bt_sum.get('completed', 0)} 笔。规模按信号日当时已披露的最新季报"
+            "取值(无未来函数)；已知已验证的净值异常已在算法内校正。"
+        )
 
 # ─── Tab 4: SSE index ────────────────────────────────────────────────────────
 with tab_sse:
