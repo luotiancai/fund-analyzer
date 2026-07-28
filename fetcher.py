@@ -1397,7 +1397,7 @@ def load_qvix_self_history() -> Optional[pd.DataFrame]:
 
 
 def save_qvix_self_threshold(dates: list, thresholds: list) -> None:
-    """把滚动3年95分位恐慌阈值写回 qvix_self_history 的 threshold 列
+    """把滚动2年90分位恐慌阈值写回 qvix_self_history 的 threshold 列
     (按自算QVIX序列现算的,不是套用optbbs那条历史算出来的阈值)。"""
     conn = _conn()
     cols = [r[1] for r in conn.execute("PRAGMA table_info(qvix_self_history)")]
@@ -1412,7 +1412,7 @@ def save_qvix_self_threshold(dates: list, thresholds: list) -> None:
 
 def update_qvix_self_daily() -> tuple:
     """收盘后重算"最近一个已收盘交易日"的自算QVIX,写入 qvix_self_history
-    并重算滚动3年95分位阈值。update_daily.py(06:00)和 notify_qvix.py
+    并重算滚动2年90分位阈值。update_daily.py(06:00)和 notify_qvix.py
     (14:40)都调这个,取代原来基于 optbbs 的 fetch_qvix_daily(force_refresh=True)。
 
     目标日期不是"今天"——06:00 时今天还没开盘,14:40 时今天还没收盘,
@@ -1443,13 +1443,17 @@ def update_qvix_self_daily() -> tuple:
     hist = load_qvix_self_history()
     if hist is not None:
         hist = hist.sort_values("date").reset_index(drop=True)
-        # min_periods=700(不是240):阈值要接近满3年数据才给值,不足3年
-        # 宁可空着也不用不完整窗口凑数——早期用240(约1年)会让阈值在头
-        # 两年里被少量样本撑出来的分位数带偏,不够稳。不用严格720:历史
-        # 里偶发接口失败/数据缺失(约1.6%的交易日),真设成720会导致
-        # 720天窗口只要出现过一天缺失就整个失真成NaN,700留了约20天的
-        # 容错,仍然远比240严格。
-        hist["threshold"] = hist["qvix"].rolling(720, min_periods=700).quantile(0.95)
+        # 2026-07-27 起生产口径从 720/0.95(3年95分位)对齐到 490/0.90
+        # (2年90分位)——与 2026-07-24 定档的标准策略(backtest_qvix.py
+        # 头部快照)及 app.py 展示线同口径,不然 notify 邮件报的阈值偏高
+        # ~1.6个点,QVIX 落在两阈值之间时会漏信号。
+        # min_periods=475(=490×0.97):阈值要接近满窗口才给值,不足宁可
+        # 空着也不用不完整窗口凑数——早期用240(约1年)会让阈值在头
+        # 两年里被少量样本撑出来的分位数带偏,不够稳。不用严格490:历史
+        # 里偶发接口失败/数据缺失(约1.6%的交易日),真设成490会导致
+        # 窗口只要出现过一天缺失就整个失真成NaN,475留了约15天的
+        # 容错,仍然远比240严格(同 backtest_qvix.py 的 minp_ratio=0.97)。
+        hist["threshold"] = hist["qvix"].rolling(490, min_periods=475).quantile(0.90)
         save_qvix_self_threshold(hist["date"].tolist(), hist["threshold"].tolist())
     return vix, note
 

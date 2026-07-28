@@ -1,6 +1,6 @@
 """
 回测: QVIX恐慌信号买入 + 双止损(基金回撤控制线 / 大盘回撤线)
-- 买入: QVIX > 3年95分位阈值, 且资金可用(空仓或当天恰好卖出)
+- 买入: QVIX > 2年90分位阈值, 且资金可用(空仓或当天恰好卖出)
 - 标的: 前一交易日近3月冠军(C类全市场), 冠军排名复用 fetcher.compute_
   metrics_asof——与 app.py「基金列表」页"截至日期"筛选完全同口径(按日
   收益率连乘, 正确处理分红除权, 自带单日|收益率|>30%异常值过滤), 而非
@@ -40,8 +40,10 @@ NAV_ANOMALIES = {
 # 跌幅耗尽(候选按跌幅从深到浅排, 找到第一个非负值就当天不操作, 不退而
 # 求其次买涨幅最小的) + 排除QDII/海外/持有期锁定基金(港股通/沪港深/
 # 恒生系列不再排除, 见 _HK_RE 定义处说明), 命令:
-#   python3 backtest_qvix.py --window 490 --pct 0.90
-# (以上都是当前 run_backtest 的默认值, 不用额外传参)
+#   python3 backtest_qvix.py
+# (以上全部是当前 run_backtest 的默认值, 不用额外传参——含 window=490/
+# pct=0.90, 2026-07-27 起生产阈值列/通知邮件也已对齐这个口径,
+# 默认值随之从 720/0.95 改过来)
 #
 #   笔数  胜率        累计收益(费后复利)  平均持有  平均收益(费后)
 #   8    7/8=87.5%   +470.41%           72天      +29.47%
@@ -286,12 +288,13 @@ def get_fund_nav_after(conn, code, from_date):
             for r in rows if r[1]]
 
 
-def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97,
+def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  min_corr: float = None, ret_col: str = "ret_3m", pick: str = "bottom",
                  min_vol_ratio: float = 1.5, dd_divisor: float = 5.0):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
-    的 700/720 那套道理)。默认 720/0.95 是当前线上在用的参数。
+    的 475/490 那套道理)。默认 490/0.90 是当前线上在用的参数
+    (2026-07-27 起生产阈值列/通知邮件从 720/0.95 对齐到这个口径)。
 
     min_corr: 冠军候选与上证指数近3月相关系数门槛, 见
     find_champion_on_date 的 sse_df/min_corr 说明。2026-07-24 起默认
@@ -361,7 +364,7 @@ def run_backtest(window: int = 720, pct: float = 0.95, minp_ratio: float = 0.97,
 
     # Load QVIX —— 自算(qvix_self_history,上交所官方期权风险指标反推,
     # 不再是 optbbs 的 index_daily_cache)。阈值按传入的 window/pct 现算,
-    # 不用表里预存的那一列(那一列固定是线上用的720/0.95)。
+    # 不用表里预存的那一列(那一列固定是线上用的490/0.90)。
     print(f"加载数据... (窗口={window}天, 分位={pct}, 排名依据={ret_col}, "
           f"方向={pick}, 相关系数门槛={min_corr}, 波动率比值下限={min_vol_ratio}, "
           f"回撤线除数={dd_divisor})")
@@ -594,8 +597,8 @@ def _apply_chain_fees(trades):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="QVIX恐慌信号回测")
-    parser.add_argument("--window", type=int, default=720, help="滚动窗口(交易日),默认720(约3年)")
-    parser.add_argument("--pct", type=float, default=0.95, help="分位数,默认0.95")
+    parser.add_argument("--window", type=int, default=490, help="滚动窗口(交易日),默认490(约2年,线上口径)")
+    parser.add_argument("--pct", type=float, default=0.90, help="分位数,默认0.90(线上口径)")
     parser.add_argument("--min-corr", type=lambda s: None if s.lower() == "none" else float(s),
                         default=None,
                         help="冠军候选与上证指数近3月相关系数门槛,默认不启用"

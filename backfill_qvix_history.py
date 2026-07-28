@@ -121,11 +121,11 @@ def main():
 
     fetcher.save_qvix_self_history(results)
 
-    log.info("重算滚动3年95分位恐慌阈值…")
+    log.info("重算滚动2年90分位恐慌阈值…")
     hist = fetcher.load_qvix_self_history()
     hist = hist.sort_values("date").reset_index(drop=True)
-    # min_periods=700(接近满3年,留约20天容错,理由同 fetcher.update_qvix_self_daily)
-    hist["threshold"] = hist["qvix"].rolling(720, min_periods=700).quantile(0.95)
+    # min_periods=475(接近满2年,留约15天容错,理由同 fetcher.update_qvix_self_daily)
+    hist["threshold"] = hist["qvix"].rolling(490, min_periods=475).quantile(0.90)
     fetcher.save_qvix_self_threshold(hist["date"].tolist(), hist["threshold"].tolist())
 
     log.info("✅ 完成,写入 %d 条(成功%d 失败%d),总耗时 %.1f 分钟",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""每个交易日 14:40 邮件推送:盘中 QVIX 与恐慌阈值(滚动3年95分位)。
+"""每个交易日 14:40 邮件推送:盘中 QVIX 与恐慌阈值(滚动2年90分位)。
 
 只报数不做判定:QVIX 取自 fetcher.fetch_qvix_now()(上交所期权实时
 行情自算,不再用 optbbs,见 qvix_calc.py 顶部说明),阈值取自
@@ -67,7 +67,7 @@ def _sse_quote_date():
 
 
 def _threshold():
-    """滚动3年95分位阈值,从自算历史(qvix_self_history)现取最新一条。
+    """滚动2年90分位阈值,从自算历史(qvix_self_history)现取最新一条。
 
     先调 update_qvix_self_daily() 补一次"最近一个已收盘交易日":上交所
     官方数据源发布也有延迟(实测过收盘3小时后仍未发布),06:00 跑批时
@@ -102,7 +102,7 @@ def main():
     title = f"QVIX {qvix:.2f} / 阈值 {thr:.2f}"
     body = (f"{today} {qtime}\n\n"
             f"盘中 QVIX:{qvix:.2f}\n"
-            f"恐慌阈值(3年95分位):{thr:.2f}\n")
+            f"恐慌阈值(2年90分位):{thr:.2f}\n")
 
     try:
         sent = _send_mail(title, body)

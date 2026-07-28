@@ -190,9 +190,10 @@ _QVIX_THR_COMBOS = [
 
 @st.cache_data(show_spinner="正在计算候选恐慌阈值…")
 def load_qvix_threshold_combos(cache_key):
-    """按 backtest_qvix.py 同一套口径(minp_ratio=0.97)现算几组候选滚动
-    阈值(窗口×分位),供上证指数图勾选叠加对比——与线上生产阈值列(720/
-    0.95,minp=700,fetcher.update_qvix_self_daily 里精确维护)算法一致但
+    """按 backtest_qvix.py 同一套口径(minp_ratio=0.97)现算滚动阈值
+    (窗口×分位),供上证指数图叠加展示——与线上生产阈值列(490/
+    0.90,minp=475,fetcher.update_qvix_self_daily 里精确维护,2026-07-27
+    起已从720/0.95对齐到这个口径)算法一致但
     独立现算,只用于图上对比展示,不影响生产阈值/策略复盘本身。"""
     hist = fetcher.load_qvix_self_history()
     if hist is None or hist.empty:
@@ -348,12 +349,19 @@ for _c in ("ret_1m", "ret_3m", "ret_6m", "ret_1y"):
 
 # ── 当前 QVIX(盘中,5分钟缓存) ────────────────────────────────────────────────
 # 装饰性小字,拉取失败(接口变更/限流/部署过渡态等)绝不能带崩整页。
+# 刷新按钮在读取之前处理:点击触发 rerun,先清掉5分钟缓存,本次就现拉。
+_c_qvix_txt, _c_qvix_btn = st.columns([9, 1], vertical_alignment="center")
+if _c_qvix_btn.button("🔄", key="qvix_now_refresh", help="立即重新拉取盘中QVIX"):
+    load_qvix_now.clear()
 try:
     _qvix_now, _qvix_now_t = load_qvix_now()
 except Exception:
     _qvix_now, _qvix_now_t = None, None
-if _qvix_now is not None:
-    st.caption(f"🌡️ 当前QVIX {_qvix_now:.2f}（{_qvix_now_t} 更新，自算）")
+with _c_qvix_txt:
+    if _qvix_now is not None:
+        st.caption(f"🌡️ 当前QVIX {_qvix_now:.2f}（{_qvix_now_t} 更新，自算）")
+    else:
+        st.caption("🌡️ 当前QVIX 暂不可用（点右侧🔄重试）")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_table, tab_detail, tab_sim, tab_sse, tab_hsi = st.tabs(

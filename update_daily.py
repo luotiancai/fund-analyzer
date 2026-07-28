@@ -83,7 +83,7 @@ def main():
         if sse is not None and vix is not None and thr is not None:
             s_last = sse.iloc[-1]
             triggered = vix > thr
-            log.info("   上证 %s 收 %.0f(%+.2f%%) · QVIX(自算) %.2f · 恐慌阈值(3年95分位) %.2f%s",
+            log.info("   上证 %s 收 %.0f(%+.2f%%) · QVIX(自算) %.2f · 恐慌阈值(2年90分位) %.2f%s",
                      s_last["date"], s_last["close"], s_last["pct"],
                      vix, thr,
                      " · 🔔 B点触发(QVIX破阈值)" if triggered else "")
