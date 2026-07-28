@@ -215,34 +215,6 @@ def load_qvix_self(cache_key):
     return fetcher.load_qvix_self_history()
 
 
-@st.cache_data(show_spinner="正在加载恒生指数数据…")
-def load_hsi_daily(cache_key):
-    return fetcher.fetch_hsi_daily()
-
-
-@st.cache_data(show_spinner="正在加载VHSI恒指波幅指数数据…")
-def load_vhsi_daily(cache_key):
-    """VHSI(恒指波幅指数,港股版VIX)——新浪源,只保留2021-03-18起的数据
-    (fetcher._VHSI_START,更早的整段缺失已砍掉,见该常量说明)。"""
-    return fetcher.fetch_vhsi_daily()
-
-
-@st.cache_data(show_spinner="正在计算VHSI恐慌阈值…")
-def load_vhsi_threshold(cache_key):
-    """VHSI滚动2年90分位阈值,跟QVIX那套口径一致(minp_ratio=0.97),
-    独立现算,只用于图上叠加展示。"""
-    hist = fetcher.fetch_vhsi_daily()
-    if hist is None or hist.empty:
-        return None
-    hist = hist.sort_values("date").reset_index(drop=True)
-    hist["date"] = pd.to_datetime(hist["date"])
-    hist["close"] = pd.to_numeric(hist["close"], errors="coerce")
-    window, minp = 490, int(490 * 0.97)
-    out = hist[["date"]].copy()
-    out["threshold"] = hist["close"].rolling(window, min_periods=minp).quantile(0.90)
-    return out
-
-
 # 1y max drawdown as it stood on the buy date (window: buy_date-365d → buy_date),
 # on the corrected daily-return growth index (nav_series 的 ret 列) so dividend
 # NAV resets don't count as drops, while build-up-period fake-zero growth rates
@@ -364,8 +336,8 @@ with _c_qvix_txt:
         st.caption("🌡️ 当前QVIX 暂不可用（点右侧🔄重试）")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_table, tab_detail, tab_sim, tab_bt, tab_sse, tab_hsi = st.tabs(
-    ["📋 基金列表", "🔍 基金详情", "💰 模拟盘", "📊 策略回测", "📈 上证指数", "🇭🇰 恒生指数"])
+tab_table, tab_detail, tab_sim, tab_sse = st.tabs(
+    ["📋 基金列表", "🔍 基金详情", "💰 模拟盘", "📈 上证指数"])
 
 # ─── Tab 1: Table ────────────────────────────────────────────────────────────
 with tab_table:
@@ -1401,52 +1373,6 @@ with tab_sim:
                         mime="text/csv",
                     )
 
-# ─── Tab: 策略回测 ────────────────────────────────────────────────────────────
-# 回测要跑几百秒、不能在页面里实时算, 这里只读 strategy_backtest 表(由
-# backtest_qvix.py --save / update_daily 跑批写入)展示最新一次标准策略的
-# 交易明细与汇总。
-with tab_bt:
-    st.subheader("QVIX恐慌信号反转策略 · 历史回测")
-    st.caption(
-        "标准策略：QVIX 破「滚动2年90分位」恐慌阈值当天买入 · 标的取前一交易日"
-        "「近3月跌幅最大」的C类基金(反转候选) · 候选须满足 波动率比值≥1.5(振幅"
-        "强于大盘) 且 规模≥5000万 · 当天若没有真正下跌(近3月负收益)的合格标的"
-        "则不操作 · 卖出用双回撤止损线(基金线=阈值/5×波动率比值，大盘线=阈值/5，"
-        "先到先卖)。费后收益已扣赎回费。"
-    )
-    _bt = fetcher.load_backtest_result()
-    if _bt is None:
-        st.info("尚未生成回测数据。运行 `python3 backtest_qvix.py --save` 或等每日跑批生成。")
-    else:
-        _bt_df, _bt_sum, _bt_params, _bt_saved = _bt
-        _bt_age_h = (time.time() - _bt_saved) / 3600
-        _fresh = "🟢" if _bt_age_h < 30 else "🟠"
-        st.caption(
-            f"{_fresh} 回测数据生成于 {_fmt_cst(_bt_saved, '%Y-%m-%d %H:%M')}"
-            f"（{_bt_age_h:.0f} 小时前）· 随净值/QVIX每日跑批刷新"
-        )
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("交易笔数", f"{_bt_sum.get('completed', _bt_sum.get('total_trades', 0))} 笔")
-        c2.metric("胜率", f"{_bt_sum.get('win_rate', 0):.1f}%",
-                  f"{_bt_sum.get('wins', 0)}/{_bt_sum.get('completed', 0)} 胜")
-        c3.metric("累计收益(费后复利)", f"{_bt_sum.get('total_ret', 0):+.1f}%")
-        c4.metric("平均单笔(费后)", f"{_bt_sum.get('avg_ret', 0):+.1f}%",
-                  f"最差 {_bt_sum.get('worst', 0):+.2f}%")
-
-        _bt_cols = ["买入日", "冠军(C类全市场,按前一交易日榜单)", "类型",
-                    "波动率比值(近3月)", "恐慌阈值", "回撤控制线(%)", "大盘回撤线(%)",
-                    "冠军近3月涨幅(前日口径)", "卖出日", "持有收益",
-                    "期间最高", "期间最大回撤", "同期上证", "卖出原因"]
-        _bt_show = _bt_df[[c for c in _bt_cols if c in _bt_df.columns]].rename(
-            columns={"冠军(C类全市场,按前一交易日榜单)": "标的(近3月跌幅最大)",
-                     "波动率比值(近3月)": "波动率比值"})
-        st.dataframe(_bt_show, use_container_width=True, height=460, hide_index=True)
-        st.caption(
-            "⚠️ 回测为历史复盘、非未来收益承诺，样本仅"
-            f" {_bt_sum.get('completed', 0)} 笔。规模按信号日当时已披露的最新季报"
-            "取值(无未来函数)；已知已验证的净值异常已在算法内校正。"
-        )
-
 # ─── Tab 4: SSE index ────────────────────────────────────────────────────────
 with tab_sse:
     sse_df = load_sse_daily(fetcher.index_daily_saved_at("sse"))
@@ -1632,7 +1558,7 @@ with tab_sse:
         # 2018 年起(2015-2017 期权刚上市流动性薄、QVIX 计算噪声偏大,
         # 已整段剔除, 见 fetcher.py)。
         with st.expander("📜 策略复盘:QVIX 2年90%信号 + 近3月跌幅最大"
-                         "(波动率比值≥1.5,反转策略) + 基金/大盘双止损逐日盯盘",
+                         "(波动率比值≥1.5 + 规模≥5000万,反转策略) + 基金/大盘双止损逐日盯盘",
                           expanded=True):
             # 5% 定线依据(2026-07 校准,别随手改):大盘线 = 恐慌阈值/5,常态
             # 波动率(QVIX 20)下 ≈ 4 倍日σ;历史 12 次触发的固定线网格回测显示
@@ -1643,21 +1569,27 @@ with tab_sse:
             # 需重算。动态线(QVIX/实际σ×入场定死/每日跟随,k=2~6)无稳健
             # 增益——恐慌日按入场波动率定线永远给宽线,反而丢掉恐慌后反弹守
             # 利润的功能。重议条件:QVIX 中枢驻留 35+。
-            st.caption("8 笔已完成:胜率 87.5%(7/8),费后复利 +470.41%,"
-                       "累计手续费 0.5%,平均持有 72 天,平均费后 +29.47%,"
-                       "最佳 +140.23% / 最差 -0.77%。"
+            st.caption("8 笔已完成:胜率 87.5%(7/8),费后复利 +675.40%,"
+                       "累计手续费 0.5%,平均持有 75 天,平均费后 +34.29%,"
+                       "最佳 +140.23% / 最差 -0.06%。"
                        "注:+140.23%那笔(021528财通成长优选混合C)是单只"
                        "小微盘主题基金的极端案例,剔除它其余7笔累计约"
-                       "+137.45%,别把140%当期望值——但8笔里只有1笔亏,"
-                       "而且只亏了0.77%,这个结论不依赖那笔运气。79个"
+                       "+222.77%,别把140%当期望值——但8笔里只有1笔亏,"
+                       "而且只亏了0.06%,这个结论不依赖那笔运气。79个"
                        "QVIX信号日里只有这8次同时满足\"真正下跌+波动率"
-                       "比值≥1.5\",其余全部跳过不操作(2020年下半年那波"
-                       "尤其明显,QVIX反复触发但从没凑出过合格候选)。"
-                       "橙色=触发基金回撤线离场,蓝色=触发大盘回撤线离场;"
+                       "比值≥1.5+规模≥5000万\",其余全部跳过不操作(2020年"
+                       "下半年那波尤其明显,QVIX反复触发但从没凑出过合格"
+                       "候选)。规模按信号日当时已披露的最新季报口径(无未来"
+                       "函数),排掉了几十万~几千万规模、净值易失真的迷你基金。"
+                       "橙色=触发基金回撤线离场,蓝色=触发大盘回撤线离场,"
+                       "两格都染色=同日两条线双双触发(仅华富那笔);"
                        "连续接力同一只基金视为未真实离场,中间腿不收手续费,"
                        "只在链条最后一腿按累计持有天数收一次。")
+            # 每笔卖出当天触发了哪条止损线: fund=仅基金线, sse=仅大盘线,
+            # both=同日两条线都破(实测2024-10-09华富那笔:基金11.1%≥7.9%且
+            # 大盘6.6%≥4.1%, 924见顶急跌日基金和大盘一起跳水)。
             _review_trigger = [
-                "sse", "sse", "sse", "fund", "fund", "fund", "fund", "fund",
+                "sse", "sse", "sse", "fund", "both", "fund", "fund", "fund",
             ]
             _review_df = pd.DataFrame({
                 "买入日": ["2022-04-25", "2022-10-24", "2023-08-28",
@@ -1665,53 +1597,52 @@ with tab_sse:
                           "2025-04-07", "2026-03-23"],
                 "近3月跌幅最大标的(C类全市场,按前一交易日榜单)": [
                     "诺安创新驱动混合C (002051)",
-                    "国泰中证港股通科技ETF发起联接C (015740)",
-                    "诺安稳健回报混合C (002052)",
-                    "东吴新经济混合C (012617)",
+                    "富国中证港股通互联网ETF发起式联接C (014674)",
+                    "诺安积极回报混合C (012847)",
+                    "汇丰晋信时代先锋混合C (014918)",
                     "华富健康文娱灵活配置混合C (019200)",
                     "海富通科技创新混合C (009024)",
                     "财通成长优选混合C (021528)",
-                    "东方城镇消费主题混合C (025884)"],
+                    "国融融盛龙头严选混合C (006719)"],
                 "类型": ["混合型-灵活", "指数型-股票", "混合型-灵活",
                         "混合型-偏股", "混合型-灵活", "混合型-偏股",
                         "混合型-灵活", "混合型-偏股"],
-                "波动率比值(近3月)": [1.73, 2.09, 3.07, 1.89,
-                                   1.93, 1.81, 3.41, 2.34],
+                "波动率比值(近3月)": [1.73, 2.19, 3.20, 2.11,
+                                   1.93, 1.81, 3.41, 2.49],
                 "恐慌阈值": [26.33, 23.24, 22.28, 22.28,
                             20.45, 20.52, 21.42, 22.54],
-                "回撤控制线(%)": [9.11, 9.71, 13.68, 8.42,
-                                7.89, 7.43, 14.61, 10.55],
+                "回撤控制线(%)": [9.11, 10.18, 14.26, 9.40,
+                                7.89, 7.43, 14.61, 11.22],
                 "大盘回撤线(%)": [5.27, 4.65, 4.46, 4.46,
                                 4.09, 4.10, 4.28, 4.51],
                 "近3月跌幅(前日口径)": [
-                    "-37.80%", "-27.01%", "-31.63%", "-36.76%",
-                    "-22.41%", "-2.42%", "-22.35%", "-20.75%"],
+                    "-37.80%", "-26.93%", "-27.95%", "-34.29%",
+                    "-22.41%", "-2.42%", "-22.35%", "-18.57%"],
                 "卖出日": ["2022-07-15", "2022-12-22", "2023-10-19",
-                          "2024-03-27", "2024-10-09", "2024-11-14",
-                          "2025-11-18", "2026-05-21"],
-                "持有收益": ["+14.19%", "+31.54%", "-0.77%", "+23.24%",
+                          "2024-04-12", "2024-10-09", "2024-11-14",
+                          "2025-11-18", "2026-06-01"],
+                "持有收益": ["+14.19%", "+49.70%", "-0.06%", "+15.18%",
                             "+18.05% (费后+17.55%)", "+6.66%",
-                            "+140.23%", "+3.10%"],
-                "期间最高": ["+23.2%", "+35.8%", "+7.2%", "+36.3%",
-                            "+32.8%", "+15.9%", "+181.4%", "+17.1%"],
-                "期间最大回撤": ["7.3%", "8.7%", "10.7%", "9.6%",
-                              "11.1%", "8.0%", "14.6%", "11.9%"],
-                "同期上证": ["+10.2%", "+2.6%", "-3.0%", "+10.8%",
-                            "+8.6%", "+2.4%", "+27.2%", "+6.9%"],
+                            "+140.23%", "+30.83%"],
+                "期间最高": ["+23.2%", "+54.7%", "+8.5%", "+27.6%",
+                            "+32.8%", "+15.9%", "+181.4%", "+51.3%"],
+                "期间最大回撤": ["7.3%", "8.6%", "12.5%", "9.8%",
+                              "11.1%", "8.0%", "14.6%", "13.5%"],
+                "同期上证": ["+10.2%", "+2.6%", "-3.0%", "+11.7%",
+                            "+8.6%", "+2.4%", "+27.2%", "+6.4%"],
                 "备注": [
                     "近3月跌幅-37.80%(全表最深);81天大盘线触发,+14.19%,"
                     "超跌反弹兑现",
-                    "港股互联网超跌反弹段入场(近3月跌幅-27.01%,跟同期"
-                    "港股互联网强势反弹重合,见\"22年10月涨幅最好的基金\""
-                    "分析);59天大盘线触发,+31.54%——恒生指数跟上证相关"
-                    "系数常年0.4~0.74,不算脱钩,港股通基金不再排除",
-                    "近3月跌幅-31.63%;52天大盘线触发,-0.77%小亏,全表"
-                    "唯一亏损的一笔,亏损幅度也是最小的——超跌不代表一定"
-                    "反弹",
-                    "雪球产品集中平仓踩踏后入场,近3月跌幅-36.76%;51天"
-                    "基金线触发,+23.24%",
-                    "924行情前夕入场,近3月跌幅-22.41%;13天基金线触发,"
-                    "+18.05%(费后+17.55%)",
+                    "港股互联网超跌反弹段入场(近3月跌幅-26.93%,跟同期"
+                    "港股互联网强势反弹重合);59天大盘线触发,+49.70%——"
+                    "恒生指数跟上证相关系数常年0.4~0.74,不算脱钩,港股通"
+                    "基金不再排除",
+                    "近3月跌幅-27.95%;52天大盘线触发,-0.06%微亏,全表"
+                    "唯一亏损的一笔,亏损幅度也小到可忽略——超跌不代表"
+                    "一定反弹",
+                    "近3月跌幅-34.29%;基金线触发,+15.18%,超跌反弹兑现",
+                    "924行情前夕入场,近3月跌幅-22.41%;持有13天后(924见顶"
+                    "急跌日)基金线与大盘线同日双双触发,+18.05%(费后+17.55%)",
                     "近3月跌幅仅-2.42%(全表最浅,勉强满足\"真下跌\"门槛);"
                     "35天基金线触发,+6.66%",
                     "\"对等关税\"暴跌日入场,近3月跌幅-22.35%;225天基金线"
@@ -1719,8 +1650,9 @@ with tab_sse:
                     "+181.4%)——单只小微盘主题基金的极端案例(近1年一度"
                     "涨209%),净值序列已核实无异常跳变、不是脏数据,但"
                     "不代表可复制的期望值,全表最佳单笔",
-                    "上证单日-3.6%入场,近3月跌幅-20.75%;59天大盘线触发,"
-                    "+3.10%",
+                    "上证大跌日入场,近3月跌幅-18.57%;基金线触发,+30.83%"
+                    "——旧口径这天选中的是东方城镇消费主题C(规模仅几万、"
+                    "只+3.10%),规模≥5000万门槛把它换成了正常规模标的",
                 ],
             })
 
@@ -1728,9 +1660,11 @@ with tab_sse:
                 _styles = [""] * len(row)
                 _idx = list(_review_df.columns).index
                 _trig = _review_trigger[row.name]
-                _col = "回撤控制线(%)" if _trig == "fund" else "大盘回撤线(%)"
-                _bg = "#ffdca8" if _trig == "fund" else "#c9e2ff"
-                _styles[_idx(_col)] = f"background-color: {_bg}; color: #1a1a1a"
+                # both=同日双触发:基金线橙、大盘线蓝两格都染;否则只染触发的那条
+                if _trig in ("fund", "both"):
+                    _styles[_idx("回撤控制线(%)")] = "background-color: #ffdca8; color: #1a1a1a"
+                if _trig in ("sse", "both"):
+                    _styles[_idx("大盘回撤线(%)")] = "background-color: #c9e2ff; color: #1a1a1a"
                 return _styles
 
             st.dataframe(
@@ -1754,130 +1688,3 @@ with tab_sse:
                     "同期上证": st.column_config.Column(width="small"),
                     "备注": st.column_config.Column(width="large"),
                 })
-
-# ─── Tab 5: 恒生指数 ─────────────────────────────────────────────────────────
-# 跟上证指数tab同一套画法, 标的换成恒生指数(HSI)+VHSI(恒指波幅指数,
-# 港股版VIX,方法论同CBOE VIX白皮书,标的换成恒生指数期权)。数据源都是
-# 新浪 stock_hk_index_daily_sina, 不是自算——不像QVIX那样自己拿期权
-# 反推, 这里没有对应的境内期权数据源, 直接用新浪现成的官方指数。VHSI
-# 只从2021-03-18起保留(见 fetcher._VHSI_START, 更早整段缺失已砍掉),
-# 阈值固定滚动2年90分位(跟QVIX当前标准口径一致, minp_ratio=0.97), 只有
-# 一条线, 不像上证tab那样有多组可选——没有必要在这里重复验证一遍
-# 窗口/分位组合, 就用已经在QVIX上验证过的这一组。
-with tab_hsi:
-    hsi_df = load_hsi_daily(fetcher.index_daily_saved_at("hsi"))
-    if hsi_df is None or hsi_df.empty:
-        st.warning("恒生指数数据获取失败，请稍后重试。")
-    else:
-        hsi_all = hsi_df.copy()
-        hsi_all["date"] = pd.to_datetime(hsi_all["date"])
-        hsi_all = hsi_all.sort_values("date").reset_index(drop=True)
-
-        _hsi_ranges = {"近1月": 30, "近3月": 91, "近6月": 182,
-                       "近1年": 365, "近3年": 365 * 3, "近5年": 365 * 5,
-                       "全部": None}
-        _c_rng2, _c_vhsi = st.columns([5, 1])
-        with _c_rng2:
-            _rng2 = st.radio("时间区间", list(_hsi_ranges.keys()), index=3,
-                             horizontal=True, key="hsi_range")
-        with _c_vhsi:
-            _show_vhsi = st.checkbox("VHSI恐慌指数", value=True,
-                                     key="hsi_vhsi",
-                                     help="恒指波幅指数（港股版VIX），右轴，"
-                                          "叠加滚动2年90分位阈值线")
-
-        _days2 = _hsi_ranges[_rng2]
-        if _days2 is None:
-            view2 = hsi_all
-        else:
-            _start2 = hsi_all["date"].max() - pd.Timedelta(days=_days2)
-            _older2 = hsi_all[hsi_all["date"] <= _start2]
-            view2 = hsi_all.loc[_older2.index[-1]:] if not _older2.empty else hsi_all
-
-        _latest2 = hsi_all.iloc[-1]
-        _chg2 = (_latest2["close"] / view2["close"].iloc[0] - 1.0) * 100.0
-        _peak2 = view2["close"].cummax()
-        _mdd2 = float(((_peak2 - view2["close"]) / _peak2).max() * 100.0)
-        h1, h2, h3, h4 = st.columns(4)
-        h1.metric("最新收盘", f"{_latest2['close']:,.2f}",
-                  f"{_latest2['pct']:+.2f}%（当日）")
-        h2.metric(f"{_rng2}涨跌幅", f"{_chg2:+.2f}%")
-        h3.metric(f"{_rng2}最大回撤", f"{_mdd2:.2f}%")
-        h4.metric("数据日期", _latest2["date"].strftime("%Y-%m-%d"))
-
-        fig_hsi = px.line(
-            view2, x="date", y="close",
-            title=f"恒生指数走势（{_rng2}）",
-            labels={"date": "日期", "close": "收盘点位"},
-            height=420,
-        )
-        fig_hsi.update_traces(
-            customdata=view2[["pct"]],
-            hovertemplate="收盘 %{y:,.2f} · 日涨跌 %{customdata[0]:+.2f}%"
-                          "<extra></extra>")
-
-        vhsi_view = None
-        if _show_vhsi:
-            _vhsi = load_vhsi_daily(fetcher.index_daily_saved_at("vhsi"))
-            if _vhsi is not None and not _vhsi.empty:
-                vhsi_view = _vhsi.dropna(subset=["close"]).copy()
-                vhsi_view["date"] = pd.to_datetime(vhsi_view["date"])
-                vhsi_view["close"] = pd.to_numeric(vhsi_view["close"], errors="coerce")
-                vhsi_view = vhsi_view[
-                    (vhsi_view["date"] >= view2["date"].min())
-                    & (vhsi_view["date"] <= view2["date"].max())]
-            if vhsi_view is None or vhsi_view.empty:
-                st.caption("⚠️ VHSI恐慌指数数据暂不可用"
-                          "（2021-03-18前无可用数据）")
-                vhsi_view = None
-        if vhsi_view is not None:
-            fig_hsi.data[0].name = "恒生指数"
-            fig_hsi.data[0].showlegend = True
-            fig_hsi.add_trace(go.Scatter(
-                x=vhsi_view["date"], y=vhsi_view["close"],
-                name="VHSI恐慌指数", yaxis="y2",
-                line=dict(color="#f28e2b", width=1.3),
-                hovertemplate="VHSI %{y:.2f}<extra></extra>"))
-            fig_hsi.update_layout(
-                yaxis2=dict(title="VHSI恐慌指数", overlaying="y", side="right",
-                            showgrid=False))
-            _vhsi_thr = load_vhsi_threshold(fetcher.index_daily_saved_at("vhsi"))
-            if _vhsi_thr is not None:
-                _thr_view2 = _vhsi_thr[
-                    (_vhsi_thr["date"] >= view2["date"].min())
-                    & (_vhsi_thr["date"] <= view2["date"].max())].dropna(subset=["threshold"])
-                if not _thr_view2.empty:
-                    fig_hsi.add_trace(go.Scatter(
-                        x=_thr_view2["date"], y=_thr_view2["threshold"],
-                        name="恐慌阈值(2年90%)", yaxis="y2",
-                        line=dict(color="#8e44ad", width=1.2, dash="dash"),
-                        hovertemplate="阈值(2年90%) %{y:.2f}<extra></extra>"))
-
-        fig_hsi.update_layout(
-            hovermode="x unified", hoverdistance=-1, spikedistance=-1)
-        _span_d2 = max((view2["date"].max() - view2["date"].min()).days, 1)
-        fig_hsi.update_xaxes(
-            showspikes=True, spikemode="across", spikesnap="data",
-            spikedash="dot", spikethickness=1,
-            hoverformat="%Y-%m-%d", tickformat="%Y-%m-%d",
-            dtick=max(1, _span_d2 // 8) * 86400000)
-        fig_hsi.update_yaxes(
-            showspikes=True, spikemode="across", spikesnap="data",
-            spikedash="dot", spikethickness=1)
-        st.plotly_chart(fig_hsi, use_container_width=True)
-
-        with st.expander("📄 每日数据（当前区间）"):
-            _hsi_table = view2.sort_values("date", ascending=False).reset_index(drop=True)
-            _tbl2 = pd.DataFrame({
-                "日期": _hsi_table["date"].dt.strftime("%Y-%m-%d"),
-                "收盘点位": _hsi_table["close"].round(2),
-                "日涨跌(%)": pd.to_numeric(_hsi_table["pct"],
-                                         errors="coerce").round(2),
-            })
-            if vhsi_view is not None:
-                _v = vhsi_view.assign(
-                    日期=vhsi_view["date"].dt.strftime("%Y-%m-%d"),
-                    **{"VHSI恐慌指数": vhsi_view["close"].round(2)})
-                _tbl2 = _tbl2.merge(_v[["日期", "VHSI恐慌指数"]],
-                                    on="日期", how="left")
-            st.dataframe(_tbl2, use_container_width=True, height=420)

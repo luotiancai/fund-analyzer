@@ -149,16 +149,6 @@ def init_db():
             data     TEXT NOT NULL,
             saved_at REAL NOT NULL
         );
-        -- 标准策略回测结果缓存(只存最新一次, id 固定=1)。回测要跑几百秒、
-        -- 没法在页面里实时算, 由 backtest_qvix.py --save / update_daily 跑批
-        -- 写入, app「策略回测」tab 只读渲染。
-        CREATE TABLE IF NOT EXISTS strategy_backtest (
-            id       INTEGER PRIMARY KEY,
-            summary  TEXT NOT NULL,   -- JSON 汇总(笔数/胜率/累计收益…)
-            data     TEXT NOT NULL,   -- JSON 明细(orient=split)
-            params   TEXT NOT NULL,   -- JSON 回测参数
-            saved_at REAL NOT NULL
-        );
         -- ETF联接基金 → 目标场内ETF 的映射(重仓穿透用)。target_code 为空
         -- 串表示解析失败,按 TTL 重试;成功的映射视为永久。
         CREATE TABLE IF NOT EXISTS etf_target_map (
@@ -962,42 +952,6 @@ def load_filter_result(key: str):
     df = pd.read_json(io.StringIO(row["data"]), orient="split",
                       dtype=False, convert_dates=False)
     return df, json.loads(row["params"]), row["saved_at"]
-
-
-def save_backtest_result(trades: list, summary: dict, params: dict) -> None:
-    """把一次标准策略回测的明细+汇总+参数写入 strategy_backtest(覆盖 id=1)。
-    由 backtest_qvix.py --save 及 update_daily 跑批调用。"""
-    conn = _conn()
-    conn.execute("""CREATE TABLE IF NOT EXISTS strategy_backtest (
-        id INTEGER PRIMARY KEY, summary TEXT NOT NULL, data TEXT NOT NULL,
-        params TEXT NOT NULL, saved_at REAL NOT NULL)""")
-    df = pd.DataFrame(trades)
-    conn.execute(
-        "INSERT OR REPLACE INTO strategy_backtest (id, summary, data, params, saved_at) "
-        "VALUES (1, ?, ?, ?, ?)",
-        (json.dumps(summary, ensure_ascii=False),
-         df.to_json(orient="split", force_ascii=False),
-         json.dumps(params, ensure_ascii=False), time.time()))
-    conn.commit()
-    conn.close()
-
-
-def load_backtest_result():
-    """(df, summary, params, saved_at) 或 None(尚未跑过/表不存在)。"""
-    conn = _conn()
-    try:
-        row = conn.execute(
-            "SELECT summary, data, params, saved_at FROM strategy_backtest "
-            "WHERE id = 1").fetchone()
-    except sqlite3.OperationalError:
-        return None
-    finally:
-        conn.close()
-    if not row:
-        return None
-    df = pd.read_json(io.StringIO(row["data"]), orient="split",
-                      dtype=False, convert_dates=False)
-    return df, json.loads(row["summary"]), json.loads(row["params"]), row["saved_at"]
 
 
 # ── Quarterly top holdings ───────────────────────────────────────────────────

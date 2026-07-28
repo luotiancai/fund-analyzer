@@ -101,9 +101,6 @@ def main():
     except Exception as e:
         log.warning("   指数刷新失败(不影响基金跑批): %s", e)
 
-    # 注: app「策略回测」tab 的数据不在这里自动刷新——回测结果只有新信号日/
-    # 持仓平仓才变, 每天跑白加几百秒。需要更新时手动跑 backtest_qvix.py --save。
-
     log.info("✅ 完成,总耗时 %.1f 分钟", (time.time() - t0) / 60)
 
 
