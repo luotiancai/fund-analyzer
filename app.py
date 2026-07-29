@@ -163,6 +163,13 @@ def load_holdings(code: str):
     return df, fetcher.resolve_target_etf(code)
 
 
+@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
+def load_scale_hist(code: str):
+    """基金季度规模历史(cache-first, 库里没有就现拉一次并入库)。
+    列: quarter_end, aum(亿元), publish_date。"""
+    return fetcher.fetch_fund_scale_hist(code)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_nav(code: str):
     return fetcher.fetch_nav(code)
@@ -913,6 +920,38 @@ with tab_detail:
                                 pd.DataFrame(cols).reset_index(drop=True),
                                 use_container_width=True,
                             )
+            st.markdown("---")
+            st.subheader("📊 规模变化（各季度期末净资产）")
+            with st.spinner("加载规模数据…"):
+                _scale = load_scale_hist(code_input.strip().zfill(6))
+            if _scale is None or _scale.empty:
+                st.info("该基金暂无规模数据（新基金或数据源缺失）。")
+            else:
+                _sc = _scale.copy()
+                _sc["quarter_end"] = pd.to_datetime(_sc["quarter_end"])
+                _sc["aum"] = pd.to_numeric(_sc["aum"], errors="coerce")
+                _sc = _sc.sort_values("quarter_end")
+                _latest = _sc.iloc[-1]
+                _prev = _sc.iloc[-2] if len(_sc) >= 2 else None
+                s1, s2 = st.columns(2)
+                s1.metric("最新规模", f"{_latest['aum']:.2f} 亿",
+                          (f"{(_latest['aum']/_prev['aum']-1)*100:+.1f}% 环比"
+                           if _prev is not None and _prev['aum'] else None))
+                s2.metric("最新季度", _latest["quarter_end"].strftime("%Y-%m-%d"))
+                # 走势图(按季末升序)
+                _chart = _sc.set_index("quarter_end")["aum"].rename("规模(亿)")
+                st.line_chart(_chart, height=240)
+                # 明细表(最新在上)
+                _tbl = _sc.sort_values("quarter_end", ascending=False).copy()
+                _tbl["季度"] = _tbl["quarter_end"].dt.strftime("%Y-%m-%d")
+                _tbl["期末净资产(亿元)"] = _tbl["aum"].round(2)
+                _tbl = _tbl.rename(columns={"publish_date": "约披露日"})
+                st.dataframe(
+                    _tbl[["季度", "期末净资产(亿元)", "约披露日"]].reset_index(drop=True),
+                    use_container_width=True, hide_index=True, height=300)
+                st.caption("规模取自基金季度报告的期末净资产（各季末后约1个月披露）。"
+                           "「约披露日」为估算的可见日期，用于回测/选基的无未来函数取数。")
+
             st.markdown("---")
             st.subheader("📄 净值历史")
             nav_table = nav_df.sort_values("date", ascending=False).reset_index(drop=True)
