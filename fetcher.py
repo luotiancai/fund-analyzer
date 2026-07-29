@@ -660,16 +660,18 @@ def _fetch_nav_full(code: str) -> Optional[pd.DataFrame]:
 
 
 # ── 基金季度规模(AUM)历史 ────────────────────────────────────────────────────
-# pingzhongdata 的 Data_fluctuationScale(期末净资产,亿元)。规模是季度数据、
-# 有披露滞后:季报(3/9月末)约15个工作日内披露,半年报(6月末)60天,年报(12
-# 月末)90天。存 publish_date=季末+滞后天数(留buffer),这样按信号日取"当时
-# 真正能看到的最新一期",避免用到尚未披露的数据(未来函数)。
-_SCALE_PUB_LAG = {3: 25, 6: 62, 9: 25, 12: 92}  # 季末月 → 披露滞后(日历日)
-SCALE_TTL = 7 * 24 * 3600  # 规模季度数据,一周内不重复抓
+# 期末净资产(亿元)来自基金「季度报告」——四个季度都有, 各季末后约15个工作日
+# 内披露(《基金信息披露管理办法》), 即约1个月, 对应 1月底/4月底/7月底/10月底。
+# (半年报6月末/年报12月末是另外更详细的披露, 但期末净资产在季报里就有, 所以
+# 规模不用等到8月底/次年3月底。)存 publish_date=季末+滞后天数, 这样按信号日
+# 取"当时真正能看到的最新一期", 避免用到尚未披露的数据(未来函数)。滞后含
+# 假期buffer:Q3多留国庆一周、Q4多留元旦/春节。
+_SCALE_PUB_LAG = {3: 25, 6: 25, 9: 30, 12: 35}  # 季末月 → 披露滞后(日历日)
+SCALE_TTL = 7 * 24 * 3600  # fetch_fund_scale_hist 的 cache-first 兜底(app按需取数用)
 
 
 def _scale_publish_date(quarter_end: str) -> str:
-    lag = _SCALE_PUB_LAG.get(int(quarter_end[5:7]), 92)
+    lag = _SCALE_PUB_LAG.get(int(quarter_end[5:7]), 35)
     return (pd.Timestamp(quarter_end) + pd.Timedelta(days=lag)).strftime("%Y-%m-%d")
 
 
@@ -773,25 +775,56 @@ def funds_aum_asof(codes: list, date) -> dict:
     return {c: got.get(c) for c in codes}
 
 
+def latest_published_quarter(today=None) -> Optional[str]:
+    """截至 today, 已披露(publish_date<=today)的最新一期季末(ISO)。规模季报
+    约季末后1个月披露, 所以这个值大约在 1月底/4月底/7月底/10月底 各跳一档。"""
+    today = today or datetime.now(_CST).date()
+    tstr = today.isoformat()
+    cands = [f"{y}-{md}"
+             for y in (today.year, today.year - 1, today.year - 2)
+             for md in ("03-31", "06-30", "09-30", "12-31")
+             if _scale_publish_date(f"{y}-{md}") <= tstr]
+    return max(cands) if cands else None
+
+
 def refresh_scale_hist(codes: Optional[list] = None,
                        progress: Optional[Callable] = None) -> int:
-    """批量刷新基金季度规模(cache-first: SCALE_TTL 内已抓过的跳过)。codes
-    默认取所有有净值历史的基金(即候选池)。规模是季度数据, 平时绝大多数
-    命中缓存、几乎零网络; 只有新基金/过期的才真抓。返回实际发生网络抓取
-    的只数。由 update_daily.py 每日调用(不放进 run_pipeline, 免得拖慢
-    in-app「🔄 更新数据」按钮)。"""
+    """批量刷新基金季度规模。规模是季度数据(一年4次, 各季末后约1个月披露),
+    所以只在"某只基金还缺最新一期已披露季报"时才真抓——效果是每年约4次
+    (1月底/4月底/7月底/10月底 新季报出来后)各刷一轮, 其余日子几乎全跳过、
+    零网络。避免了按固定TTL会导致的"全体同日过期→每周2小时尖峰"。
+
+    额外用 recheck 窗口(20天)兜底极少数"永远缺最新季报"的基金(如刚成立还
+    没出过季报的), 免得每天都去重抓它们。返回实际发生网络抓取的只数。由
+    update_daily.py 每日调用(不放进 run_pipeline, 免得拖慢 in-app 更新按钮)。"""
     if codes is None:
         codes = sorted(list_nav_codes())
+    # 自愈:披露滞后口径变过(如 _SCALE_PUB_LAG 调整)时, 库里存量行的
+    # publish_date 会过时。按 quarter_end 批量重算对齐(几十条, 秒级), 免得
+    # 靠重抓才更新——否则 have_latest 已命中的基金不会再抓、旧披露日就一直
+    # 留着, app/回测的 as-of 口径也就跟着错。
     conn = _conn()
-    fresh = {r["code"] for r in conn.execute(
+    for (qe,) in conn.execute("SELECT DISTINCT quarter_end FROM fund_scale_hist").fetchall():
+        conn.execute("UPDATE fund_scale_hist SET publish_date=? "
+                     "WHERE quarter_end=? AND publish_date<>?",
+                     (_scale_publish_date(qe), qe, _scale_publish_date(qe)))
+    conn.commit()
+    due = latest_published_quarter()
+    have_latest = set()
+    if due:
+        have_latest = {r["code"] for r in conn.execute(
+            "SELECT code FROM fund_scale_hist GROUP BY code "
+            "HAVING MAX(quarter_end) >= ?", (due,))}
+    recent = {r["code"] for r in conn.execute(
         "SELECT code FROM fund_scale_hist GROUP BY code "
-        "HAVING MAX(saved_at) > ?", (time.time() - SCALE_TTL,))}
+        "HAVING MAX(saved_at) > ?", (time.time() - 20 * 24 * 3600,))}
     conn.close()
     fetched = 0
     total = len(codes)
     for i, code in enumerate(codes):
-        if code not in fresh:
-            fetch_fund_scale_hist(code)  # 内部 upsert + 0.15s 限速
+        # 已有最新已披露季报 → 跳过; 没有但20天内刚抓过(还是没有)→ 也先跳过
+        if code not in have_latest and code not in recent:
+            fetch_fund_scale_hist(code, force_refresh=True)  # upsert + 0.15s 限速
             fetched += 1
         if progress:
             progress("刷新规模", i + 1, total)
