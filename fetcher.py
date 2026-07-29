@@ -660,19 +660,38 @@ def _fetch_nav_full(code: str) -> Optional[pd.DataFrame]:
 
 
 # ── 基金季度规模(AUM)历史 ────────────────────────────────────────────────────
-# 期末净资产(亿元)来自基金「季度报告」——四个季度都有, 各季末后约15个工作日
-# 内披露(《基金信息披露管理办法》), 即约1个月, 对应 1月底/4月底/7月底/10月底。
+# 期末净资产(亿元)来自基金「季度报告」——四个季度都有, 披露截止是季末后
+# 「15个工作日」内(《基金信息披露管理办法》), 四个季度同一口径。A股交易日
+# ≈法定工作日, 所以用交易日历数季末后第15个交易日当披露日, 能自动把国庆/
+# 春节顺延算进去(Q4→次年1月下旬、Q3→10月底)。存 publish_date, 这样按信号日
+# 取"当时真正能看到的最新一期", 避免用到尚未披露的数据(未来函数)。
 # (半年报6月末/年报12月末是另外更详细的披露, 但期末净资产在季报里就有, 所以
-# 规模不用等到8月底/次年3月底。)存 publish_date=季末+滞后天数, 这样按信号日
-# 取"当时真正能看到的最新一期", 避免用到尚未披露的数据(未来函数)。滞后含
-# 假期buffer:Q3多留国庆一周、Q4多留元旦/春节。
-_SCALE_PUB_LAG = {3: 25, 6: 25, 9: 30, 12: 35}  # 季末月 → 披露滞后(日历日)
+# 规模不用等到8月底/次年3月底。)
 SCALE_TTL = 7 * 24 * 3600  # fetch_fund_scale_hist 的 cache-first 兜底(app按需取数用)
+_TRADE_CAL = None           # 交易日历缓存(升序 DatetimeIndex/Series), 进程内只拉一次
 
 
-def _scale_publish_date(quarter_end: str) -> str:
-    lag = _SCALE_PUB_LAG.get(int(quarter_end[5:7]), 35)
-    return (pd.Timestamp(quarter_end) + pd.Timedelta(days=lag)).strftime("%Y-%m-%d")
+def _trade_calendar():
+    global _TRADE_CAL
+    if _TRADE_CAL is None:
+        cal = ak.tool_trade_date_hist_sina()
+        _TRADE_CAL = pd.to_datetime(cal["trade_date"]).dt.normalize() \
+            .sort_values().reset_index(drop=True)
+    return _TRADE_CAL
+
+
+def _scale_publish_date(period_end: str) -> str:
+    """定期报告披露截止 = 期末后第15个交易日(≈15个工作日, 含节假日顺延)。
+    取不到交易日历时退回 +25 自然日兜底(不影响正确性方向: 只会略偏晚)。"""
+    d = pd.Timestamp(period_end)
+    try:
+        after = _trade_calendar()
+        after = after[after > d]
+        if len(after) >= 15:
+            return after.iloc[14].strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return (d + pd.Timedelta(days=25)).strftime("%Y-%m-%d")
 
 
 def load_fund_scale_hist(code: str) -> pd.DataFrame:

@@ -931,12 +931,13 @@ with tab_detail:
                 _sc["quarter_end"] = pd.to_datetime(_sc["quarter_end"])
                 _sc["aum"] = pd.to_numeric(_sc["aum"], errors="coerce")
                 _tbl = _sc.sort_values("quarter_end", ascending=False)
-                _tbl["季度"] = _tbl["quarter_end"].dt.strftime("%Y-%m-%d")
+                _tbl["报告日期"] = _tbl["quarter_end"].dt.strftime("%Y-%m-%d")
                 _tbl["期末净资产(亿元)"] = _tbl["aum"].round(2)
                 st.dataframe(
-                    _tbl[["季度", "期末净资产(亿元)"]].reset_index(drop=True),
+                    _tbl[["报告日期", "期末净资产(亿元)"]].reset_index(drop=True),
                     use_container_width=True, hide_index=True, height=400)
-                st.caption("规模取自基金季度报告的期末净资产（各季末后约1个月披露）。")
+                st.caption("规模取自基金定期报告的期末净资产（季报须在季末后15个"
+                           "工作日内披露；最早一行通常是基金成立日的初始规模）。")
 
             st.markdown("---")
             st.subheader("📄 净值历史")
