@@ -90,9 +90,9 @@ def main():
         log.info("非交易日(行情日期 %s),跳过", quote_date)
         return
 
-    qvix, qtime = fetcher.fetch_qvix_now()
+    qvix, qtime, qsrc = fetcher.fetch_qvix_now()
     if qvix is None:
-        log.error("QVIX 自算失败,拿不到值")
+        log.error("QVIX 盘中取值失败(自算+optbbs 都没拿到)")
         sys.exit(1)
     thr = _threshold()
     if thr is None:
@@ -101,7 +101,7 @@ def main():
 
     title = f"QVIX {qvix:.2f} / 阈值 {thr:.2f}"
     body = (f"{today} {qtime}\n\n"
-            f"盘中 QVIX:{qvix:.2f}\n"
+            f"盘中 QVIX:{qvix:.2f}（{qsrc}）\n"
             f"恐慌阈值(2年90分位):{thr:.2f}\n")
 
     try:

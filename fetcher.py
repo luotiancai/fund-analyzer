@@ -1536,28 +1536,53 @@ def index_daily_saved_at(key: str) -> Optional[float]:
     return row["saved_at"] if row else None
 
 
+def _optbbs_qvix_now() -> tuple:
+    """optbbs 分钟QVIX(index_option_50etf_min_qvix)的最新一个非空值,
+    返回 (qvix, "HH:MM:SS")。失败/全空返回 (None, None)。仅作自算失败时的
+    盘中回退——自算走新浪逐合约(部署在境外云时常连不上), optbbs 是单个
+    请求, 境外主机大概率拿得到。"""
+    try:
+        df = _fetch_with_timeout(ak.index_option_50etf_min_qvix, timeout=20)
+        if df is None or df.empty:
+            return None, None
+        df = df.copy()
+        df["qvix"] = pd.to_numeric(df["qvix"], errors="coerce")
+        df = df.dropna(subset=["qvix"])
+        if df.empty:
+            return None, None
+        last = df.iloc[-1]
+        return round(float(last["qvix"]), 2), str(last["time"])
+    except Exception as e:
+        logger.warning("QVIX intraday optbbs fallback failed: %s", e)
+        return None, None
+
+
 def fetch_qvix_now() -> tuple:
-    """盘中最新 QVIX——上交所50ETF期权实时行情自算(qvix_calc.compute_qvix,
-    CBOE VIX 白皮书方法论),不再用 optbbs(1.optbbs.com)。
+    """盘中最新 QVIX。优先上交所50ETF期权实时行情自算(qvix_calc.compute_qvix,
+    CBOE VIX 白皮书方法论);自算取不到(典型: 部署在境外云、连不上新浪实时
+    逐合约接口)时退回 optbbs(1.optbbs.com)的最新分钟值。
 
-    optbbs 曾经是这里的主路径,但它是免费QVIX源里唯一的现成选择、没有
-    第二家可切换,而且实测过整天返回空值、历史日线数据的极端行情日
-    (2026-03-23)交叉验证也对不上标准方法论算出来的值(见 qvix_calc.py
-    顶部说明)——已经不再信任,全面改用自算。
+    optbbs 曾因整天返回空值、极端行情日(2026-03-23)交叉验证对不上而不再
+    做主路径(见 qvix_calc.py 顶部),但作为自算失败时的盘中兜底仍可用——
+    它只发一个请求, 境外主机拿得到, 平时也就跟自算差零点几个点。
 
-    返回 (qvix, "HH:MM:SS"),失败为 (None, None)。"""
+    返回 (qvix, "HH:MM:SS", source), source∈{"自算","optbbs"};
+    全失败为 (None, None, None)。"""
     try:
         import qvix_calc   # 延迟导入:qvix_calc 反过来 import fetcher,
                             # 模块顶层互相 import 会循环失败。
         # 请求错峰(见 qvix_calc._parallel_fetch)让单次现算要5~8秒,
         # timeout 留够余量,不要因为外层超时先一步掐断。
         r = _fetch_with_timeout(qvix_calc.compute_qvix, timeout=40)
-        if r is not None:
-            return r
+        if r is not None and r[0] is not None:
+            return r[0], r[1], "自算"
     except Exception as e:
         logger.warning("QVIX intraday fetch (self-computed) failed: %s", e)
 
-    return None, None
+    v, t = _optbbs_qvix_now()
+    if v is not None:
+        return v, t, "optbbs"
+    return None, None, None
 
 
 def save_qvix_self_history(rows: list) -> None:

@@ -333,12 +333,13 @@ _c_qvix_txt, _c_qvix_btn = st.columns([9, 1], vertical_alignment="center")
 if _c_qvix_btn.button("🔄", key="qvix_now_refresh", help="立即重新拉取盘中QVIX"):
     load_qvix_now.clear()
 try:
-    _qvix_now, _qvix_now_t = load_qvix_now()
+    _qvix_now, _qvix_now_t, _qvix_src = load_qvix_now()
 except Exception:
-    _qvix_now, _qvix_now_t = None, None
+    _qvix_now, _qvix_now_t, _qvix_src = None, None, None
 with _c_qvix_txt:
     if _qvix_now is not None:
-        st.caption(f"🌡️ 当前QVIX {_qvix_now:.2f}（{_qvix_now_t} 更新，自算）")
+        # source: 自算(上交所期权实时反推) 或 optbbs(自算取不到时的回退源)
+        st.caption(f"🌡️ 当前QVIX {_qvix_now:.2f}（{_qvix_now_t} 更新，{_qvix_src}）")
     else:
         st.caption("🌡️ 当前QVIX 暂不可用（点右侧🔄重试）")
 
