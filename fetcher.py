@@ -1643,6 +1643,24 @@ def update_qvix_self_daily() -> tuple:
     else:
         logger.info("QVIX 每日自算(%s) = %.2f", target, vix)
 
+    # 自愈:补最近15天里"接口临时失败"留下的空值(qvix IS NULL)。update 每次
+    # 只算"上一个收盘日", 某天上交所接口抽风留的空值之后不会再被重算、会成
+    # 永久空洞(2026-07-28/29 就这么丢过)。这里顺带把近15天的空值重试一遍,
+    # 接口恢复后自动补上。失败不影响主流程。
+    try:
+        _h = load_qvix_self_history()
+        if _h is not None:
+            _cut = (today - timedelta(days=15)).isoformat()
+            _nulls = _h[_h["qvix"].isna() & (_h["date"].astype(str) >= _cut)
+                        & (_h["date"].astype(str) != target.isoformat())]["date"].tolist()
+            for _d in _nulls:
+                _v, _n = qvix_calc.compute_qvix_for_date(datetime.fromisoformat(_d).date())
+                if _v is not None:
+                    save_qvix_self_history([{"date": _d, "qvix": _v, "note": None}])
+                    logger.info("QVIX 空值自愈回补(%s) = %.2f", _d, _v)
+    except Exception as e:
+        logger.warning("QVIX 空值自愈失败(不影响主流程): %s", e)
+
     hist = load_qvix_self_history()
     if hist is not None:
         hist = hist.sort_values("date").reset_index(drop=True)
