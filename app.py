@@ -340,23 +340,7 @@ with _c_qvix_txt:
     if _qvix_now is not None:
         st.caption(f"🌡️ 当前QVIX {_qvix_now:.2f}（{_qvix_now_t} 更新，自算）")
     else:
-        # 盘中实时算不出来(部署主机取不到新浪实时期权报价/限流, 或非交易时段)
-        # 时, 退回显示最近一天的自算收盘值, 至少有参考; 标注是收盘、非盘中。
-        _fb = None
-        try:
-            _qh = fetcher.load_qvix_self_history()
-            if _qh is not None:
-                _qh = _qh.dropna(subset=["qvix"])
-                if not _qh.empty:
-                    _r = _qh.sort_values("date").iloc[-1]
-                    _fb = (float(_r["qvix"]), str(_r["date"])[:10])
-        except Exception:
-            pass
-        if _fb:
-            st.caption(f"🌡️ 盘中QVIX暂不可用，最近收盘 {_fb[0]:.2f}"
-                       f"（{_fb[1]}，自算）· 点右侧🔄重试盘中")
-        else:
-            st.caption("🌡️ 当前QVIX 暂不可用（点右侧🔄重试）")
+        st.caption("🌡️ 当前QVIX 暂不可用（点右侧🔄重试）")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_table, tab_detail, tab_sim, tab_sse = st.tabs(
