@@ -1668,51 +1668,6 @@ def last_qvix_self_close() -> tuple:
     return round(float(row["qvix"]), 2), str(row["date"])
 
 
-# 盘中自算值算成了就记一笔, 算不出来时拿来顶上。live 档最多认这么久之前的
-# 值——再旧就别顶着"当前QVIX"的名头了, 宁可退回 optbbs 并标明来源不同。
-# noon/close 档不受这个限制:那两档的值本来就钉死在 11:30 / 15:00, 不会变。
-_INTRADAY_REUSE_MAX_MIN = 60
-
-
-def save_intraday_qvix(qvix: float, time_str: str, phase: str) -> None:
-    """记下最近一次**成功**的盘中自算值(只存一行, 覆盖式)。
-
-    云端(Streamlit Cloud/GCP)到新浪的建连只有约50%成功率, 一次算不出来是
-    常态。这份记录是**第三顺位**的兜底:现算失败先用 optbbs(实时性优先,
-    用户决策 2026-07-31——宁可要此刻的 optbbs, 也不要几十分钟前的自算值),
-    optbbs 也拿不到时才用它, 因为它再旧也是今天的, 比"昨天的收盘值"近得多。"""
-    conn = _conn()
-    conn.execute("CREATE TABLE IF NOT EXISTS qvix_intraday_last ("
-                 "id INTEGER PRIMARY KEY, date TEXT, time TEXT, phase TEXT, "
-                 "qvix REAL, saved_at REAL)")
-    conn.execute("INSERT OR REPLACE INTO qvix_intraday_last "
-                 "(id, date, time, phase, qvix, saved_at) VALUES (1,?,?,?,?,?)",
-                 (datetime.now(_CST).strftime("%Y-%m-%d"), time_str, phase,
-                  float(qvix), time.time()))
-    conn.commit()
-    conn.close()
-
-
-def last_intraday_qvix(phase: str) -> tuple:
-    """今天、同一档位下最近一次成功的自算值 → (qvix, "HH:MM:SS")。
-    没有/隔天/档位不符/live档太旧 都返回 (None, None)。"""
-    conn = _conn()
-    conn.execute("CREATE TABLE IF NOT EXISTS qvix_intraday_last ("
-                 "id INTEGER PRIMARY KEY, date TEXT, time TEXT, phase TEXT, "
-                 "qvix REAL, saved_at REAL)")
-    row = conn.execute("SELECT date, time, phase, qvix, saved_at "
-                       "FROM qvix_intraday_last WHERE id=1").fetchone()
-    conn.close()
-    now = datetime.now(_CST)
-    if not row or row["date"] != now.strftime("%Y-%m-%d") or row["phase"] != phase:
-        return None, None
-    if phase == "live":
-        age_min = (time.time() - (row["saved_at"] or 0)) / 60
-        if age_min > _INTRADAY_REUSE_MAX_MIN:
-            return None, None
-    return round(float(row["qvix"]), 2), str(row["time"])
-
-
 def _label(qvix: float, time_str: str, phase: str) -> tuple:
     """按档位给自算值贴标签(见 qvix_phase 的时段表)。"""
     if phase == "noon":
@@ -1764,7 +1719,6 @@ def fetch_qvix_now() -> tuple:
         r = _fetch_with_timeout(lambda: qvix_calc.compute_qvix(as_of=as_of),
                                 timeout=25)
         if r is not None and r[0] is not None:
-            save_intraday_qvix(r[0], r[1], phase)
             return _label(r[0], r[1], phase)
     except Exception as e:
         logger.warning("QVIX intraday fetch (self-computed) failed: %s", e)
@@ -1779,13 +1733,10 @@ def fetch_qvix_now() -> tuple:
     if v is not None:
         return v, t, "optbbs"
 
-    # optbbs 也挂了,才退今天最近一次成功的自算值——它再旧也是今天的,
-    # 比下面那个"昨天收盘值"近得多。
-    v, t = last_intraday_qvix(phase)
-    if v is not None:
-        return _label(v, t, phase)
-
-    return _from_db()
+    # 两条都拿不到就如实返回失败, 不拿旧值顶(用户决策 2026-07-31): 交易时段
+    # 显示一个几十分钟前、甚至昨天的数, 比显示"暂不可用"更容易误导——页面上
+    # 那行字叫"当前QVIX"。
+    return None, None, None
 
 
 def save_qvix_self_history(rows: list) -> None:
