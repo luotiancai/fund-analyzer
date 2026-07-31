@@ -56,10 +56,12 @@ TIMEOUT = 10
 
 
 # 每个请求最多试几次、每次间隔多久。新浪按 IP 限流, 而云厂商出口 IP 是共享的
-# ——实测腾讯云和 Streamlit Cloud 上单个请求都有约一半概率拿不到(表现为连接
-# 失败或空响应), 而本机同一时刻百发百中。重试是这里唯一有效的办法: 3 次之后
-# 全失败的概率降到约 1/8。
-_RETRY = 3
+# ——实测腾讯云(上海)和 Streamlit Cloud(GCP)上单个请求都只有约一半成功率, 而
+# 本机同一时刻百发百中。两个完全不同的云厂商、境内境外各一个, 都是一半, 基本
+# 排除了网络路由问题, 指向"按 IP 段限流": 机房 IP 一律降级, 家用宽带放行。
+# 提不高单次成功率, 就只能重试 + 少发请求(见 fetch_chains 如何把 6 次压成 2 次)。
+# 5 次全失败的概率约 1/32。
+_RETRY = 5
 _RETRY_SLEEP = 0.6
 
 
@@ -276,9 +278,14 @@ def _next_month_str(base: dt.date, offset: int) -> str:
     return f"{y:04d}{m:02d}"
 
 
-def expiry_candidates(today: dt.date):
+def expiry_candidates(today: dt.date, limit: int = 2):
     """还没到期的合约月份, 按到期先后:[(月份代码, 到期日, 剩余自然天数), …]。
-    50ETF期权只挂近两个月+两个季月, 探测 6 个月足够覆盖。"""
+
+    默认只取 2 个:加了"近月不得超过40天"的护栏后, 只有最靠前的那一对可能
+    有效(顺延一对的话近月就变成次月、五十多天, 必然被护栏挡掉), 再往后探
+    纯属白发请求——而在被限流的机房 IP 上, 每个请求都是一次翻车机会。
+    50ETF期权只挂近两个月+两个季月, 中间月份不存在, 所以要多试几个 offset
+    才凑得够 limit 个。"""
     out = []
     for off in range(6):
         ms = _next_month_str(today, off)
@@ -299,71 +306,74 @@ def expiry_candidates(today: dt.date):
         if days <= 0:
             continue
         out.append((ms, expiry, days))
-        if len(out) >= 4:
+        if len(out) >= limit:
             break
     return out
 
 
-def _contract_codes(month_str: str):
-    """某月的看涨+看跌合约代码 → [(代码, "C"/"P"), ...]。
-    走 hq.sinajs.cn 的 OP_UP_/OP_DOWN_ 清单接口, 返回形如
-      var hq_str_OP_UP_5100502608="CON_OP_10012127,CON_OP_10011851,...,"
+def _contract_codes_multi(months):
+    """一次请求拿多个月的双边合约清单 → {月份: [(代码, "C"/"P"), ...]}。
 
-    任一侧拿不到就整月作废(返回 [])而不是给个残缺清单:只有认购没有认沽时,
-    put-call parity 反推不出远期价格, 后面的 K0 选取、虚值筛选全都建立在错误
-    前提上。实测云端出现过只拿到一侧(11个而不是22个)的情况。"""
-    out = []
-    for tag, kind in (("OP_UP_", "C"), ("OP_DOWN_", "P")):
-        try:
-            text = _get(_HQ + tag + UNDERLYING + month_str[-4:])
-        except Exception:
-            return []
-        body = re.search(r'="([^"]*)"', text)
-        codes = re.findall(r"CON_OP_(\d+)", body.group(1)) if body else []
-        if not codes:
-            return []
-        out += [(c, kind) for c in codes]
+    新浪 list= 支持逗号拼接多个符号, 所以 N 个月的认购+认沽清单(原本 2N 次
+    请求)压成 1 次。在被限流的机房 IP 上, 请求次数就是成功率——少发一次就少
+    一次翻车机会。
+    任一月任一侧缺失, 该月不进结果:只有认购没有认沽时 put-call parity 反推
+    不出远期价格, 后面 K0 选取、虚值筛选全建立在错误前提上。"""
+    syms = []
+    for ms in months:
+        syms += [f"OP_UP_{UNDERLYING}{ms[-4:]}", f"OP_DOWN_{UNDERLYING}{ms[-4:]}"]
+    text = _get(_HQ + ",".join(syms))
+    out = {}
+    for ms in months:
+        sides = {}
+        for tag, kind in (("OP_UP_", "C"), ("OP_DOWN_", "P")):
+            m = re.search(f'{tag}{UNDERLYING}{ms[-4:]}="([^"]*)"', text)
+            codes = re.findall(r"CON_OP_(\d+)", m.group(1)) if m else []
+            if codes:
+                sides[kind] = codes
+        if len(sides) == 2:
+            out[ms] = [(c, k) for k, cs in sides.items() for c in cs]
     return out
 
 
-def fetch_chain(month_str: str):
-    """整月合约链 → 一次批量拉实时报价, 返回
-    [{"kind","strike","bid","mid"}, ...]。
+def fetch_chains(months):
+    """一次请求拿多个月的全部实时报价 → {月份: [{"kind","strike","bid","mid"}…]}。
 
-    新浪支持逗号拼多个 CON_OP_ 代码一次返回(整月~50合约一个请求15KB全回来),
-    所以每月链只发 1 个批量请求, 不是逐合约近50连发——单请求容错高、也不会
-    因"瞬时几十并发"被反爬掐掉。行情行格式:
+    连同上面的清单接口, 一次现算对 hq.sinajs.cn 只发 **2 个**请求(原本每月
+    2次清单+1次报价 = 6次)。行情行格式:
       var hq_str_CON_OP_<code>="买量,买价,最新价,卖价,卖量,持仓,涨幅,行权价,…"
-    """
-    codes = _contract_codes(month_str)
-    if not codes:
-        return []
-    kind_of = dict(codes)
-    try:
-        text = _get(_HQ + ",".join("CON_OP_" + c for c, _ in codes))
-    except Exception:
-        return []
+    某月报价没拿全就不放进结果——少几个行权价会让 1/K² 加权求和漏掉整段虚值
+    期权, 算出来偏低且看不出异常。宁可那个月不算。"""
+    codes_by_month = _contract_codes_multi(months)
+    if not codes_by_month:
+        return {}
+    meta = {c: (k, ms) for ms, lst in codes_by_month.items() for c, k in lst}
+    text = _get(_HQ + ",".join("CON_OP_" + c for c in meta))
 
-    rows = []
+    got = {}
     for m in re.finditer(r'CON_OP_(\d+)="([^"]*)"', text):
         code, parts = m.group(1), m.group(2).split(",")
-        if len(parts) < 8:
+        if code not in meta or len(parts) < 8:
             continue
+        kind, ms = meta[code]
         try:
             bid, last, ask = float(parts[1]), float(parts[2]), float(parts[3])
             strike = float(parts[7])
         except ValueError:
             continue
         mid = (bid + ask) / 2 if bid > 0 and ask > 0 else last
-        rows.append({"kind": kind_of.get(code, "C"), "strike": strike,
-                     "bid": bid, "mid": mid})
+        got.setdefault(ms, []).append({"kind": kind, "strike": strike,
+                                       "bid": bid, "mid": mid})
+    return {ms: rows for ms, rows in got.items()
+            if len(rows) == len(codes_by_month[ms])}
 
-    # 报价没拿全就整月作废。原来这里只记一条日志、照样用残缺数据算——但少几个
-    # 行权价会让 1/K² 加权求和漏掉整段虚值期权, 算出来的数偏低且看不出异常。
-    # 实测云端出现过 22 个合约只回 11 个。宁可这个月不算, 让上层去用别的组合。
-    if len(rows) < len(codes):
+
+def fetch_chain(month_str: str):
+    """单月版, 内部走 fetch_chains。拿不到返回 []。"""
+    try:
+        return fetch_chains([month_str]).get(month_str, [])
+    except Exception:
         return []
-    return rows
 
 
 def compute_qvix(as_of: Optional[dt.datetime] = None,
@@ -375,12 +385,19 @@ def compute_qvix(as_of: Optional[dt.datetime] = None,
     还跟着真实时间缩小, 同一批报价会随时间算出不一样的数。
     fallback_rate:SHIBOR 取不到时用的无风险利率。"""
     now = as_of or dt.datetime.now(CST)
-    pairs = candidate_pairs(expiry_candidates(now.date()))
+    cands = expiry_candidates(now.date())
+    pairs = candidate_pairs(cands)
     if not pairs:
         return None
 
     curve = shibor_curve()
-    chains = {}
+    # 一次性把要用到的月份全取回来(对 hq.sinajs.cn 只 2 个请求), 而不是每月
+    # 分别去取——机房 IP 被限流时, 请求次数直接决定成功率。
+    try:
+        chains = fetch_chains([c[0] for c in cands])
+    except Exception:
+        return None
+
     for (near_ms, near_date, _), (next_ms, next_date, _) in pairs:
         T1, N1 = years_to_expiry(near_date, now)
         T2, N2 = years_to_expiry(next_date, now)
@@ -394,11 +411,10 @@ def compute_qvix(as_of: Optional[dt.datetime] = None,
         # 情况下 N1 不会超过 40。
         if N1 > 40:
             continue
+        if near_ms not in chains or next_ms not in chains:
+            continue
         r1 = rate_for_days(curve, N1, fallback_rate)
         r2 = rate_for_days(curve, N2, fallback_rate)
-        for ms in (near_ms, next_ms):
-            if ms not in chains:
-                chains[ms] = fetch_chain(ms)
         near = term_variance(chains[near_ms], r1, T1)
         nxt = term_variance(chains[next_ms], r2, T2)
         if near is None or nxt is None:
@@ -454,17 +470,15 @@ def diagnose(as_of: Optional[dt.datetime] = None) -> dict:
     # ③ 合约清单 + ④ 批量报价(拿第一个到期月试)
     cands = out.get("expiry_candidates") or []
     if cands:
-        ms = cands[0][0]
+        months = [c[0] for c in cands]
         try:
-            codes = _contract_codes(ms)
-            out["contract_codes_n"] = len(codes)
-            out["contract_codes_head"] = codes[:3]
+            codes = _contract_codes_multi(months)
+            out["contract_codes_n"] = {k: len(v) for k, v in codes.items()}
         except Exception as e:
             out["contract_codes_error"] = f"{type(e).__name__}: {e}"
         try:
-            chain = fetch_chain(ms)
-            out["chain_n"] = len(chain)
-            out["chain_head"] = chain[:2]
+            chains = fetch_chains(months)
+            out["chain_n"] = {k: len(v) for k, v in chains.items()}
         except Exception as e:
             out["chain_error"] = f"{type(e).__name__}: {e}"
 
