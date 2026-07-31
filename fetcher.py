@@ -1668,6 +1668,51 @@ def last_qvix_self_close() -> tuple:
     return round(float(row["qvix"]), 2), str(row["date"])
 
 
+_QVIX_NOW_ASSET_URL = ("https://github.com/luotiancai/fund-analyzer/"
+                       "releases/download/data/qvix_now.json")
+
+
+def _published_qvix_now(phase: str) -> tuple:
+    """读本机 publish_qvix.py 发布到 Release 的自算值 → (qvix, "HH:MM:SS")。
+
+    为什么要这么绕:新浪按 IP 段限流, 机房出口(Streamlit Cloud/腾讯云都试过)
+    单请求成功率只有约50%, 而本机家用宽带 ~100%。所以自算只能在本机跑, 结果
+    发到 Release, 页面来读——这是唯一能让云端页面拿到"跟自算阈值同一把尺子"
+    的数的办法。详见 publish_qvix.py 顶部。
+
+    只认同一天、且档位一致的值:
+      · live 档另要求发布时间在 _QVIX_NOW_MAX_AGE_MIN 分钟内(实时值会变);
+      · noon/close 档不看新鲜度——那两档的值本来就钉死在 11:30 / 15:00,
+        中午12:50 读到 11:32 发布的值完全正确, 按分钟判过期反而会误杀。
+    拿不到/过期/档位不符返回 (None, None), 调用方继续往下走现算和 optbbs。"""
+    try:
+        r = requests.get(_QVIX_NOW_ASSET_URL, timeout=8)
+        r.raise_for_status()
+        d = r.json()
+    except Exception as e:
+        logger.debug("盘中自算发布值取不到: %s", e)
+        return None, None
+    now = datetime.now(_CST)
+    if d.get("date") != now.strftime("%Y-%m-%d") or d.get("phase") != phase:
+        return None, None
+    if phase == "live":
+        try:
+            hh, mm, ss = (int(x) for x in str(d["time"]).split(":"))
+        except Exception:
+            return None, None
+        age = (now - now.replace(hour=hh, minute=mm, second=ss,
+                                 microsecond=0)).total_seconds() / 60
+        if not (0 <= age <= _QVIX_NOW_MAX_AGE_MIN):
+            return None, None
+    v = d.get("qvix")
+    return (float(v), str(d.get("time"))) if v is not None else (None, None)
+
+
+# live 档的发布值多久算过期。本机按需/定时推送, 留宽一点, 免得刚过几分钟就
+# 判过期、掉回 optbbs(那是另一把尺子)。noon/close 档不看这个。
+_QVIX_NOW_MAX_AGE_MIN = 30
+
+
 def _label(qvix: float, time_str: str, phase: str) -> tuple:
     """按档位给自算值贴标签(见 qvix_phase 的时段表)。"""
     if phase == "noon":
@@ -1708,6 +1753,14 @@ def fetch_qvix_now() -> tuple:
 
     if phase == "prev":
         return _from_db()
+
+    # 先看本机发布的自算值(publish_qvix.py 推到 Release 的小文件)。放在现算
+    # 前面是有意的:云端到新浪只有约50%成功率, 每次都先去赌一把要拿页面加载
+    # 时间当赌注; 而发布值几百字节、从 GitHub 拿、稳定且快。
+    # 本机跑这个项目时该文件多半也是新的, 用它跟自己现算结果一样。
+    v, t = _published_qvix_now(phase)
+    if v is not None:
+        return _label(v, t, phase)
 
     try:
         import qvix_calc   # 延迟导入:qvix_calc 反过来 import fetcher,
