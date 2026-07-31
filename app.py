@@ -359,8 +359,8 @@ with _c_qvix_txt:
         st.caption(f"🌡️ 当前QVIX {_qvix_now:.2f}（{_qvix_now_t} 更新，{_qvix_src}）")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_table, tab_detail, tab_sim, tab_sse = st.tabs(
-    ["📋 基金列表", "🔍 基金详情", "💰 模拟盘", "📈 上证指数"])
+tab_sse, tab_table, tab_detail, tab_sim = st.tabs(
+    ["📈 上证指数", "📋 基金列表", "🔍 基金详情", "💰 模拟盘"])
 
 # ─── Tab 1: Table ────────────────────────────────────────────────────────────
 with tab_table:

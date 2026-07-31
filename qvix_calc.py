@@ -342,11 +342,18 @@ def _term_variance(chain: pd.DataFrame, r: float, T: float):
     return sigma2, F, K0
 
 
-def compute_qvix() -> Optional[tuple]:
-    """现算当前 QVIX。失败(到期月探测失败/合约或报价拿不全等)返回 None,
+def compute_qvix(as_of: Optional[dt.datetime] = None) -> Optional[tuple]:
+    """现算 QVIX。失败(到期月探测失败/合约或报价拿不全等)返回 None,
     由调用方(fetcher.fetch_qvix_now)决定要不要继续找别的路子。
-    返回 (qvix, "HH:MM:SS")。"""
-    now = dt.datetime.now(_CST)
+    返回 (qvix, "HH:MM:SS")。
+
+    as_of:用哪个时刻算剩余到期时间 T,默认当下。传定值是为了把结果
+    "冻结"在某一刻——中午休市(11:30~13:00)和收盘后,新浪返回的都是
+    11:30 / 15:00 那一刻的静态报价,如果 T 还跟着真实时间一直缩小,
+    同一批报价会随着时间推移算出越来越不一样的数(下午2点看和晚上10点
+    看不一致)。把 as_of 钉在 11:30 / 15:00,算出来的就稳定是"上午收盘值"
+    /"今日收盘值"。调用方见 fetcher.qvix_phase()。"""
+    now = as_of or dt.datetime.now(_CST)
     try:
         pairs = _candidate_pairs(_expiry_candidates(now.date()))
         if not pairs:

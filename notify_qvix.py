@@ -16,7 +16,7 @@ workflow_dispatch——不用 GitHub 自己的 schedule 触发器,那个高峰�
   SMTP_PASS  QQ 邮箱 SMTP 授权码(设置→账号→开启SMTP服务→生成授权码)
   MAIL_TO    收件人,缺省同 SMTP_USER
   SMTP_HOST/SMTP_PORT  缺省 smtp.qq.com / 465
-非交易日(新浪行情日期不是当天)静默退出。
+非交易日静默退出(优先看新浪行情日期,新浪不可达时退回交易日历)。
 """
 
 import datetime as dt
@@ -58,12 +58,25 @@ def _send_mail(subject: str, body: str) -> bool:
     return True
 
 
-def _sse_quote_date():
-    """新浪实时行情的日期;非今天 → 非交易日。"""
-    r = requests.get("https://hq.sinajs.cn/list=sh000001", timeout=10,
-                     headers={"Referer": "https://finance.sina.com.cn",
-                              "User-Agent": "Mozilla/5.0"})
-    return r.text.split('"')[1].split(",")[30]
+def _is_trading_today() -> bool:
+    """今天是不是交易日。优先看新浪实时行情的日期(它只在交易日更新到当天,
+    最直接);新浪不可达时退回交易日历。
+
+    以前这里裸调新浪、没有任何异常捕获,而 hq.sinajs.cn 从境外机房是 IP 层
+    不可达的([Errno 101] Network is unreachable)。它又是 main() 的第一步,
+    所以新浪一断整个推送任务就崩:2026-07-30 实际发生过,那天没发出任何
+    QVIX 提醒,收件箱里只有 GitHub 的构建失败通知——看着像技术故障、很容易
+    划走,可万一那天恰好破了阈值就完全错过了。
+    QVIX 取值本身有 optbbs 兜底、境外拿得到,不该被这道坎卡死。"""
+    today = dt.datetime.now(_CST).strftime("%Y-%m-%d")
+    try:
+        r = requests.get("https://hq.sinajs.cn/list=sh000001", timeout=10,
+                         headers={"Referer": "https://finance.sina.com.cn",
+                                  "User-Agent": "Mozilla/5.0"})
+        return r.text.split('"')[1].split(",")[30] == today
+    except Exception as e:
+        log.warning("新浪行情日期取不到(%s),改用交易日历判断", e)
+        return fetcher.is_trading_day()
 
 
 def _threshold():
@@ -85,9 +98,8 @@ def _threshold():
 
 def main():
     today = dt.datetime.now(_CST).strftime("%Y-%m-%d")
-    quote_date = _sse_quote_date()
-    if quote_date != today:
-        log.info("非交易日(行情日期 %s),跳过", quote_date)
+    if not _is_trading_today():
+        log.info("非交易日,跳过")
         return
 
     qvix, qtime, qsrc = fetcher.fetch_qvix_now()
