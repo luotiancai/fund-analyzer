@@ -1577,26 +1577,58 @@ def _trading_days() -> Optional[set]:
     return days
 
 
-# A股连续竞价时段(北京时间)。集合竞价 9:15~9:25 不算在内:那时只有申报、
-# 没有连续成交,期权买卖盘还没铺开,现算出来的值噪声大且不可比。
-_TRADING_SESSIONS = ((9, 30, 11, 30), (13, 0, 15, 0))
+# 开盘到收盘(北京时间),中午 11:30~13:00 的休市**包含在内**,不切成两段。
+# 休市时新浪返回的是 11:30 的静态快照,照常现算得到的就是"上午收盘"那个
+# 值——这正是午休时该显示的最新值。要是把午休排除掉,页面会在 11:30~13:00
+# 退回去显示**昨天**的收盘值,而上午明明已经交易了两小时,那才是错的。
+# 集合竞价 9:15~9:25 不算:那时只有申报、没有连续成交,期权买卖盘还没铺开,
+# 现算出来的值噪声大且不可比。
+# 盘中QVIX的"取哪个数"分档(北京时间,交易日)。交易所连续竞价是
+# 9:30~11:30 和 13:00~15:00,中午休市和收盘后新浪返回的都是休市/收盘那一刻
+# 的静态报价,所以那两段不是"没有数",而是"数已经定格了":
+#   00:00~09:30  昨天的收盘值(今天还没开始交易)
+#   09:30~11:30  实时现算
+#   11:30~13:00  定格在 11:30(上午收盘值)
+#   13:00~15:00  实时现算
+#   15:00~24:00  定格在 15:00(今日收盘值)
+# 定格靠给 qvix_calc.compute_qvix 传 as_of 实现:报价本来就是静态的,只要
+# 把"剩余到期时间"也钉在同一刻,同一批报价就永远算出同一个数,不会出现
+# 下午2点看和晚上10点看不一致。非交易日全天走"昨天的收盘值"。
+_OPEN = dt_time(9, 30)
+_NOON_CLOSE = dt_time(11, 30)
+_NOON_OPEN = dt_time(13, 0)
+_CLOSE = dt_time(15, 0)
 
 
-def is_trading_time(now: Optional[datetime] = None) -> bool:
-    """现在是不是A股连续竞价时段(交易日 + 时段内)。节假日靠交易日历排除;
-    日历拉不到时退化成只看星期几——那种情况下节假日会被误判成交易时段,
-    但届时新浪返回的是上一交易日的静态报价,自算结果等于上一收盘值,
-    不会凭空造出一个错的"实时值"。"""
-    now = now or datetime.now(_CST)
+def is_trading_day(day=None) -> bool:
+    """是不是A股交易日。节假日靠交易日历排除;日历拉不到时退化成只看
+    星期几——那种情况下节假日会被误判成交易日,但届时新浪返回的是上一
+    交易日的静态报价,算出来等于上一收盘值,不会凭空造出一个错的实时值。"""
+    day = day or datetime.now(_CST).date()
     days = _trading_days()
     if days is not None:
-        if now.date() not in days:
-            return False
-    elif now.weekday() >= 5:
-        return False
+        return day in days
+    return day.weekday() < 5
+
+
+def qvix_phase(now: Optional[datetime] = None) -> tuple:
+    """当下该取哪个数 → (档位, as_of)。
+
+    档位∈{"live","noon","close","prev"};as_of 是要钉住的时刻
+    ("live" 为 None=用当下,"prev" 也是 None=不现算、直接读库)。"""
+    now = now or datetime.now(_CST)
+    if not is_trading_day(now.date()):
+        return "prev", None
     t = now.time()
-    return any(dt_time(h1, m1) <= t <= dt_time(h2, m2)
-               for h1, m1, h2, m2 in _TRADING_SESSIONS)
+    if t < _OPEN:
+        return "prev", None
+    if t < _NOON_CLOSE:
+        return "live", None
+    if t < _NOON_OPEN:
+        return "noon", now.replace(hour=11, minute=30, second=0, microsecond=0)
+    if t < _CLOSE:
+        return "live", None
+    return "close", now.replace(hour=15, minute=0, second=0, microsecond=0)
 
 
 def last_qvix_self_close() -> tuple:
@@ -1615,46 +1647,60 @@ def last_qvix_self_close() -> tuple:
 
 
 def fetch_qvix_now() -> tuple:
-    """盘中最新 QVIX。优先上交所50ETF期权实时行情自算(qvix_calc.compute_qvix,
-    CBOE VIX 白皮书方法论);自算取不到(典型: 部署在境外云、连不上新浪实时
-    逐合约接口)时退回 optbbs(1.optbbs.com)的最新分钟值。
+    """页面上那个 QVIX 该显示的数。按 qvix_phase() 分档(见那里的时段表):
+    盘中现算,午休定格在11:30,收盘后定格在15:00,开盘前/非交易日读库里
+    最近一个收盘值。
 
-    optbbs 曾因整天返回空值、极端行情日(2026-03-23)交叉验证对不上而不再
-    做主路径(见 qvix_calc.py 顶部),但作为自算失败时的盘中兜底仍可用——
-    它只发一个请求, 境外主机拿得到, 平时也就跟自算差零点几个点。
+    现算优先用上交所50ETF期权实时行情自算(qvix_calc.compute_qvix,CBOE VIX
+    白皮书方法论);算不到时退回 optbbs(1.optbbs.com)的最新分钟值——典型
+    场景是部署在境外云:实测 hq.sinajs.cn 从境外机房是 IP 层不可达
+    ([Errno 101] Network is unreachable),自算整条链路都在新浪上,必然失败。
+    optbbs 只发一个请求、境外拿得到,平时跟自算差零点几个点,作为兜底可用
+    (但它在合约临到期那两天会塌成"临到期合约的波动率",见 qvix_calc 顶部
+    2026-03-23 那段,所以只做兜底不做主路径)。
 
-    非交易时段直接给最近一个自算收盘值,不去现算:收盘后新浪返回的是当天
-    收盘那一刻的静态报价,现算等于把收盘值重算一遍,白白发请求、还会因为
-    "时间到期项 T 继续变小"算出跟收盘值对不上的数。注意这跟 2026-07 那次
-    被 revert 的改动(26315a8)不是一回事:那次是"盘中算不出来就退回收盘值",
-    会把故障伪装成正常值;这次是按时段分流,盘中失败仍然照旧走 optbbs 兜底、
-    再失败就如实显示不可用。
+    两条都取不到时,退回库里最近一个收盘值并如实标注日期——不是把故障
+    伪装成实时值(那是被 revert 的 26315a8 的做法),标签会写清楚显示的是
+    哪天的收盘值。
 
     返回 (qvix, 时间戳, source):
-      · 交易时段 source∈{"自算","optbbs"},时间戳为 "HH:MM:SS"
-      · 非交易时段 source="收盘",时间戳为 "YYYY-MM-DD"
-      · 全失败为 (None, None, None)"""
-    if not is_trading_time():
+      · live  → source∈{"自算","optbbs"},时间戳 "HH:MM:SS"
+      · noon  → source="上午收盘",时间戳 "11:30"
+      · close → source="今日收盘",时间戳 "15:00"
+      · prev/兜底 → source="收盘",时间戳 "YYYY-MM-DD"
+      · 全失败 → (None, None, None)"""
+    phase, as_of = qvix_phase()
+
+    def _from_db():
         v, d = last_qvix_self_close()
-        if v is not None:
-            return v, d, "收盘"
-        return None, None, None
+        return (v, d, "收盘") if v is not None else (None, None, None)
+
+    if phase == "prev":
+        return _from_db()
 
     try:
         import qvix_calc   # 延迟导入:qvix_calc 反过来 import fetcher,
                             # 模块顶层互相 import 会循环失败。
         # 自算改批量取链后单次现算约2~3秒(见 qvix_calc._fetch_chain),
         # timeout 仍留够余量,不要因为外层超时先一步掐断。
-        r = _fetch_with_timeout(qvix_calc.compute_qvix, timeout=40)
+        r = _fetch_with_timeout(lambda: qvix_calc.compute_qvix(as_of=as_of),
+                                timeout=40)
         if r is not None and r[0] is not None:
+            if phase == "noon":
+                return r[0], "11:30", "上午收盘"
+            if phase == "close":
+                return r[0], "15:00", "今日收盘"
             return r[0], r[1], "自算"
     except Exception as e:
         logger.warning("QVIX intraday fetch (self-computed) failed: %s", e)
 
     v, t = _optbbs_qvix_now()
     if v is not None:
+        # optbbs 给的是分钟序列的最后一个非空值:休市/收盘后它自然就停在
+        # 11:30 / 15:00 那一条,跟本档要的"定格值"是同一个东西,直接用它
+        # 自带的时间戳,不硬改成 11:30/15:00。
         return v, t, "optbbs"
-    return None, None, None
+    return _from_db()
 
 
 def save_qvix_self_history(rows: list) -> None:

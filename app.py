@@ -345,11 +345,18 @@ try:
 except Exception:
     _qvix_now, _qvix_now_t, _qvix_src = None, None, None
 with _c_qvix_txt:
-    if _qvix_now is not None:
+    if _qvix_now is None:
+        st.caption("🌡️ 当前QVIX 暂不可用（点右侧🔄重试）")
+    elif _qvix_src == "收盘":
+        # 开盘前/非交易日(或两条实时路径都断了):库里最近一个收盘值,
+        # 标清楚是哪天的,别让人误以为是实时值
+        st.caption(f"🌡️ QVIX {_qvix_now:.2f}（{_qvix_now_t} 收盘值）")
+    elif _qvix_src in ("上午收盘", "今日收盘"):
+        # 午休/收盘后:定格在 11:30 / 15:00 的值(报价本就静止,见 qvix_phase)
+        st.caption(f"🌡️ QVIX {_qvix_now:.2f}（今日 {_qvix_now_t} {_qvix_src}）")
+    else:
         # source: 自算(上交所期权实时反推) 或 optbbs(自算取不到时的回退源)
         st.caption(f"🌡️ 当前QVIX {_qvix_now:.2f}（{_qvix_now_t} 更新，{_qvix_src}）")
-    else:
-        st.caption("🌡️ 当前QVIX 暂不可用（点右侧🔄重试）")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_table, tab_detail, tab_sim, tab_sse = st.tabs(
