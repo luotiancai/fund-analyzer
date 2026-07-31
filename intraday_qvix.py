@@ -43,6 +43,13 @@ RELEASE_TAG = "data"
 
 
 def main():
+    # 建一个空库就够了:这个任务不下载 81MB 的数据快照(算盘中值只需要网络),
+    # 但 compute_qvix 会调 fetcher.get_risk_free_rate() 取"SHIBOR拿不到时的
+    # 兜底利率", 那个函数要读 app_meta 表。没有库就是 no such table: app_meta,
+    # 整个自算被这一步带挂(实测踩过)。init_db() 会在空目录里建好表结构,
+    # 利率取不到时函数自己有常量兜底, 不影响结果。
+    fetcher.init_db()
+
     phase, as_of = fetcher.qvix_phase()
     if phase == "prev":
         log.info("当前非交易时段(档位=%s),无需发布", phase)
