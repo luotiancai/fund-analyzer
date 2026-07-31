@@ -396,12 +396,32 @@ def compute_qvix(as_of: Optional[dt.datetime] = None,
 # 可选加固:这个接口是公开的, 每次调用都会打一次新浪。URL 本身很难猜到,
 # 真担心被人乱调可以在网关上加个鉴权, 或在下面校验一个约定的 query 参数。
 
+def parse_qs_flat(qs: str) -> dict:
+    """"a=1&b=2" → {"a":"1","b":"2"}。用标准库, 不引额外依赖。"""
+    from urllib.parse import parse_qs
+    return {k: v[0] for k, v in parse_qs(qs.lstrip("?")).items() if v}
+
+
 def main_handler(event, context):
     """HTTP 触发:返回 {"qvix":19.71,"time":"15:00:00","ok":true}。
 
     query 参数 as_of=HH:MM 可以把计算时刻钉死(页面在午休/收盘后会传 11:30 /
     15:00, 理由见 compute_qvix 的 as_of 说明)。不传就用当下。"""
-    params = (event or {}).get("queryString") or {}
+    # query 参数的字段名各触发方式不一样(函数URL / API网关 / 直接测试),
+    # 全都兼容一下, 免得换个接入方式就取不到。
+    e = event or {}
+    params = {}
+    for key in ("queryString", "queryStringParameters"):
+        v = e.get(key)
+        if isinstance(v, dict):
+            params.update(v)
+        elif isinstance(v, str) and v:
+            params.update(parse_qs_flat(v))
+    for key in ("rawQueryString", "rawQuery"):
+        if isinstance(e.get(key), str) and e[key]:
+            params.update(parse_qs_flat(e[key]))
+    params.update({k: v for k, v in e.items() if k == "as_of"})  # 控制台直接测试
+
     as_of = None
     raw = params.get("as_of")
     if raw:
