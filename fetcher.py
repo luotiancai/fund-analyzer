@@ -9,7 +9,7 @@ import threading
 import time
 import logging
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -1557,6 +1557,63 @@ def _optbbs_qvix_now() -> tuple:
         return None, None
 
 
+_TRADE_CAL_CACHE = {"at": 0.0, "days": None}
+
+
+def _trading_days() -> Optional[set]:
+    """A股交易日集合,进程内缓存12小时(日历一年只变几次,没必要每次现拉)。
+    拉不到返回 None,调用方退化成只按星期几判断。"""
+    now = time.time()
+    if (_TRADE_CAL_CACHE["days"] is not None
+            and now - _TRADE_CAL_CACHE["at"] < 12 * 3600):
+        return _TRADE_CAL_CACHE["days"]
+    try:
+        cal = ak.tool_trade_date_hist_sina()
+        days = set(pd.to_datetime(cal["trade_date"]).dt.date)
+    except Exception as e:
+        logger.debug("交易日历拉取失败,退化成按星期判断: %s", e)
+        return _TRADE_CAL_CACHE["days"]
+    _TRADE_CAL_CACHE.update(at=now, days=days)
+    return days
+
+
+# A股连续竞价时段(北京时间)。集合竞价 9:15~9:25 不算在内:那时只有申报、
+# 没有连续成交,期权买卖盘还没铺开,现算出来的值噪声大且不可比。
+_TRADING_SESSIONS = ((9, 30, 11, 30), (13, 0, 15, 0))
+
+
+def is_trading_time(now: Optional[datetime] = None) -> bool:
+    """现在是不是A股连续竞价时段(交易日 + 时段内)。节假日靠交易日历排除;
+    日历拉不到时退化成只看星期几——那种情况下节假日会被误判成交易时段,
+    但届时新浪返回的是上一交易日的静态报价,自算结果等于上一收盘值,
+    不会凭空造出一个错的"实时值"。"""
+    now = now or datetime.now(_CST)
+    days = _trading_days()
+    if days is not None:
+        if now.date() not in days:
+            return False
+    elif now.weekday() >= 5:
+        return False
+    t = now.time()
+    return any(dt_time(h1, m1) <= t <= dt_time(h2, m2)
+               for h1, m1, h2, m2 in _TRADING_SESSIONS)
+
+
+def last_qvix_self_close() -> tuple:
+    """qvix_self_history 里最近一个非空自算收盘值 → (qvix, "YYYY-MM-DD")。
+    没有则 (None, None)。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS qvix_self_history ("
+                 "date TEXT PRIMARY KEY, qvix REAL, note TEXT)")
+    row = conn.execute(
+        "SELECT date, qvix FROM qvix_self_history "
+        "WHERE qvix IS NOT NULL ORDER BY date DESC LIMIT 1").fetchone()
+    conn.close()
+    if not row:
+        return None, None
+    return round(float(row["qvix"]), 2), str(row["date"])
+
+
 def fetch_qvix_now() -> tuple:
     """盘中最新 QVIX。优先上交所50ETF期权实时行情自算(qvix_calc.compute_qvix,
     CBOE VIX 白皮书方法论);自算取不到(典型: 部署在境外云、连不上新浪实时
@@ -1566,8 +1623,23 @@ def fetch_qvix_now() -> tuple:
     做主路径(见 qvix_calc.py 顶部),但作为自算失败时的盘中兜底仍可用——
     它只发一个请求, 境外主机拿得到, 平时也就跟自算差零点几个点。
 
-    返回 (qvix, "HH:MM:SS", source), source∈{"自算","optbbs"};
-    全失败为 (None, None, None)。"""
+    非交易时段直接给最近一个自算收盘值,不去现算:收盘后新浪返回的是当天
+    收盘那一刻的静态报价,现算等于把收盘值重算一遍,白白发请求、还会因为
+    "时间到期项 T 继续变小"算出跟收盘值对不上的数。注意这跟 2026-07 那次
+    被 revert 的改动(26315a8)不是一回事:那次是"盘中算不出来就退回收盘值",
+    会把故障伪装成正常值;这次是按时段分流,盘中失败仍然照旧走 optbbs 兜底、
+    再失败就如实显示不可用。
+
+    返回 (qvix, 时间戳, source):
+      · 交易时段 source∈{"自算","optbbs"},时间戳为 "HH:MM:SS"
+      · 非交易时段 source="收盘",时间戳为 "YYYY-MM-DD"
+      · 全失败为 (None, None, None)"""
+    if not is_trading_time():
+        v, d = last_qvix_self_close()
+        if v is not None:
+            return v, d, "收盘"
+        return None, None, None
+
     try:
         import qvix_calc   # 延迟导入:qvix_calc 反过来 import fetcher,
                             # 模块顶层互相 import 会循环失败。
@@ -1636,6 +1708,81 @@ def save_qvix_self_threshold(dates: list, thresholds: list) -> None:
         [(t, d) for d, t in zip(dates, thresholds)])
     conn.commit()
     conn.close()
+
+
+def save_backtest_trades(trades: list, params: Optional[dict] = None) -> None:
+    """标准策略回测明细落库(表 backtest_trades),供 app「策略复盘」表直接读。
+
+    以前这张表是硬编码在 app.py 里的一堆列表字面量,每次重跑回测都要手抄
+    一遍数字进页面——既容易抄错,也让"页面上的数"和"回测真正跑出来的数"
+    随时可能对不上。改成回测跑完直接落库、页面读库,跑批推一次库页面就
+    跟着变,不用改代码。
+
+    整表覆盖(每次回测都是全量重跑,增量没有意义)。trades 原样存 JSON,
+    以后回测多加一列也不用动表结构。params 记录跑这次用的参数,页面上
+    要标注口径时可以取。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS backtest_trades ("
+                 "id INTEGER PRIMARY KEY, data TEXT, params TEXT, saved_at REAL)")
+    conn.execute("DELETE FROM backtest_trades")
+    conn.execute(
+        "INSERT INTO backtest_trades (id, data, params, saved_at) VALUES (1,?,?,?)",
+        (json.dumps(trades, ensure_ascii=False, default=str),
+         json.dumps(params or {}, ensure_ascii=False, default=str),
+         time.time()))
+    conn.commit()
+    conn.close()
+
+
+def load_backtest_trades() -> tuple:
+    """→ (DataFrame, params dict, saved_at unix秒)。没跑过回测返回
+    (None, {}, None)——调用方(app)据此决定是否隐藏整个复盘区。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS backtest_trades ("
+                 "id INTEGER PRIMARY KEY, data TEXT, params TEXT, saved_at REAL)")
+    row = conn.execute(
+        "SELECT data, params, saved_at FROM backtest_trades WHERE id=1").fetchone()
+    conn.close()
+    if not row or not row["data"]:
+        return None, {}, None
+    try:
+        trades = json.loads(row["data"])
+        params = json.loads(row["params"]) if row["params"] else {}
+    except Exception as e:
+        logger.warning("回测明细解析失败: %s", e)
+        return None, {}, None
+    if not trades:
+        return None, params, row["saved_at"]
+    return pd.DataFrame(trades), params, row["saved_at"]
+
+
+def save_backtest_notes(notes: dict) -> None:
+    """回测逐笔点评落库(表 backtest_notes,按买入日索引)。
+
+    单独一张表而不是塞进 backtest_trades:那张表每次回测整表覆盖,
+    分开写只是省事(不用去改 JSON blob),不是为了长期保存点评——
+    点评本来就是每次重跑回测后重写一遍的。
+    upsert 语义:只覆盖传进来的买入日。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS backtest_notes ("
+                 "buy_date TEXT PRIMARY KEY, note TEXT, saved_at REAL)")
+    now = time.time()
+    conn.executemany(
+        "INSERT OR REPLACE INTO backtest_notes (buy_date, note, saved_at) "
+        "VALUES (?,?,?)",
+        [(str(d), str(n), now) for d, n in notes.items()])
+    conn.commit()
+    conn.close()
+
+
+def load_backtest_notes() -> dict:
+    """{买入日: 点评};没有则空 dict。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS backtest_notes ("
+                 "buy_date TEXT PRIMARY KEY, note TEXT, saved_at REAL)")
+    rows = conn.execute("SELECT buy_date, note FROM backtest_notes").fetchall()
+    conn.close()
+    return {r["buy_date"]: r["note"] for r in rows}
 
 
 def update_qvix_self_daily() -> tuple:

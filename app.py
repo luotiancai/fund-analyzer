@@ -215,6 +215,14 @@ def load_qvix_threshold_combos(cache_key):
     return out
 
 
+@st.cache_data(show_spinner=False)
+def load_backtest_trades(cache_key):
+    """标准策略回测明细(backtest_trades 表,backtest_qvix.py 跑完落库)。
+    cache_key 传数据库文件的 mtime:云端换快照、本地重跑回测都会让它变,
+    缓存随即失效,不需要额外的失效逻辑。"""
+    return fetcher.load_backtest_trades()
+
+
 @st.cache_data(show_spinner="正在加载VIX恐慌指数数据…")
 def load_qvix_self(cache_key):
     """自算QVIX历史(qvix_self_history表,上交所官方期权风险指标反推,
@@ -1596,97 +1604,79 @@ with tab_sse:
             # 需重算。动态线(QVIX/实际σ×入场定死/每日跟随,k=2~6)无稳健
             # 增益——恐慌日按入场波动率定线永远给宽线,反而丢掉恐慌后反弹守
             # 利润的功能。重议条件:QVIX 中枢驻留 35+。
-            st.caption("8 笔已完成:胜率 75.0%(6/8),费后复利 +490.48%,"
-                       "累计手续费 0.5%,平均持有 76 天,平均费后 +30.38%,"
-                       "最佳 +140.23% / 最差 -0.37%。"
-                       "注:+140.23%那笔(021528财通成长优选混合C)是单只"
-                       "小微盘主题基金的极端案例,剔除它其余7笔累计约"
-                       "+145.80%,别把140%当期望值——不依赖那笔运气结论也成立。"
-                       "8笔里只有2笔亏,且都很小(-0.06% / -0.37%)。79个"
-                       "QVIX信号日里只有这8次同时满足\"真正下跌+波动率"
-                       "比值≥1.5+规模≥5000万\",其余全部跳过不操作(2020年"
-                       "下半年那波尤其明显,QVIX反复触发但从没凑出过合格"
-                       "候选)。规模按信号日当时已披露的最新季报口径(无未来"
-                       "函数),排掉了几十万~几千万规模、净值易失真的迷你基金。"
-                       "橙色=触发基金回撤线离场,蓝色=触发大盘回撤线离场,"
-                       "两格都染色=同日两条线双双触发(华富、广发医药创新那两笔);"
-                       "连续接力同一只基金视为未真实离场,中间腿不收手续费,"
-                       "只在链条最后一腿按累计持有天数收一次。")
-            # 每笔卖出当天触发了哪条止损线: fund=仅基金线, sse=仅大盘线,
-            # both=同日两条线都破(2024-10-09华富、2026-03-23广发医药创新两笔:
-            # 基金线和大盘线同一天双双击穿)。
-            _review_trigger = [
-                "sse", "sse", "sse", "fund", "both", "fund", "fund", "both",
-            ]
-            _review_df = pd.DataFrame({
-                "买入日": ["2022-04-25", "2022-10-24", "2023-08-28",
-                          "2024-02-05", "2024-09-26", "2024-10-10",
-                          "2025-04-07", "2026-03-23"],
-                "近3月跌幅最大标的(C类全市场,按前一交易日榜单)": [
-                    "诺安创新驱动混合C (002051)",
-                    "富国中证港股通互联网ETF发起式联接C (014674)",
-                    "诺安积极回报混合C (012847)",
-                    "汇丰晋信时代先锋混合C (014918)",
-                    "华富健康文娱灵活配置混合C (019200)",
-                    "海富通科技创新混合C (009024)",
-                    "财通成长优选混合C (021528)",
-                    "广发医药创新混合发起式C (017963)"],
-                "类型": ["混合型-灵活", "指数型-股票", "混合型-灵活",
-                        "混合型-偏股", "混合型-灵活", "混合型-偏股",
-                        "混合型-灵活", "混合型-偏股"],
-                # 买入日当时已披露的最新一期季报规模(as-of, 无未来函数),
-                # 即策略选基那天实际能看到的规模。全部≥5000万门槛(最小
-                # 汇丰晋信0.76亿, <1亿, 故1亿档会把它换掉)。
-                "买入时规模(亿)": [1.33, 1.70, 10.92, 0.76,
-                                 1.31, 1.80, 1.36, 1.50],
-                "波动率比值(近3月)": [1.73, 2.19, 3.20, 2.11,
-                                   1.93, 1.81, 3.41, 2.68],
-                "恐慌阈值": [26.33, 23.24, 22.28, 22.28,
-                            20.45, 20.52, 21.42, 22.54],
-                "回撤控制线(%)": [9.11, 10.18, 14.26, 9.40,
-                                7.89, 7.43, 14.61, 12.08],
-                "大盘回撤线(%)": [5.27, 4.65, 4.46, 4.46,
-                                4.09, 4.10, 4.28, 4.51],
-                "近3月跌幅(前日口径)": [
-                    "-37.80%", "-26.93%", "-27.95%", "-34.29%",
-                    "-22.41%", "-2.42%", "-22.35%", "-19.69%"],
-                "卖出日": ["2022-07-15", "2022-12-22", "2023-10-19",
-                          "2024-04-12", "2024-10-09", "2024-11-14",
-                          "2025-11-18", "2026-06-05"],
-                "持有收益": ["+14.19%", "+49.70%", "-0.06%", "+15.18%",
-                            "+18.05% (费后+17.55%)", "+6.66%",
-                            "+140.23%", "-0.37%"],
-                "期间最高": ["+23.2%", "+54.7%", "+8.5%", "+27.6%",
-                            "+32.8%", "+15.9%", "+181.4%", "+14.2%"],
-                "期间最大回撤": ["7.3%", "8.6%", "12.5%", "9.8%",
-                              "11.1%", "8.0%", "14.6%", "12.8%"],
-                "同期上证": ["+10.2%", "+2.6%", "-3.0%", "+11.7%",
-                            "+8.6%", "+2.4%", "+27.2%", "+5.6%"],
-                "备注": [
-                    "近3月跌幅-37.80%(全表最深);81天大盘线触发,+14.19%,"
-                    "超跌反弹兑现",
-                    "港股互联网超跌反弹段入场(近3月跌幅-26.93%,跟同期"
-                    "港股互联网强势反弹重合);59天大盘线触发,+49.70%——"
-                    "恒生指数跟上证相关系数常年0.4~0.74,不算脱钩,港股通"
-                    "基金不再排除",
-                    "近3月跌幅-27.95%;52天大盘线触发,-0.06%微亏(全表两笔"
-                    "小亏之一,幅度小到可忽略)——超跌不代表一定反弹",
-                    "近3月跌幅-34.29%;基金线触发,+15.18%,超跌反弹兑现",
-                    "924行情前夕入场,近3月跌幅-22.41%;持有13天后(924见顶"
-                    "急跌日)基金线与大盘线同日双双触发,+18.05%(费后+17.55%)",
-                    "近3月跌幅仅-2.42%(全表最浅,勉强满足\"真下跌\"门槛);"
-                    "35天基金线触发,+6.66%",
-                    "\"对等关税\"暴跌日入场,近3月跌幅-22.35%;225天基金线"
-                    "(14.61%宽线)一路扛住震荡直到触发,+140.23%(期间最高"
-                    "+181.4%)——单只小微盘主题基金的极端案例(近1年一度"
-                    "涨209%),净值序列已核实无异常跳变、不是脏数据,但"
-                    "不代表可复制的期望值,全表最佳单笔",
-                    "近3月跌幅-19.69%(全表次深);基金线与大盘线同日双双"
-                    "触发,-0.37%微亏(全表两笔小亏之一)——旧口径这天选中的是"
-                    "东方城镇消费主题C(规模仅几万),规模≥5000万门槛把它换掉,"
-                    "换成的这只虽也没反弹但亏损极小、被止损线兜住",
-                ],
-            })
+            # 复盘明细改读 backtest_trades 表(backtest_qvix.py 跑完自动落库,
+            # 见 fetcher.save_backtest_trades)。以前这张表连同上面这段统计
+            # 数字全是硬编码在这里的列表字面量:每次重跑回测都得把十几列
+            # 数字手抄一遍进页面, 抄错没人发现, 页面上的数和回测真正跑出来
+            # 的数也随时可能对不上(实测就对不上过)。现在回测落库、页面读库,
+            # 跑批推一次库页面自动跟着变, 不用改代码。
+            _bt_df, _bt_params, _bt_at = load_backtest_trades(
+                os.path.getmtime(fetcher.CACHE_DB))
+            if _bt_df is None or _bt_df.empty:
+                st.info("暂无回测明细——跑一次 `python3 backtest_qvix.py` "
+                        "会写入 backtest_trades 表, 页面随即显示。")
+                _review_df, _review_trigger = None, []
+            else:
+                # 未平仓的那笔不计入统计(卖出日带"(持仓中)"标记)
+                _open = _bt_df["卖出日"].astype(str).str.contains("持仓中")
+                _done = _bt_df[~_open]
+                _rets = pd.to_numeric(_done["费后收益"], errors="coerce").dropna()
+                _n, _wins = len(_rets), int((_rets > 0).sum())
+                _cum = ((1 + _rets / 100).prod() - 1) * 100
+                _fees = pd.to_numeric(_done["手续费%"], errors="coerce").fillna(0).sum()
+                _days = pd.to_numeric(_done["持有天数"], errors="coerce").dropna()
+                _best_i = _rets.idxmax()
+                _cum_ex = ((1 + _rets.drop(_best_i) / 100).prod() - 1) * 100
+                _loss = _rets[_rets <= 0]
+                _loss_txt = ("、".join(f"{v:+.2f}%" for v in _loss)
+                             if len(_loss) else "无")
+                st.caption(
+                    f"{_n} 笔已完成:胜率 {_wins / _n * 100:.1f}%({_wins}/{_n}),"
+                    f"费后复利 {_cum:+.2f}%,累计手续费 {_fees:.1f}%,"
+                    f"平均持有 {_days.mean():.0f} 天,"
+                    f"平均费后 {_rets.mean():+.2f}%,"
+                    f"最佳 {_rets.max():+.2f}% / 最差 {_rets.min():+.2f}%。"
+                    f"最佳那笔是单只小微盘主题基金的极端案例,剔除它其余 "
+                    f"{_n - 1} 笔累计仍有 {_cum_ex:+.2f}%——别把它当期望值,"
+                    f"不依赖那笔运气结论也成立。亏损笔:{_loss_txt}。"
+                    "样本只有个位数、跨度6年,统计上很薄,别当成可靠预期。"
+                    "候选须同时满足\"真正下跌 + 波动率比值≥1.5 + 规模≥5000万\","
+                    "其余信号日一律跳过不操作(2020年下半年那波尤其明显,"
+                    "QVIX反复触发但从没凑出过合格候选)。规模按信号日当时"
+                    "已披露的最新季报口径(无未来函数),排掉了几十万~几千万"
+                    "规模、净值易失真的迷你基金。橙色=触发基金回撤线离场,"
+                    "蓝色=触发大盘回撤线离场,两格都染色=同日两条线双双触发;"
+                    "连续接力同一只基金视为未真实离场,中间腿不收手续费,"
+                    "只在链条最后一腿按累计持有天数收一次。"
+                    + (f"(明细跑于 {_fmt_cst(_bt_at, '%Y-%m-%d %H:%M')})"
+                       if _bt_at else ""))
+
+                # 每笔卖出当天触发了哪条止损线, 直接从回测写下的「卖出原因」
+                # 反推(以前是另一份手工维护的列表, 跟表格行数各管各的,
+                # 一旦交易笔数变了就会错位染色)。
+                def _trig_of(reason: str) -> str:
+                    _r = str(reason)
+                    _f, _s = "基金" in _r, "大盘" in _r
+                    return "both" if _f and _s else ("fund" if _f else
+                                                     ("sse" if _s else ""))
+                _review_trigger = [_trig_of(r) for r in _bt_df["卖出原因"]]
+
+                _review_df = _bt_df.rename(columns={
+                    "冠军(C类全市场,按前一交易日榜单)":
+                        "近3月跌幅最大标的(C类全市场,按前一交易日榜单)",
+                    "冠军近3月涨幅(前日口径)": "近3月跌幅(前日口径)",
+                })
+                _review_df = _review_df[[c for c in [
+                    "买入日", "近3月跌幅最大标的(C类全市场,按前一交易日榜单)",
+                    "类型", "买入时规模(亿)", "波动率比值(近3月)", "恐慌阈值",
+                    "回撤控制线(%)", "大盘回撤线(%)", "近3月跌幅(前日口径)",
+                    "卖出日", "持有收益", "期间最高", "期间最大回撤", "同期上证",
+                ] if c in _review_df.columns]].copy()
+                # 「备注」是人工点评(backtest_notes 表), 算不出来、只能人写,
+                # 每次重跑回测后重写一遍。按买入日 join, 没写的显示空白。
+                _notes = fetcher.load_backtest_notes()
+                _review_df["备注"] = [_notes.get(str(d), "")
+                                     for d in _review_df["买入日"]]
 
             def _trigger_cell_style(row):
                 _styles = [""] * len(row)
@@ -1699,25 +1689,26 @@ with tab_sse:
                     _styles[_idx("大盘回撤线(%)")] = "background-color: #c9e2ff; color: #1a1a1a"
                 return _styles
 
-            st.dataframe(
-                _review_df.style.apply(_trigger_cell_style, axis=1)
-                .format(precision=2, na_rep=""),
-                use_container_width=True, hide_index=True,
-                height=(len(_review_df) + 1) * 35 + 3,
-                column_config={
-                    "买入日": st.column_config.Column(width="small"),
-                    "近3月跌幅最大标的(C类全市场,按前一交易日榜单)": st.column_config.Column(width="medium"),
-                    "类型": st.column_config.Column(width="small"),
-                    "买入时规模(亿)": st.column_config.Column(width="small"),
-                    "波动率比值(近3月)": st.column_config.Column(width="small"),
-                    "恐慌阈值": st.column_config.Column(width="small"),
-                    "回撤控制线(%)": st.column_config.Column(width="small"),
-                    "大盘回撤线(%)": st.column_config.Column(width="small"),
-                    "近3月跌幅(前日口径)": st.column_config.Column(width="small"),
-                    "卖出日": st.column_config.Column(width="small"),
-                    "持有收益": st.column_config.Column(width="small"),
-                    "期间最高": st.column_config.Column(width="small"),
-                    "期间最大回撤": st.column_config.Column(width="small"),
-                    "同期上证": st.column_config.Column(width="small"),
-                    "备注": st.column_config.Column(width="large"),
-                })
+            if _review_df is not None and not _review_df.empty:
+                st.dataframe(
+                    _review_df.style.apply(_trigger_cell_style, axis=1)
+                    .format(precision=2, na_rep=""),
+                    use_container_width=True, hide_index=True,
+                    height=(len(_review_df) + 1) * 35 + 3,
+                    column_config={
+                        "买入日": st.column_config.Column(width="small"),
+                        "近3月跌幅最大标的(C类全市场,按前一交易日榜单)": st.column_config.Column(width="medium"),
+                        "类型": st.column_config.Column(width="small"),
+                        "买入时规模(亿)": st.column_config.Column(width="small"),
+                        "波动率比值(近3月)": st.column_config.Column(width="small"),
+                        "恐慌阈值": st.column_config.Column(width="small"),
+                        "回撤控制线(%)": st.column_config.Column(width="small"),
+                        "大盘回撤线(%)": st.column_config.Column(width="small"),
+                        "近3月跌幅(前日口径)": st.column_config.Column(width="small"),
+                        "卖出日": st.column_config.Column(width="small"),
+                        "持有收益": st.column_config.Column(width="small"),
+                        "期间最高": st.column_config.Column(width="small"),
+                        "期间最大回撤": st.column_config.Column(width="small"),
+                        "同期上证": st.column_config.Column(width="small"),
+                        "备注": st.column_config.Column(width="large"),
+                    })

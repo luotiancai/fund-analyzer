@@ -517,6 +517,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                     "买入日": position["buy_date"].strftime("%Y-%m-%d"),
                     "冠军(C类全市场,按前一交易日榜单)": f"{name} ({code})",
                     "类型": fund_types.get(code, ""),
+                    "买入时规模(亿)": position.get("buy_aum"),
                     "波动率比值(近3月)": position["beta"],
                     "恐慌阈值": round(position["threshold"], 2),
                     "回撤控制线(%)": round(position["fund_dd_limit"], 2),
@@ -589,6 +590,10 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                 "sse_dd_limit": threshold / dd_divisor,
                 "threshold": threshold,
                 "nav_map": nav_map,
+                # 买入日当时已披露的最新一期季报规模(as-of, 无未来函数),
+                # 即策略选基那天实际能看到的规模。选基环节已经查过一次,
+                # 这里走 fund_scale_hist 缓存, 不产生额外网络请求。
+                "buy_aum": fetcher.fund_aum_asof(code, day_str),
             }
 
     # Close open position
@@ -612,6 +617,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                 "买入日": position["buy_date"].strftime("%Y-%m-%d"),
                 "冠军(C类全市场,按前一交易日榜单)": f"{name} ({code})",
                 "类型": fund_types.get(code, ""),
+                "买入时规模(亿)": position.get("buy_aum"),
                 "波动率比值(近3月)": position["beta"],
                 "恐慌阈值": round(position["threshold"], 2),
                 "回撤控制线(%)": round(position["fund_dd_limit"], 2),
@@ -722,12 +728,35 @@ def main():
         print("无交易记录")
         return
 
+    # 落库供 app「策略复盘」表读取(页面不再硬编码这张表, 见
+    # fetcher.save_backtest_trades 说明)。只有跑默认参数(=线上标准策略)
+    # 时才写, 免得随手跑一次 --pick top 之类的对照实验就把页面上的
+    # 标准策略明细顶掉。
+    _is_standard = (args.window == 490 and args.pct == 0.90
+                    and args.min_corr is None and args.lookback == "3m"
+                    and args.pick == "bottom" and args.min_vol_ratio == 1.5
+                    and args.dd_divisor == 5.0 and args.min_aum == 0.5
+                    and not args.no_require_drop)
+    if _is_standard:
+        fetcher.save_backtest_trades(trades, {
+            "window": args.window, "pct": args.pct, "ret_col": _ret_col,
+            "pick": args.pick, "min_vol_ratio": args.min_vol_ratio,
+            "dd_divisor": args.dd_divisor, "min_aum": args.min_aum,
+        })
+        print("已写入 backtest_trades 表(app 复盘表读这里)")
+    else:
+        print("非默认参数, 不写库(页面只展示标准策略明细)")
+
     df = pd.DataFrame(trades)
     print(f"\n{'='*110}")
     print(f"回测结果(窗口={args.window} 分位={args.pct}): {len(df)} 笔交易, 耗时 {elapsed:.0f}s")
     print(f"{'='*110}\n")
 
-    completed = df[~df["卖出原因"].str.contains("持仓中")]
+    # 未平仓那笔的标记在「卖出日」上("YYYY-MM-DD(持仓中)"), 不在「卖出原因」
+    # 里(那里写的是"未触发")——原来按卖出原因过滤等于没过滤, 会把浮盈浮亏
+    # 当成已实现收益算进胜率和累计收益。当前区间恰好没有未平仓的笔, 所以
+    # 一直没暴露。
+    completed = df[~df["卖出日"].astype(str).str.contains("持仓中")]
     if not completed.empty:
         rets = completed["费后收益"]
         days = completed["持有天数"]
