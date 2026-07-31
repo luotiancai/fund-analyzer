@@ -1678,9 +1678,9 @@ def save_intraday_qvix(qvix: float, time_str: str, phase: str) -> None:
     """记下最近一次**成功**的盘中自算值(只存一行, 覆盖式)。
 
     云端(Streamlit Cloud/GCP)到新浪的建连只有约50%成功率, 一次算不出来是
-    常态。有这份记录, 失败时就能顶上"几分钟前的自算值", 而不是掉到 optbbs。
-    这很重要:恐慌阈值是拿自算序列算的, optbbs 系统性偏高约0.18、极端日差2
-    以上, 拿它比自算的线是两把尺子——**尺子对不对, 比数新不新鲜要紧得多**。"""
+    常态。这份记录是**第三顺位**的兜底:现算失败先用 optbbs(实时性优先,
+    用户决策 2026-07-31——宁可要此刻的 optbbs, 也不要几十分钟前的自算值),
+    optbbs 也拿不到时才用它, 因为它再旧也是今天的, 比"昨天的收盘值"近得多。"""
     conn = _conn()
     conn.execute("CREATE TABLE IF NOT EXISTS qvix_intraday_last ("
                  "id INTEGER PRIMARY KEY, date TEXT, time TEXT, phase TEXT, "
@@ -1769,18 +1769,22 @@ def fetch_qvix_now() -> tuple:
     except Exception as e:
         logger.warning("QVIX intraday fetch (self-computed) failed: %s", e)
 
-    # 现算没成:先顶今天最近一次成功的自算值(见 save_intraday_qvix 的说明:
-    # 尺子对不对比数新不新鲜要紧)。展示时会带上它自己的时刻, 不冒充此刻。
+    # 现算没成 → optbbs。实时性优先(用户决策 2026-07-31):宁可要一个此刻的
+    # optbbs 值,也不要一个几十分钟前的自算值。标签会写明来源是 optbbs,
+    # 看得出这个数跟自算阈值不是同一把尺子(它系统性偏高约0.18)。
+    # optbbs 给的是分钟序列的最后一个非空值:休市/收盘后它自然就停在
+    # 11:30 / 15:00 那一条,跟本档要的"定格值"是同一个东西,直接用它
+    # 自带的时间戳,不硬改成 11:30/15:00。
+    v, t = _optbbs_qvix_now()
+    if v is not None:
+        return v, t, "optbbs"
+
+    # optbbs 也挂了,才退今天最近一次成功的自算值——它再旧也是今天的,
+    # 比下面那个"昨天收盘值"近得多。
     v, t = last_intraday_qvix(phase)
     if v is not None:
         return _label(v, t, phase)
 
-    v, t = _optbbs_qvix_now()
-    if v is not None:
-        # optbbs 给的是分钟序列的最后一个非空值:休市/收盘后它自然就停在
-        # 11:30 / 15:00 那一条,跟本档要的"定格值"是同一个东西,直接用它
-        # 自带的时间戳,不硬改成 11:30/15:00。
-        return v, t, "optbbs"
     return _from_db()
 
 
