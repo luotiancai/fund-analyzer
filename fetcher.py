@@ -16,6 +16,28 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
+import socket
+import urllib3.util.connection
+
+# 强制所有 HTTP 走 IPv4。
+#
+# 2026-07-30 起,GitHub Actions / Streamlit Cloud 上访问 hq.sinajs.cn 突然开始
+# 报 [Errno 101] Network is unreachable。这不是被墙——被墙通常表现为超时或
+# 连接被重置;Errno 101 的含义是"目标地址族没有路由",包根本没发出去。
+# 查 DNS 发现新浪给 hq.sinajs.cn 加了 AAAA 记录:
+#     A     125.94.246.104
+#     AAAA  240e:97d:2000:a00::11:105     (240e::/20 = 中国电信 IPv6)
+# 按 RFC 6724 客户端优先走 IPv6,而这些境外容器没有到该网络的 IPv6 路由,
+# 于是秒失败。时间点吻合:07-29 那次 Actions 还跑通(邮件已发),07-30 开始断。
+# 旁证:stock.finance.sina.com.cn(拿合约代码那个接口)只有 A 记录、没有
+# AAAA,它就从没出过这个错。
+#
+# urllib3 官方留了 allowed_gai_family 钩子,改成只返回 AF_INET 就只解析
+# IPv4。放模块级是有意的:akshare 底层也是 requests/urllib3,这样一处生效、
+# 全链路覆盖,不用去改每个调用点(很多调用点在 akshare 内部,我们也改不到)。
+# 副作用是本进程所有 HTTP 都只走 IPv4——GitHub/天天基金/上交所的 IPv4 都
+# 一直可达,风险很低。
+urllib3.util.connection.allowed_gai_family = lambda: socket.AF_INET
 
 
 class _LazyAkshare:
