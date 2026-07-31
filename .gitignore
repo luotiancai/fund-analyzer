@@ -5,3 +5,6 @@ __pycache__/
 .DS_Store
 # intraday_qvix.py 的产物, 只发到 Release, 不进仓库
 qvix_now.json
+
+# 通知配置: 里面是手机号, 不进仓库
+qvix_notify.conf

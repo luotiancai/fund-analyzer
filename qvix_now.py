@@ -16,17 +16,20 @@
 的链路, 也不会出现"页面显示的数跟阈值不是同一把尺子"的问题。
 
 怎么用:
-  · 自动: launchd 在交易日 14:40 触发(见 ~/Library/LaunchAgents/com.fundanalyzer.qvix.plist), 失败则在 14:45/14:50/14:55 及
-    15:10/16:30/19:00/22:00 补跑, 当天成功过一次就不再跑(--daily 模式)。
-    这套多时点设计是因为这台机器**不是一直有网**: launchd 到点就触发、
-    不管有没有网, 也不会自动重试, 只挂一个时点的话那天断网就永久错过。
-    收盘后补跑仍然是对的——15:00 后档位变成"今日收盘"、计算时刻钉死在
-    15:00, 晚上补跑算出来的就是当天收盘值, 跟准点跑完全一致。
-  · 手动: 双击 qvix.command(或 `python3 publish_qvix.py`), 不受"当天已跑过"
-    限制, 每次都现算。
-  跑完会把当前 QVIX、恐慌阈值、距触发还差多少直接打在屏幕上, 同时发布到
-  Release, 手机/网页刷新就能看到同一个数。
-  没有定时任务——页面在境外, 没法反向叫本机算, 所以只能你想看时点一下。
+  · 自动: launchd 在工作日 14:40 跑一次, 就这一次(见
+    ~/Library/LaunchAgents/com.fundanalyzer.qvix.plist), 加 --notify 把结果
+    推成 macOS 通知。不自动补跑: 这台机器不是一直有网, 但补跑要么打扰、
+    要么无声无息, 不如让人知道"今天这次没成"——失败会弹一个不会自动消失的
+    对话框, 回来双击 qvix.command 手动跑一次即可。
+    节假日不用管: 脚本自己查交易日历(qvix_phase), 非交易日静默退出。
+  · 手动: 双击 qvix.command, 每次都现算, 不加 --notify(终端里本来就看得见)。
+  跑完把当前 QVIX、恐慌阈值、距触发还差多少直接打在屏幕上, 并写到本地
+  qvix_now.json。**不上传**——线上页面只有日度自算历史和阈值。
+
+注意 plist 里的路径是写死的绝对路径, 挪动本项目目录后必须同步改 plist 并
+重新 bootstrap, 否则定时任务会静默失效(launchd 只往日志里写一行找不到文件)。
+另外别把项目放在 ~/Desktop 下: launchd 起的 python3 没有 Desktop 的 TCC
+权限, 会报 "Operation not permitted"。
 
 只认自算值:
   算不出来就如实报错, 绝不退回 optbbs——它系统性偏高约0.18、极端日差2以上,
@@ -46,9 +49,10 @@ import qvix_core    # noqa: E402
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s  %(levelname)s  %(message)s",
                     datefmt="%m-%d %H:%M:%S")
-log = logging.getLogger("publish_qvix")
+log = logging.getLogger("qvix_now")
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qvix_now.json")
+CONF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qvix_notify.conf")
 
 
 def _osa(script: str) -> None:
@@ -60,16 +64,83 @@ def _osa(script: str) -> None:
         log.debug("通知失败: %s", e)
 
 
+def _as_lit(s: str) -> str:
+    """把 Python 字符串转成 AppleScript 字符串字面量。
+    反斜杠和双引号要转义(AppleScript 里 \\ 是转义符);裸换行它反倒是接受的,
+    但拼在一起容易看不出来, 统一走这个函数省得每处各想一遍。"""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _imessage_to():
+    """iMessage 收件人。刻意不写死在代码里——手机号不该进 git。
+    取值顺序: 环境变量 QVIX_IMESSAGE_TO > 同目录 qvix_notify.conf(已 gitignore)
+    里的 imessage_to=xxx。没配就返回 None, 表示"不发", 不是错误。"""
+    to = os.environ.get("QVIX_IMESSAGE_TO", "").strip()
+    if to:
+        return to
+    try:
+        with open(CONF, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                k, _, v = line.partition("=")
+                if k.strip() == "imessage_to":
+                    return v.strip() or None
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("读 %s 失败: %s", os.path.basename(CONF), e)
+    return None
+
+
+def _send_imessage(msg: str) -> bool:
+    """把结果发到自己手机。
+    横幅/对话框只有人在电脑前才看得见, 而这任务 14:40 跑的时候人多半不在,
+    iMessage 是唯一能追到手机上的一条。
+    失败**不静默**(跟上面两个通知不同): 远程通知没送到、而你以为送到了, 比
+    压根没有更糟, 所以照实记 warning。"""
+    to = _imessage_to()
+    if not to:
+        return False
+    script = ('tell application "Messages"\n'
+              '  set svc to 1st service whose service type = iMessage\n'
+              f'  send {_as_lit(msg)} to participant {_as_lit(to)} of svc\n'
+              'end tell')
+    try:
+        p = subprocess.run(["osascript", "-e", script], timeout=30,
+                           capture_output=True, text=True)
+    except Exception as e:
+        log.warning("iMessage 发送异常: %s", e)
+        return False
+    if p.returncode != 0:
+        # 常见原因: Messages 没登录 iCloud; 或首次运行时"自动化"权限没批准
+        # (系统设置 > 隐私与安全性 > 自动化, 允许 python3 控制"信息")。
+        log.warning("iMessage 未发出: %s", (p.stderr or "").strip())
+        return False
+    # 措辞留神: 返回 0 只说明 Messages **收下**了这条, 不代表已送达。真断网时
+    # 它会转成待发/发送失败, 退出码照样是 0。这里没法从 osascript 拿到投递结果。
+    log.info("iMessage 已交给 Messages 发送 -> %s", to)
+    return True
+
+
 def _notify_ok(title: str, msg: str) -> None:
-    """成功: 横幅通知, 看一眼就走, 不打断。"""
+    """成功: 横幅通知, 看一眼就走, 不打断。同时发一条 iMessage 到手机——
+    14:40 跑的时候人多半不在电脑前, 横幅几秒就没了。"""
     t, m = title.replace('"', "'"), msg.replace('"', "'")
     _osa(f'display notification "{m}" with title "{t}"')
+    _send_imessage(f"{t}\n{m}")
 
 
 def _notify_fail(msg: str) -> None:
     """失败: 对话框, **不会自动消失**, 人回到电脑前必然看见。
-    横幅几秒就没了, 而这个任务一天只跑一次, 错过就是错过。"""
+    横幅几秒就没了, 而这个任务一天只跑一次, 错过就是错过。
+    也发一条 iMessage, 但别指望它兜底: 失败最常见的原因就是没网, 那 iMessage
+    同样发不出去(会记 warning)。对话框才是失败路径上真正可靠的那一条。"""
     m = msg.replace('"', "'")
+    # 必须发在弹窗**之前**: display dialog 会一直阻塞到有人点"知道了", 放后面
+    # 的话短信要等你回到电脑前才发得出去, 正好把这条通道的意义抵消掉。
+    _send_imessage("QVIX 定时任务失败\n" + msg)
     _osa('display dialog "' + m + '" with title "QVIX 定时任务失败" '
          'buttons {"知道了"} default button 1 with icon caution')
 
