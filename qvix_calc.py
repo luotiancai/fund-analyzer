@@ -239,12 +239,11 @@ def _sina_session():
         if _sina_sess is None:
             s = requests.Session()
             s.headers.update(_SINA_OPT_HEADERS)
-            # 重试次数刻意压得很克制:外层 fetcher._fetch_with_timeout 有
-            # 总预算(会阻塞页面渲染), 重试放大的是**最坏**耗时——connect
-            # 超时18秒配2次重试, 单条链最坏就要55秒, 反而更容易把整次现算
-            # 拖超时。真正解决问题的是上面的长连接复用(第二条链不再握手),
-            # 重试只是给"第一次握手就丢包"兜个底, 1 次足够。
-            retry = Retry(total=1, connect=1, read=0, backoff_factor=0.5,
+            # 不重试。证据: GCP 那条链路要么很快连上(原来12秒超时的配置
+            # 成功过), 要么根本连不上, 不存在"需要更久才握上手"的中间态。
+            # 既然如此, 重试和长超时都只是白等——而且调用方(fetch_qvix_now)
+            # 拿不到自算值时会立刻退 optbbs, 早失败比晚失败好。
+            retry = Retry(total=0, connect=0, read=0,
                           status_forcelist=(429, 500, 502, 503, 504))
             s.mount("https://", HTTPAdapter(max_retries=retry,
                                             pool_connections=4, pool_maxsize=4))
@@ -252,10 +251,10 @@ def _sina_session():
     return _sina_sess
 
 
-# (连接超时, 读取超时)。分开设:跨境握手慢但一旦连上,新浪返回很快
-# (整月链 15KB)。连接超时从原来的 12 秒放宽到 18——实测 GCP 那条路
-# 12 秒不够握手完成, 而读取给 15 秒绰绰有余。
-_SINA_TIMEOUT = (18, 15)
+# (连接超时, 读取超时)。连接超时刻意压到 8 秒:境外主机上这条链路要么秒连、
+# 要么连不上, 等 18 秒也等不来一个成功的握手, 只会把页面卡住。两条链最坏
+# 16 秒, 留在外层 20 秒预算内; 失败后立刻退 optbbs, 用户几秒就能看到数。
+_SINA_TIMEOUT = (8, 12)
 
 
 def _fetch_chain(month_str: str) -> pd.DataFrame:

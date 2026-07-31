@@ -1712,12 +1712,13 @@ def fetch_qvix_now() -> tuple:
     try:
         import qvix_calc   # 延迟导入:qvix_calc 反过来 import fetcher,
                             # 模块顶层互相 import 会循环失败。
-        # 现算现在是**兜底**路径(主路径是上面读 Actions 发布值), 所以预算
-        # 收紧到30秒:它会阻塞页面渲染, 而云端本来就赌不赢那条抖动的链路,
-        # 与其硬扛到50秒不如早点落到 optbbs / 库里收盘值。本地开发时现算
-        # 是唯一路径, 3~5秒就够, 30秒绰绰有余。
+        # 外层预算必须**大于**内层最坏耗时, 否则外层总是先掐断: 既白等满
+        # 整个预算, 又看不到内层报的真实错误(踩过——日志里只剩
+        # "fetch exceeded 25s", 内层那行"批量行情请求失败"根本没机会打出来)。
+        # 内层现在两条链最坏 8+8=16 秒(见 qvix_calc._SINA_TIMEOUT), 加上
+        # akshare 那几个接口, 20 秒够。拿不到就立刻退 optbbs。
         r = _fetch_with_timeout(lambda: qvix_calc.compute_qvix(as_of=as_of),
-                                timeout=25)
+                                timeout=20)
         if r is not None and r[0] is not None:
             return _label(r[0], r[1], phase)
     except Exception as e:
