@@ -55,20 +55,44 @@ SHIBOR_TENOR_DAYS = [("O/N", 1), ("1W", 7), ("2W", 14), ("1M", 30),
 TIMEOUT = 10
 
 
+# 每个请求最多试几次、每次间隔多久。新浪按 IP 限流, 而云厂商出口 IP 是共享的
+# ——实测腾讯云和 Streamlit Cloud 上单个请求都有约一半概率拿不到(表现为连接
+# 失败或空响应), 而本机同一时刻百发百中。重试是这里唯一有效的办法: 3 次之后
+# 全失败的概率降到约 1/8。
+_RETRY = 3
+_RETRY_SLEEP = 0.6
+
+
 def _get(url: str, params: Optional[dict] = None) -> str:
-    """GET → 文本。用标准库 urllib 而不是 requests:腾讯云 SCF 的 Python 运行时
-    **不自带 requests**(实测 python3.9 报 ModuleNotFoundError), 而这个文件要能
-    原样粘进在线编辑器就跑起来, 不装任何依赖、不传层、不打包 zip。
-    代价是没有连接复用(每次请求重新握手), 境内延迟低, 可以接受。
+    """GET → 文本。失败或空响应会重试;试完还不行就抛异常, **不返回空串**。
+
+    用标准库 urllib 而不是 requests:腾讯云 SCF 的 Python 运行时不自带 requests
+    (实测 python3.9 报 ModuleNotFoundError), 这个文件要能原样粘进在线编辑器
+    就跑, 不装依赖、不传层、不打包 zip。
+
+    "空响应当失败"很重要:新浪限流时返回的是 200 + 空 body, 如果当成正常结果,
+    上层会静默地少拿一半合约, 然后照样算出一个像模像样、实际完全不对的数。
+    宁可抛错让上层知道, 也不要悄悄用残缺数据。
 
     新浪那两个接口必须带 *.sina.com.cn 的 Referer, 否则一律 403 Forbidden。
-    hq.sinajs.cn 返回的是 GBK 文本, 但我们只用正则抠数字和代码, 解码失败的
-    中文字符直接忽略即可。"""
+    hq.sinajs.cn 返回 GBK 文本, 但我们只用正则抠数字和代码, 中文解码失败可忽略。
+    """
     if params:
         url = url + ("&" if "?" in url else "?") + urlencode(params)
-    req = Request(url, headers=_HEADERS)
-    with urlopen(req, timeout=TIMEOUT) as r:
-        return r.read().decode("gbk", errors="ignore")
+    last = "未知"
+    for i in range(_RETRY):
+        try:
+            req = Request(url, headers=_HEADERS)
+            with urlopen(req, timeout=TIMEOUT) as r:
+                text = r.read().decode("gbk", errors="ignore")
+            if text.strip():
+                return text
+            last = "空响应(多半是被限流)"
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+        if i < _RETRY - 1:
+            time.sleep(_RETRY_SLEEP * (i + 1))
+    raise RuntimeError(f"GET 失败({_RETRY}次): {url.split('?')[0][:70]} — {last}")
 
 
 def _get_json(url: str, params: Optional[dict] = None):
@@ -283,19 +307,23 @@ def expiry_candidates(today: dt.date):
 def _contract_codes(month_str: str):
     """某月的看涨+看跌合约代码 → [(代码, "C"/"P"), ...]。
     走 hq.sinajs.cn 的 OP_UP_/OP_DOWN_ 清单接口, 返回形如
-      var hq_str_OP_UP_5100502608="CON_OP_10012127,CON_OP_10011851,...,";"""
-    codes = []
+      var hq_str_OP_UP_5100502608="CON_OP_10012127,CON_OP_10011851,...,"
+
+    任一侧拿不到就整月作废(返回 [])而不是给个残缺清单:只有认购没有认沽时,
+    put-call parity 反推不出远期价格, 后面的 K0 选取、虚值筛选全都建立在错误
+    前提上。实测云端出现过只拿到一侧(11个而不是22个)的情况。"""
+    out = []
     for tag, kind in (("OP_UP_", "C"), ("OP_DOWN_", "P")):
         try:
             text = _get(_HQ + tag + UNDERLYING + month_str[-4:])
-            body = re.search(r'="([^"]*)"', text)
         except Exception:
-            continue
-        if not body:
-            continue
-        for c in re.findall(r"CON_OP_(\d+)", body.group(1)):
-            codes.append((c, kind))
-    return codes
+            return []
+        body = re.search(r'="([^"]*)"', text)
+        codes = re.findall(r"CON_OP_(\d+)", body.group(1)) if body else []
+        if not codes:
+            return []
+        out += [(c, kind) for c in codes]
+    return out
 
 
 def fetch_chain(month_str: str):
@@ -329,6 +357,12 @@ def fetch_chain(month_str: str):
         mid = (bid + ask) / 2 if bid > 0 and ask > 0 else last
         rows.append({"kind": kind_of.get(code, "C"), "strike": strike,
                      "bid": bid, "mid": mid})
+
+    # 报价没拿全就整月作废。原来这里只记一条日志、照样用残缺数据算——但少几个
+    # 行权价会让 1/K² 加权求和漏掉整段虚值期权, 算出来的数偏低且看不出异常。
+    # 实测云端出现过 22 个合约只回 11 个。宁可这个月不算, 让上层去用别的组合。
+    if len(rows) < len(codes):
+        return []
     return rows
 
 
@@ -351,6 +385,14 @@ def compute_qvix(as_of: Optional[dt.datetime] = None,
         T1, N1 = years_to_expiry(near_date, now)
         T2, N2 = years_to_expiry(next_date, now)
         if T1 <= 0 or T2 <= T1:
+            continue
+        # 近月都已经比 30 天远这么多, 说明本该用的那个月没取到数, 此时的
+        # "插值"其实是大幅外推, 会给出一个像模像样、实际完全不对的数——实测
+        # 云端 8 月链(26天)拿不到时顺延到 (9月54天, 12月145天), 算出 22.54,
+        # 而正确值是 19.72。宁可返回失败也不给假数。
+        # 50ETF 合约月间隔约30天, 到期后新近月最远也就 35 天左右, 所以正常
+        # 情况下 N1 不会超过 40。
+        if N1 > 40:
             continue
         r1 = rate_for_days(curve, N1, fallback_rate)
         r2 = rate_for_days(curve, N2, fallback_rate)
