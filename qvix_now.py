@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""在**本机**算盘中 QVIX,把结果发布成 Release 上的一个小 JSON,供云端页面读取。
+"""在**本机**算当前 QVIX 并打印。纯本地工具, 不上传任何东西。
 
 为什么必须在本机算:
   自算 QVIX 依赖新浪实时行情(hq.sinajs.cn), 而新浪按 IP 段限流——实测
@@ -11,24 +11,31 @@
   *.sina.com.cn 的 Referer、浏览器无法伪造, 所以"让手机直接抓"也走不通。
   结论: 唯一稳定的出口就是这台机器。
 
-为什么发小文件而不是塞进数据库快照:
-  数据库快照 81MB, 盘中每几分钟传一次不现实; 这个 JSON 才几百字节。
+线上不再有实时 QVIX:页面只保留日度自算历史和恐慌阈值(由 GitHub Actions
+每天凌晨跑批更新), 实时值一律在本机看。这样线上就完全不依赖新浪那条被限流
+的链路, 也不会出现"页面显示的数跟阈值不是同一把尺子"的问题。
 
 怎么用:
-  双击项目目录下的 qvix.command(或命令行 `python3 publish_qvix.py`)。
+  · 自动: launchd 在交易日 14:40 触发(见 ~/Library/LaunchAgents/com.fundanalyzer.qvix.plist), 失败则在 14:45/14:50/14:55 及
+    15:10/16:30/19:00/22:00 补跑, 当天成功过一次就不再跑(--daily 模式)。
+    这套多时点设计是因为这台机器**不是一直有网**: launchd 到点就触发、
+    不管有没有网, 也不会自动重试, 只挂一个时点的话那天断网就永久错过。
+    收盘后补跑仍然是对的——15:00 后档位变成"今日收盘"、计算时刻钉死在
+    15:00, 晚上补跑算出来的就是当天收盘值, 跟准点跑完全一致。
+  · 手动: 双击 qvix.command(或 `python3 publish_qvix.py`), 不受"当天已跑过"
+    限制, 每次都现算。
   跑完会把当前 QVIX、恐慌阈值、距触发还差多少直接打在屏幕上, 同时发布到
   Release, 手机/网页刷新就能看到同一个数。
   没有定时任务——页面在境外, 没法反向叫本机算, 所以只能你想看时点一下。
 
-只发布"真·自算值":
-  算不出来就什么都不写, 保留上一次的值, 绝不把 optbbs 的数写进这个文件——
-  这个文件存在的全部意义就是"跟自算阈值同一把尺子", 混进别的源就没意义了。
+只认自算值:
+  算不出来就如实报错, 绝不退回 optbbs——它系统性偏高约0.18、极端日差2以上,
+  而恐慌阈值是拿自算序列算的, 混用等于拿两把尺子量同一件事。
 """
 
 import json
 import logging
 import os
-import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -41,11 +48,26 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger("publish_qvix")
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qvix_now.json")
-RELEASE_TAG = "data"
-ASSET = "qvix_now.json"
+
+
+def _published_today(date_str: str) -> bool:
+    """今天是否已经成功发布过。--daily 模式用来跳过重复跑。"""
+    try:
+        with open(OUT, encoding="utf-8") as f:
+            return json.load(f).get("date") == date_str
+    except Exception:
+        return False
 
 
 def main() -> int:
+    # --daily: 定时任务用。当天已经成功发布过就直接退出——launchd 挂了好几个
+    # 时点(见模块说明), 目的是"当天第一次有网的时点跑一次", 不是每个时点都跑。
+    daily = "--daily" in sys.argv
+    if daily and _published_today(
+            fetcher.datetime.now(fetcher._CST).strftime("%Y-%m-%d")):
+        log.info("今天已发布过, 跳过(--daily)")
+        return 0
+
     # 先把自算历史和恐慌阈值刷到最新。
     # 本机**没有**任何定时任务(云端那份跑批只更新 Release 里的快照, 不会回流
     # 到本地库), 所以不在这里刷, 下面打印的阈值就会一直停在最后一次手动跑批
@@ -69,10 +91,10 @@ def main() -> int:
         r = qvix_core.compute_qvix(as_of=as_of,
                                    fallback_rate=fetcher.get_risk_free_rate())
     except Exception as e:
-        log.error("自算异常, 不发布(保留上一次的值): %s", e)
+        log.error("自算异常: %s", e)
         return 1
     if r is None or r[0] is None:
-        log.error("自算失败, 不发布(保留上一次的值)")
+        log.error("自算失败(合约或报价拿不全), 未记录")
         return 1
 
     payload = {"qvix": r[0], "time": r[1], "date": date_str,
@@ -80,14 +102,6 @@ def main() -> int:
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
     log.info("自算 QVIX = %.2f (档位=%s, 时刻=%s)", r[0], phase, r[1])
-
-    try:
-        subprocess.run(["gh", "release", "upload", RELEASE_TAG, OUT, "--clobber"],
-                       check=True, capture_output=True, timeout=120)
-    except Exception as e:
-        log.error("上传失败: %s", getattr(e, "stderr", e))
-        return 1
-    log.info("已发布到 Release(tag=%s, 资产=%s)", RELEASE_TAG, ASSET)
 
     # 给人看的摘要:点一次就把该知道的都摆出来, 省得再去翻页面
     _PHASE_CN = {"live": "实时", "noon": "上午收盘", "close": "今日收盘"}
@@ -110,7 +124,7 @@ def main() -> int:
         print(f"    恐慌阈值  {thr:>6.2f}   {state}")
         print(f"              (2年90分位, 截至 {thr_date})")
     print("  " + "─" * 42)
-    print("    已发布, 手机/网页刷新即可看到同一个数")
+    print("    (本机结果, 不上传; 线上页面只有日度历史和阈值)")
     print()
     return 0
 

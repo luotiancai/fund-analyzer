@@ -1,8 +1,10 @@
 """自算 QVIX(CBOE VIX 白皮书方法论)。两条独立路径,共享同一套核心公式
 (_term_variance/K0选取/1-K²加权/30天插值),数据来源不同:
 
-  ① compute_qvix() ——盘中实时值。用上交所50ETF期权的新浪实时报价
-     (bid/ask)现算。fetcher.fetch_qvix_now() 用这个。
+  ① compute_qvix() ——当前实时值。用上交所50ETF期权的新浪实时报价
+     (bid/ask)现算, 实现在 qvix_core, 这里只是转发。**只在本机跑**:
+     新浪按 IP 段限流, 机房出口单请求成功率只有约一半(Streamlit Cloud 和
+     腾讯云都实测过), 所以线上不再提供实时值, 由 qvix_now.py 在本机算。
   ② compute_qvix_for_date() ——收盘后的历史/日线值。实时买卖价查不到
      历史,改用上交所官方期权风险指标接口(option_risk_indicator_sse,
      2015-02-09起可查)已经算好的隐含波动率反推 Black-Scholes 理论价格
