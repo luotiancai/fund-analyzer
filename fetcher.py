@@ -1668,6 +1668,47 @@ def last_qvix_self_close() -> tuple:
     return round(float(row["qvix"]), 2), str(row["date"])
 
 
+_QVIX_NOW_ASSET_URL = ("https://github.com/luotiancai/fund-analyzer/"
+                       "releases/download/data/qvix_now.json")
+# live 档的发布值多久算过期。noon/close 档的值本来就是定格的, 不看这个。
+_QVIX_NOW_MAX_AGE_MIN = 12
+
+
+def _published_qvix_now(phase: str) -> tuple:
+    """读 GitHub Actions 发布的盘中自算值(intraday_qvix.py 写的小 JSON)。
+
+    存在的理由见 intraday_qvix.py 顶部:Streamlit Cloud 到新浪只有约50%的
+    建连成功率, 而 Actions 上是稳的, 所以让 Actions 算好、页面直接读。
+    命中时返回 (qvix, "HH:MM:SS"), 没有/过期/档位对不上返回 (None, None)。
+
+    只认同一天、且档位一致的值:
+      · live 档还要求发布时间在 _QVIX_NOW_MAX_AGE_MIN 分钟内(实时值会变);
+      · noon/close 档不看新鲜度——那两个档的值本来就钉死在 11:30 / 15:00,
+        中午12:50 读到 11:32 发布的值完全正确, 按分钟数判过期反而会误杀。
+    """
+    try:
+        r = requests.get(_QVIX_NOW_ASSET_URL, timeout=8)
+        r.raise_for_status()
+        d = r.json()
+    except Exception as e:
+        logger.debug("盘中自算发布值取不到: %s", e)
+        return None, None
+    now = datetime.now(_CST)
+    if d.get("date") != now.strftime("%Y-%m-%d") or d.get("phase") != phase:
+        return None, None
+    if phase == "live":
+        try:
+            hh, mm, ss = (int(x) for x in str(d["time"]).split(":"))
+        except Exception:
+            return None, None
+        age = (now - now.replace(hour=hh, minute=mm, second=ss,
+                                 microsecond=0)).total_seconds() / 60
+        if not (0 <= age <= _QVIX_NOW_MAX_AGE_MIN):
+            return None, None
+    v = d.get("qvix")
+    return (float(v), str(d.get("time"))) if v is not None else (None, None)
+
+
 def fetch_qvix_now() -> tuple:
     """页面上那个 QVIX 该显示的数。按 qvix_phase() 分档(见那里的时段表):
     盘中现算,午休定格在11:30,收盘后定格在15:00,开盘前/非交易日读库里
@@ -1700,15 +1741,23 @@ def fetch_qvix_now() -> tuple:
     if phase == "prev":
         return _from_db()
 
+    # 先看 Actions 发布的自算值。放在现算前面是有意的:云端(Streamlit/GCP)
+    # 到新浪的建连只有约50%成功率, 每次都先去赌一把要拿页面加载时间当赌注;
+    # 而发布值几百字节、从 GitHub 拿、稳定且快。本地跑时如果没配这条流水线,
+    # 文件不存在, 自然落到下面的现算, 不影响本地开发。
+    v, t = _published_qvix_now(phase)
+    if v is not None:
+        return v, t, "自算"
+
     try:
         import qvix_calc   # 延迟导入:qvix_calc 反过来 import fetcher,
                             # 模块顶层互相 import 会循环失败。
-        # 境内单次现算约3~5秒;境外(Streamlit Cloud/GCP)跨境握手慢,最坏
-        # 情况是第一条链握手超时(18秒)+重试一次(约19秒), 之后第二条链复用
-        # 长连接几乎免费, 加上 akshare 那几个接口, 总计仍在 50 秒内。
-        # 这个预算会阻塞页面渲染, 但只在5分钟缓存未命中时发生。
+        # 现算现在是**兜底**路径(主路径是上面读 Actions 发布值), 所以预算
+        # 收紧到30秒:它会阻塞页面渲染, 而云端本来就赌不赢那条抖动的链路,
+        # 与其硬扛到50秒不如早点落到 optbbs / 库里收盘值。本地开发时现算
+        # 是唯一路径, 3~5秒就够, 30秒绰绰有余。
         r = _fetch_with_timeout(lambda: qvix_calc.compute_qvix(as_of=as_of),
-                                timeout=50)
+                                timeout=30)
         if r is not None and r[0] is not None:
             if phase == "noon":
                 return r[0], "11:30", "上午收盘"

@@ -3,3 +3,5 @@ update.log
 __pycache__/
 .venv/
 .DS_Store
+# intraday_qvix.py 的产物, 只发到 Release, 不进仓库
+qvix_now.json
