@@ -1,13 +1,15 @@
-"""自算 QVIX 的核心实现:**只依赖 requests + 标准库**,没有 pandas / numpy /
-akshare。
+"""自算 QVIX 的核心实现:**只用 Python 标准库**,零第三方依赖——没有
+requests / pandas / numpy / akshare。
 
 为什么单独抽出来:
   这套算法要能跑在两个地方——本项目(Streamlit + 每日跑批)和境内云函数。
   境外主机连不上新浪 hq.sinajs.cn(实测 Streamlit Cloud/GCP 建连成功率约50%,
   且新浪只认 *.sina.com.cn 的 Referer, 浏览器无法伪造, 所以客户端方案也走
   不通), 唯一可靠的办法是把这段算在境内跑。而云函数上带着 akshare(它又拖着
-  pandas/numpy/lxml 一大堆)打包会非常笨重, 所以这里把实时路径的依赖砍到只剩
-  requests, 一个 zip 就能部署。
+  pandas/numpy/lxml 一大堆)打包会非常笨重。而腾讯云 SCF 的 Python 运行时连
+  requests 都不带(实测 python3.9 直接 ModuleNotFoundError), 所以干脆把依赖砍
+  到零——只用标准库, 整个文件原样粘进在线编辑器就能跑, 不装依赖、不传层、
+  不打包 zip。
 
   更重要的是: 抽出来是为了**只有一份实现**。如果为手机端另写一份 JS/Swift,
   两边的 K0 选取、零买价裁剪、合约过滤这些手工判断迟早会不一致——而恐慌阈值
@@ -28,14 +30,12 @@ import datetime as dt
 import json
 import math
 import re
-import threading
 import time
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 CST = ZoneInfo("Asia/Shanghai")
 UNDERLYING = "510050"
@@ -47,35 +47,32 @@ _EXPIRE_API = ("https://stock.finance.sina.com.cn/futures/api/openapi.php/"
                "StockOptionService.getRemainderDay")
 _SHIBOR_JSON = "https://cdn.jin10.com/data_center/reports/il_1.json"
 
-# (连接超时, 读取超时)。连接超时压到 8 秒:境外主机上这条链路要么秒连、要么
-# 连不上, 等更久也等不来一个成功的握手, 只会把调用方卡住。境内跑时握手很快,
-# 这个值绰绰有余。
-TIMEOUT = (8, 12)
-
 SHIBOR_TENOR_DAYS = [("O/N", 1), ("1W", 7), ("2W", 14), ("1M", 30),
                      ("3M", 90), ("6M", 180), ("9M", 270), ("1Y", 365)]
 
-_sess = None
-_sess_lock = threading.Lock()
+# 超时(秒)。境内跑握手很快, 这个值绰绰有余; 境外(本项目本地兜底用)也够——
+# 那条链路要么秒连、要么连不上, 等更久也等不来一个成功的握手。
+TIMEOUT = 10
 
 
-def session() -> requests.Session:
-    """带长连接的会话。一次现算要打同一个 host(hq.sinajs.cn)好几次——合约
-    清单2次 + 行情2次, 复用连接可以省掉重复的 TCP 握手, 跨境时尤其明显。
-    不重试:证据表明这条链路要么很快连上、要么根本连不上, 重试只是白等,
-    调用方拿不到值会自己走别的路。"""
-    global _sess
-    if _sess is not None:
-        return _sess
-    with _sess_lock:
-        if _sess is None:
-            s = requests.Session()
-            s.headers.update(_HEADERS)
-            s.mount("https://", HTTPAdapter(
-                max_retries=Retry(total=0, connect=0, read=0),
-                pool_connections=4, pool_maxsize=4))
-            _sess = s
-    return _sess
+def _get(url: str, params: Optional[dict] = None) -> str:
+    """GET → 文本。用标准库 urllib 而不是 requests:腾讯云 SCF 的 Python 运行时
+    **不自带 requests**(实测 python3.9 报 ModuleNotFoundError), 而这个文件要能
+    原样粘进在线编辑器就跑起来, 不装任何依赖、不传层、不打包 zip。
+    代价是没有连接复用(每次请求重新握手), 境内延迟低, 可以接受。
+
+    新浪那两个接口必须带 *.sina.com.cn 的 Referer, 否则一律 403 Forbidden。
+    hq.sinajs.cn 返回的是 GBK 文本, 但我们只用正则抠数字和代码, 解码失败的
+    中文字符直接忽略即可。"""
+    if params:
+        url = url + ("&" if "?" in url else "?") + urlencode(params)
+    req = Request(url, headers=_HEADERS)
+    with urlopen(req, timeout=TIMEOUT) as r:
+        return r.read().decode("gbk", errors="ignore")
+
+
+def _get_json(url: str, params: Optional[dict] = None):
+    return json.loads(_get(url, params))
 
 
 # ── 纯计算部分(无网络) ────────────────────────────────────────────────────────
@@ -229,9 +226,7 @@ def shibor_curve() -> Optional[list]:
     数据源同 akshare.macro_china_shibor_all 的上游(金十的静态 JSON), 这里直接
     取, 免掉 akshare 依赖。取不到返回 None, 调用方回退到 fallback 利率。"""
     try:
-        r = session().get(_SHIBOR_JSON, params={"_": int(time.time())},
-                          timeout=TIMEOUT)
-        data = r.json()
+        data = _get_json(_SHIBOR_JSON, {"_": int(time.time())})
     except Exception:
         return None
     values = data.get("values") or {}
@@ -265,11 +260,9 @@ def expiry_candidates(today: dt.date):
         ms = _next_month_str(today, off)
         try:
             # date 要 "YYYY-MM" 形式(ms 是 "202608" → "2026-08")
-            r = session().get(_EXPIRE_API,
-                              params={"exchange": "null", "cate": "50ETF",
-                                      "date": f"{ms[:4]}-{ms[4:]}"},
-                              timeout=TIMEOUT)
-            d = (r.json().get("result") or {}).get("data") or {}
+            j = _get_json(_EXPIRE_API, {"exchange": "null", "cate": "50ETF",
+                                        "date": f"{ms[:4]}-{ms[4:]}"})
+            d = (j.get("result") or {}).get("data") or {}
             expiry, days = d.get("expireDay"), d.get("remainderDays")
         except Exception:
             continue
@@ -294,9 +287,8 @@ def _contract_codes(month_str: str):
     codes = []
     for tag, kind in (("OP_UP_", "C"), ("OP_DOWN_", "P")):
         try:
-            r = session().get(_HQ + tag + UNDERLYING + month_str[-4:],
-                              timeout=TIMEOUT)
-            body = re.search(r'="([^"]*)"', r.text)
+            text = _get(_HQ + tag + UNDERLYING + month_str[-4:])
+            body = re.search(r'="([^"]*)"', text)
         except Exception:
             continue
         if not body:
@@ -320,9 +312,7 @@ def fetch_chain(month_str: str):
         return []
     kind_of = dict(codes)
     try:
-        r = session().get(_HQ + ",".join("CON_OP_" + c for c, _ in codes),
-                          timeout=TIMEOUT)
-        text = r.text
+        text = _get(_HQ + ",".join("CON_OP_" + c for c, _ in codes))
     except Exception:
         return []
 
