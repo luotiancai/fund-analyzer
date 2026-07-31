@@ -68,6 +68,8 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import fetcher
 
@@ -215,6 +217,46 @@ _SINA_OPT_URL = "https://hq.sinajs.cn/list="
 _SINA_OPT_HEADERS = {"Referer": "https://stock.finance.sina.com.cn/",
                      "User-Agent": "Mozilla/5.0"}
 
+_sina_sess = None
+_sina_sess_lock = threading.Lock()
+
+
+def _sina_session():
+    """拉行情用的会话:保持长连接 + 建连失败重试。
+
+    一次现算要拉近月、次月两条链,打的是**同一个 host**(hq.sinajs.cn)。
+    原来每条链各发一次独立请求,等于每次都重新做一遍跨境 TCP 握手,多赌
+    一次运气。境外主机上这条链路抖动明显——Streamlit Cloud(GCP)实测过
+    近月链 22 个报价拿到了、次月链却卡在建连超时(connect timeout=12),
+    于是整次现算作废、退回 optbbs。
+    改用 Session 后第二条链直接复用已建立的连接,不再重新握手;再对建连
+    失败重试 2 次(指数退避),跨境偶发丢包也能兜住。连接超时放宽到 20 秒:
+    跨境握手本来就比境内慢得多,12 秒对 GCP 这条路太紧。"""
+    global _sina_sess
+    if _sina_sess is not None:
+        return _sina_sess
+    with _sina_sess_lock:
+        if _sina_sess is None:
+            s = requests.Session()
+            s.headers.update(_SINA_OPT_HEADERS)
+            # 重试次数刻意压得很克制:外层 fetcher._fetch_with_timeout 有
+            # 总预算(会阻塞页面渲染), 重试放大的是**最坏**耗时——connect
+            # 超时18秒配2次重试, 单条链最坏就要55秒, 反而更容易把整次现算
+            # 拖超时。真正解决问题的是上面的长连接复用(第二条链不再握手),
+            # 重试只是给"第一次握手就丢包"兜个底, 1 次足够。
+            retry = Retry(total=1, connect=1, read=0, backoff_factor=0.5,
+                          status_forcelist=(429, 500, 502, 503, 504))
+            s.mount("https://", HTTPAdapter(max_retries=retry,
+                                            pool_connections=4, pool_maxsize=4))
+            _sina_sess = s
+    return _sina_sess
+
+
+# (连接超时, 读取超时)。分开设:跨境握手慢但一旦连上,新浪返回很快
+# (整月链 15KB)。连接超时从原来的 12 秒放宽到 18——实测 GCP 那条路
+# 12 秒不够握手完成, 而读取给 15 秒绰绰有余。
+_SINA_TIMEOUT = (18, 15)
+
 
 def _fetch_chain(month_str: str) -> pd.DataFrame:
     """近月/次近月看涨+看跌整月合约链 → 一次批量拉实时报价。
@@ -240,7 +282,7 @@ def _fetch_chain(month_str: str) -> pd.DataFrame:
     kind_of = {c: k for c, k in codes}
     syms = ",".join("CON_OP_" + c for c, _ in codes)
     try:
-        r = requests.get(_SINA_OPT_URL + syms, headers=_SINA_OPT_HEADERS, timeout=12)
+        r = _sina_session().get(_SINA_OPT_URL + syms, timeout=_SINA_TIMEOUT)
         text = r.text
     except Exception as e:
         log.warning("QVIX %s 月合约批量行情请求失败: %s", month_str, e)

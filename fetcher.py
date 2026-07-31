@@ -1703,10 +1703,12 @@ def fetch_qvix_now() -> tuple:
     try:
         import qvix_calc   # 延迟导入:qvix_calc 反过来 import fetcher,
                             # 模块顶层互相 import 会循环失败。
-        # 自算改批量取链后单次现算约2~3秒(见 qvix_calc._fetch_chain),
-        # timeout 仍留够余量,不要因为外层超时先一步掐断。
+        # 境内单次现算约3~5秒;境外(Streamlit Cloud/GCP)跨境握手慢,最坏
+        # 情况是第一条链握手超时(18秒)+重试一次(约19秒), 之后第二条链复用
+        # 长连接几乎免费, 加上 akshare 那几个接口, 总计仍在 50 秒内。
+        # 这个预算会阻塞页面渲染, 但只在5分钟缓存未命中时发生。
         r = _fetch_with_timeout(lambda: qvix_calc.compute_qvix(as_of=as_of),
-                                timeout=40)
+                                timeout=50)
         if r is not None and r[0] is not None:
             if phase == "noon":
                 return r[0], "11:30", "上午收盘"
