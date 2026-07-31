@@ -1571,8 +1571,8 @@ def fetch_qvix_now() -> tuple:
     try:
         import qvix_calc   # 延迟导入:qvix_calc 反过来 import fetcher,
                             # 模块顶层互相 import 会循环失败。
-        # 请求错峰(见 qvix_calc._parallel_fetch)让单次现算要5~8秒,
-        # timeout 留够余量,不要因为外层超时先一步掐断。
+        # 自算改批量取链后单次现算约2~3秒(见 qvix_calc._fetch_chain),
+        # timeout 仍留够余量,不要因为外层超时先一步掐断。
         r = _fetch_with_timeout(qvix_calc.compute_qvix, timeout=40)
         if r is not None and r[0] is not None:
             return r[0], r[1], "自算"
