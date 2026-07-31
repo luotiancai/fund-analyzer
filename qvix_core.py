@@ -386,6 +386,57 @@ def compute_qvix(as_of: Optional[dt.datetime] = None,
 # 可选加固:这个接口是公开的, 每次调用都会打一次新浪。URL 本身很难猜到,
 # 真担心被人乱调可以在网关上加个鉴权, 或在下面校验一个约定的 query 参数。
 
+def diagnose(as_of: Optional[dt.datetime] = None) -> dict:
+    """逐步跑一遍并记录每步结果, 供云端排查。函数URL 加 ?debug=1 即可看到。
+
+    "算不出来"这个结果本身不带原因(compute_qvix 只返回 None), 在本地能一行行
+    print, 在云函数里只能靠这个。四个数据源逐个探一遍, 哪步断了一目了然——
+    尤其能区分"网络出不去"和"数据解析不对", 这两种表现一样、修法完全不同。"""
+    out = {}
+    now = as_of or dt.datetime.now(CST)
+    out["now"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    out["tz_ok"] = str(now.tzinfo)
+
+    # ① 最基础的连通性:随便打一个新浪行情
+    try:
+        out["probe_hq"] = _get(_HQ + "sh000001")[:100]
+    except Exception as e:
+        out["probe_hq_error"] = f"{type(e).__name__}: {e}"
+
+    # ② 到期日接口
+    try:
+        out["expiry_candidates"] = expiry_candidates(now.date())
+    except Exception as e:
+        out["expiry_error"] = f"{type(e).__name__}: {e}"
+
+    # ③ 合约清单 + ④ 批量报价(拿第一个到期月试)
+    cands = out.get("expiry_candidates") or []
+    if cands:
+        ms = cands[0][0]
+        try:
+            codes = _contract_codes(ms)
+            out["contract_codes_n"] = len(codes)
+            out["contract_codes_head"] = codes[:3]
+        except Exception as e:
+            out["contract_codes_error"] = f"{type(e).__name__}: {e}"
+        try:
+            chain = fetch_chain(ms)
+            out["chain_n"] = len(chain)
+            out["chain_head"] = chain[:2]
+        except Exception as e:
+            out["chain_error"] = f"{type(e).__name__}: {e}"
+
+    # ⑤ SHIBOR(拿不到不致命, 会退到 fallback 利率)
+    try:
+        c = shibor_curve()
+        out["shibor"] = c[:3] if c else None
+    except Exception as e:
+        out["shibor_error"] = f"{type(e).__name__}: {e}"
+
+    out["result"] = compute_qvix(as_of=as_of)
+    return out
+
+
 def parse_qs_flat(qs: str) -> dict:
     """"a=1&b=2" → {"a":"1","b":"2"}。用标准库, 不引额外依赖。"""
     from urllib.parse import parse_qs
@@ -421,6 +472,15 @@ def main_handler(event, context):
                                                  microsecond=0)
         except Exception:
             as_of = None
+    if str(params.get("debug", "")).lower() in ("1", "true", "yes"):
+        try:
+            body = diagnose(as_of=as_of)
+        except Exception as e:
+            body = {"ok": False, "error": f"diagnose 崩了: {type(e).__name__}: {e}"}
+        return {"isBase64Encoded": False, "statusCode": 200,
+                "headers": {"Content-Type": "application/json; charset=utf-8"},
+                "body": json.dumps(body, ensure_ascii=False, default=str)}
+
     try:
         r = compute_qvix(as_of=as_of)
     except Exception as e:
