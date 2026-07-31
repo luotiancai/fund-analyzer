@@ -1668,45 +1668,58 @@ def last_qvix_self_close() -> tuple:
     return round(float(row["qvix"]), 2), str(row["date"])
 
 
-_QVIX_NOW_ASSET_URL = ("https://github.com/luotiancai/fund-analyzer/"
-                       "releases/download/data/qvix_now.json")
-# live 档的发布值多久算过期。noon/close 档的值本来就是定格的, 不看这个。
-_QVIX_NOW_MAX_AGE_MIN = 12
+# 盘中自算值算成了就记一笔, 算不出来时拿来顶上。live 档最多认这么久之前的
+# 值——再旧就别顶着"当前QVIX"的名头了, 宁可退回 optbbs 并标明来源不同。
+# noon/close 档不受这个限制:那两档的值本来就钉死在 11:30 / 15:00, 不会变。
+_INTRADAY_REUSE_MAX_MIN = 60
 
 
-def _published_qvix_now(phase: str) -> tuple:
-    """读 GitHub Actions 发布的盘中自算值(intraday_qvix.py 写的小 JSON)。
+def save_intraday_qvix(qvix: float, time_str: str, phase: str) -> None:
+    """记下最近一次**成功**的盘中自算值(只存一行, 覆盖式)。
 
-    存在的理由见 intraday_qvix.py 顶部:Streamlit Cloud 到新浪只有约50%的
-    建连成功率, 而 Actions 上是稳的, 所以让 Actions 算好、页面直接读。
-    命中时返回 (qvix, "HH:MM:SS"), 没有/过期/档位对不上返回 (None, None)。
+    云端(Streamlit Cloud/GCP)到新浪的建连只有约50%成功率, 一次算不出来是
+    常态。有这份记录, 失败时就能顶上"几分钟前的自算值", 而不是掉到 optbbs。
+    这很重要:恐慌阈值是拿自算序列算的, optbbs 系统性偏高约0.18、极端日差2
+    以上, 拿它比自算的线是两把尺子——**尺子对不对, 比数新不新鲜要紧得多**。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS qvix_intraday_last ("
+                 "id INTEGER PRIMARY KEY, date TEXT, time TEXT, phase TEXT, "
+                 "qvix REAL, saved_at REAL)")
+    conn.execute("INSERT OR REPLACE INTO qvix_intraday_last "
+                 "(id, date, time, phase, qvix, saved_at) VALUES (1,?,?,?,?,?)",
+                 (datetime.now(_CST).strftime("%Y-%m-%d"), time_str, phase,
+                  float(qvix), time.time()))
+    conn.commit()
+    conn.close()
 
-    只认同一天、且档位一致的值:
-      · live 档还要求发布时间在 _QVIX_NOW_MAX_AGE_MIN 分钟内(实时值会变);
-      · noon/close 档不看新鲜度——那两个档的值本来就钉死在 11:30 / 15:00,
-        中午12:50 读到 11:32 发布的值完全正确, 按分钟数判过期反而会误杀。
-    """
-    try:
-        r = requests.get(_QVIX_NOW_ASSET_URL, timeout=8)
-        r.raise_for_status()
-        d = r.json()
-    except Exception as e:
-        logger.debug("盘中自算发布值取不到: %s", e)
-        return None, None
+
+def last_intraday_qvix(phase: str) -> tuple:
+    """今天、同一档位下最近一次成功的自算值 → (qvix, "HH:MM:SS")。
+    没有/隔天/档位不符/live档太旧 都返回 (None, None)。"""
+    conn = _conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS qvix_intraday_last ("
+                 "id INTEGER PRIMARY KEY, date TEXT, time TEXT, phase TEXT, "
+                 "qvix REAL, saved_at REAL)")
+    row = conn.execute("SELECT date, time, phase, qvix, saved_at "
+                       "FROM qvix_intraday_last WHERE id=1").fetchone()
+    conn.close()
     now = datetime.now(_CST)
-    if d.get("date") != now.strftime("%Y-%m-%d") or d.get("phase") != phase:
+    if not row or row["date"] != now.strftime("%Y-%m-%d") or row["phase"] != phase:
         return None, None
     if phase == "live":
-        try:
-            hh, mm, ss = (int(x) for x in str(d["time"]).split(":"))
-        except Exception:
+        age_min = (time.time() - (row["saved_at"] or 0)) / 60
+        if age_min > _INTRADAY_REUSE_MAX_MIN:
             return None, None
-        age = (now - now.replace(hour=hh, minute=mm, second=ss,
-                                 microsecond=0)).total_seconds() / 60
-        if not (0 <= age <= _QVIX_NOW_MAX_AGE_MIN):
-            return None, None
-    v = d.get("qvix")
-    return (float(v), str(d.get("time"))) if v is not None else (None, None)
+    return round(float(row["qvix"]), 2), str(row["time"])
+
+
+def _label(qvix: float, time_str: str, phase: str) -> tuple:
+    """按档位给自算值贴标签(见 qvix_phase 的时段表)。"""
+    if phase == "noon":
+        return qvix, "11:30", "上午收盘"
+    if phase == "close":
+        return qvix, "15:00", "今日收盘"
+    return qvix, time_str, "自算"
 
 
 def fetch_qvix_now() -> tuple:
@@ -1741,14 +1754,6 @@ def fetch_qvix_now() -> tuple:
     if phase == "prev":
         return _from_db()
 
-    # 先看 Actions 发布的自算值。放在现算前面是有意的:云端(Streamlit/GCP)
-    # 到新浪的建连只有约50%成功率, 每次都先去赌一把要拿页面加载时间当赌注;
-    # 而发布值几百字节、从 GitHub 拿、稳定且快。本地跑时如果没配这条流水线,
-    # 文件不存在, 自然落到下面的现算, 不影响本地开发。
-    v, t = _published_qvix_now(phase)
-    if v is not None:
-        return v, t, "自算"
-
     try:
         import qvix_calc   # 延迟导入:qvix_calc 反过来 import fetcher,
                             # 模块顶层互相 import 会循环失败。
@@ -1757,15 +1762,18 @@ def fetch_qvix_now() -> tuple:
         # 与其硬扛到50秒不如早点落到 optbbs / 库里收盘值。本地开发时现算
         # 是唯一路径, 3~5秒就够, 30秒绰绰有余。
         r = _fetch_with_timeout(lambda: qvix_calc.compute_qvix(as_of=as_of),
-                                timeout=30)
+                                timeout=25)
         if r is not None and r[0] is not None:
-            if phase == "noon":
-                return r[0], "11:30", "上午收盘"
-            if phase == "close":
-                return r[0], "15:00", "今日收盘"
-            return r[0], r[1], "自算"
+            save_intraday_qvix(r[0], r[1], phase)
+            return _label(r[0], r[1], phase)
     except Exception as e:
         logger.warning("QVIX intraday fetch (self-computed) failed: %s", e)
+
+    # 现算没成:先顶今天最近一次成功的自算值(见 save_intraday_qvix 的说明:
+    # 尺子对不对比数新不新鲜要紧)。展示时会带上它自己的时刻, 不冒充此刻。
+    v, t = last_intraday_qvix(phase)
+    if v is not None:
+        return _label(v, t, phase)
 
     v, t = _optbbs_qvix_now()
     if v is not None:

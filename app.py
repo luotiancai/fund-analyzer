@@ -180,9 +180,17 @@ def load_fund_metrics(code: str, rf: float):
     return fetcher.compute_sharpe_for_fund(code, rf=rf)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def load_qvix_now():
-    return fetcher.fetch_qvix_now()
+    """盘中QVIX。刻意**不加 st.cache_data**:那个缓存是全局的、按参数索引,
+    加了之后"刷新页面"根本不会重新取(缓存跨会话存活), 只能靠 ttl 到点自己
+    过期——也就是变成定时拉取, 而不是按需。这里改用 session_state 控制:
+    新会话(F5 刷新/新开页面)取一次, 之后的 rerun(点任何控件都会触发)直接
+    用会话里存的值, 只有点🔄按钮才强制重取。"""
+    if st.session_state.get("_qvix_refresh") or "_qvix_now" not in st.session_state:
+        st.session_state["_qvix_refresh"] = False
+        with st.spinner("正在获取盘中QVIX…"):
+            st.session_state["_qvix_now"] = fetcher.fetch_qvix_now()
+    return st.session_state["_qvix_now"]
 
 
 @st.cache_data(show_spinner="正在加载上证指数数据…")
@@ -334,12 +342,12 @@ for _c in ("ret_1m", "ret_3m", "ret_6m", "ret_1y"):
     if _c in fund_df.columns:
         fund_df[_c] = pd.to_numeric(fund_df[_c], errors="coerce")
 
-# ── 当前 QVIX(盘中,5分钟缓存) ────────────────────────────────────────────────
+# ── 当前 QVIX(按需拉取:进页面一次 + 点🔄一次) ────────────────────────────────
 # 装饰性小字,拉取失败(接口变更/限流/部署过渡态等)绝不能带崩整页。
-# 刷新按钮在读取之前处理:点击触发 rerun,先清掉5分钟缓存,本次就现拉。
+# 刷新按钮在读取之前处理:点击只置个标记,下面 load_qvix_now() 看到标记就重取。
 _c_qvix_txt, _c_qvix_btn = st.columns([9, 1], vertical_alignment="center")
 if _c_qvix_btn.button("🔄", key="qvix_now_refresh", help="立即重新拉取盘中QVIX"):
-    load_qvix_now.clear()
+    st.session_state["_qvix_refresh"] = True
 try:
     _qvix_now, _qvix_now_t, _qvix_src = load_qvix_now()
 except Exception:
