@@ -36,6 +36,7 @@
 import json
 import logging
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -50,23 +51,33 @@ log = logging.getLogger("publish_qvix")
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qvix_now.json")
 
 
-def _published_today(date_str: str) -> bool:
-    """今天是否已经成功发布过。--daily 模式用来跳过重复跑。"""
+def _osa(script: str) -> None:
+    """跑一段 AppleScript。失败静默——通知不出来不该影响主流程。"""
     try:
-        with open(OUT, encoding="utf-8") as f:
-            return json.load(f).get("date") == date_str
-    except Exception:
-        return False
+        subprocess.run(["osascript", "-e", script], timeout=20,
+                       capture_output=True)
+    except Exception as e:
+        log.debug("通知失败: %s", e)
+
+
+def _notify_ok(title: str, msg: str) -> None:
+    """成功: 横幅通知, 看一眼就走, 不打断。"""
+    t, m = title.replace('"', "'"), msg.replace('"', "'")
+    _osa(f'display notification "{m}" with title "{t}"')
+
+
+def _notify_fail(msg: str) -> None:
+    """失败: 对话框, **不会自动消失**, 人回到电脑前必然看见。
+    横幅几秒就没了, 而这个任务一天只跑一次, 错过就是错过。"""
+    m = msg.replace('"', "'")
+    _osa('display dialog "' + m + '" with title "QVIX 定时任务失败" '
+         'buttons {"知道了"} default button 1 with icon caution')
 
 
 def main() -> int:
-    # --daily: 定时任务用。当天已经成功发布过就直接退出——launchd 挂了好几个
-    # 时点(见模块说明), 目的是"当天第一次有网的时点跑一次", 不是每个时点都跑。
-    daily = "--daily" in sys.argv
-    if daily and _published_today(
-            fetcher.datetime.now(fetcher._CST).strftime("%Y-%m-%d")):
-        log.info("今天已发布过, 跳过(--daily)")
-        return 0
+    # --notify: 定时任务用, 把结果推成 macOS 通知。手动跑时不加——终端里
+    # 本来就看得见, 再弹一次是噪音。
+    notify = "--notify" in sys.argv
 
     # 先把自算历史和恐慌阈值刷到最新。
     # 本机**没有**任何定时任务(云端那份跑批只更新 Release 里的快照, 不会回流
@@ -85,6 +96,7 @@ def main() -> int:
     date_str = now.strftime("%Y-%m-%d")
 
     if phase == "prev":
+        # 周末/节假日/开盘前:本来就没有实时值可算, 静默退出, 不打扰。
         log.info("非交易时段(档位=prev), 跳过")
         return 0
     try:
@@ -92,9 +104,16 @@ def main() -> int:
                                    fallback_rate=fetcher.get_risk_free_rate())
     except Exception as e:
         log.error("自算异常: %s", e)
+        if notify:
+            _notify_fail(f"算不出来: {type(e).__name__}\n\n"
+                         "多半是当时没网。回到电脑前双击 qvix.command 手动跑一次即可。")
         return 1
     if r is None or r[0] is None:
         log.error("自算失败(合约或报价拿不全), 未记录")
+        if notify:
+            _notify_fail("算不出来: 合约或报价没拿全。\n\n"
+                         "多半是当时没网, 或新浪限流。回到电脑前双击 "
+                         "qvix.command 手动跑一次即可。")
         return 1
 
     payload = {"qvix": r[0], "time": r[1], "date": date_str,
@@ -126,6 +145,15 @@ def main() -> int:
     print("  " + "─" * 42)
     print("    (本机结果, 不上传; 线上页面只有日度历史和阈值)")
     print()
+
+    if notify:
+        gap_txt = ""
+        if thr is not None:
+            gap = r[0] - thr
+            gap_txt = ("  🔔 已破阈值" if gap >= 0 else f"  距触发 {-gap:.2f}")
+        _notify_ok(f"QVIX {r[0]:.2f}",
+                   f"{_PHASE_CN.get(phase, phase)} {r[1]}"
+                   + (f"   阈值 {thr:.2f}{gap_txt}" if thr is not None else ""))
     return 0
 
 
