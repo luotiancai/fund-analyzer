@@ -46,6 +46,18 @@ ASSET = "qvix_now.json"
 
 
 def main() -> int:
+    # 先把自算历史和恐慌阈值刷到最新。
+    # 本机**没有**任何定时任务(云端那份跑批只更新 Release 里的快照, 不会回流
+    # 到本地库), 所以不在这里刷, 下面打印的阈值就会一直停在最后一次手动跑批
+    # 那天的值, 而且看不出来是旧的。这一步只打一次上交所官方接口(境外也通的
+    # 那个)+一次滚动分位, 几秒钟, 顺带自愈最近15天的空值。
+    try:
+        v, note = fetcher.update_qvix_self_daily()
+        if v is None:
+            log.warning("自算历史刷新未成功(%s), 阈值可能不是最新", note)
+    except Exception as e:
+        log.warning("自算历史刷新失败(%s), 阈值可能不是最新", e)
+
     phase, as_of = fetcher.qvix_phase()
     now = fetcher.datetime.now(fetcher._CST)
     date_str = now.strftime("%Y-%m-%d")
@@ -79,13 +91,14 @@ def main() -> int:
 
     # 给人看的摘要:点一次就把该知道的都摆出来, 省得再去翻页面
     _PHASE_CN = {"live": "实时", "noon": "上午收盘", "close": "今日收盘"}
-    thr = None
+    thr = thr_date = None
     try:
         hist = fetcher.load_qvix_self_history()
         if hist is not None:
             row = hist.dropna(subset=["threshold"])
             if not row.empty:
                 thr = float(row["threshold"].iloc[-1])
+                thr_date = str(row["date"].iloc[-1])
     except Exception:
         pass
     print()
@@ -95,6 +108,7 @@ def main() -> int:
         gap = r[0] - thr
         state = "🔔 已破阈值" if gap >= 0 else f"距触发还差 {-gap:.2f}"
         print(f"    恐慌阈值  {thr:>6.2f}   {state}")
+        print(f"              (2年90分位, 截至 {thr_date})")
     print("  " + "─" * 42)
     print("    已发布, 手机/网页刷新即可看到同一个数")
     print()
