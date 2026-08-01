@@ -14,13 +14,15 @@ Pipeline (fetcher.run_pipeline):
   ④ 重算:用存好的净值对全部基金重算夏普 + 最大回撤(纯 CPU,几秒)
 
 用法
-  手动:   python3 update_daily.py
-  仅重算:  python3 update_daily.py --recompute-only
-  cron:    0 18 * * 1-5  cd /path/to/fund-analyzer && python3 update_daily.py >> update.log 2>&1
+  手动:     python3 update_daily.py
+  仅重算:    python3 update_daily.py --recompute-only
+  仅补QVIX:  python3 update_daily.py --qvix-only   (见 run_qvix_only 说明)
+  cron:      0 18 * * 1-5  cd /path/to/fund-analyzer && python3 update_daily.py >> update.log 2>&1
 """
 
 import argparse
 import logging
+import os
 import time
 
 import fetcher
@@ -42,14 +44,77 @@ def _log_progress(phase, done, total):
         _last_log[phase] = time.time()
 
 
+def _qvix_dates_with_value() -> set:
+    """qvix_self_history 里**已经有值**(qvix 非空)的日期集合。
+    用来判断一次补跑到底补上了什么:没补上任何东西就不必回传 82MB 的库。"""
+    hist = fetcher.load_qvix_self_history()
+    if hist is None:
+        return set()
+    return set(hist[hist["qvix"].notna()]["date"].astype(str))
+
+
+def _emit_gha_output(**kv) -> None:
+    """把结果写给 GitHub Actions 的 step outputs。本地跑时 GITHUB_OUTPUT
+    不存在,什么也不做——脚本本身不该因为"没在CI里"就报错。"""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            for k, v in kv.items():
+                f.write("%s=%s\n" % (k, v))
+    except Exception as e:      # 写不进去不该让整个补跑算失败
+        log.warning("写 GITHUB_OUTPUT 失败(不影响补跑结果): %s", e)
+
+
+def run_qvix_only() -> None:
+    """只补自算QVIX,不碰基金净值、不刷指数缓存。
+
+    为什么单独有这么一条路径:凌晨那次跑批撞上上交所期权风险指标接口抽风时
+    (2026-07-29、07-31 都栽在这上面,近5次里两次),当天的 QVIX 会在
+    qvix_self_history 里留一个空值,而页面取的是最后一个非空值——于是线上
+    整天显示前一天的数。update_qvix_self_daily 本身带"补最近15天空值"的自愈
+    逻辑,但它只在下一次跑批时才执行,那要等到次日凌晨;周五晚上失败的话
+    整个周末都补不上。所以在北京时间早上6点再跑一次,接口这个点基本都正常了。
+
+    幂等:update_qvix_self_daily 是 INSERT OR REPLACE,凌晨那次已经成功的话
+    这里算出来是同一个数,没有副作用,只是白算十几秒。也正因为大部分早上都是
+    白跑,这里会把"到底补上了哪几天"写进 step output,让 workflow 只在真补上
+    了值的时候才回传数据库。"""
+    before = _qvix_dates_with_value()
+    vix, note = fetcher.update_qvix_self_daily()
+    filled = sorted(_qvix_dates_with_value() - before)
+
+    if vix is not None:
+        log.info("   QVIX(自算) %.2f", vix)
+    else:
+        log.warning("   QVIX 自算仍未成功: %s", note)
+
+    if filled:
+        log.info("   本次补上 %d 天: %s", len(filled), ", ".join(filled))
+    else:
+        log.info("   没有新补上的值(凌晨那次已经算好了,或接口这会儿还是不通)")
+
+    _emit_gha_output(changed=str(bool(filled)).lower(),
+                     filled=",".join(filled))
+
+
 def main():
     parser = argparse.ArgumentParser(description="基金净值每日跑批")
     parser.add_argument("--recompute-only", action="store_true",
                         help="跳过下载,只用已存净值重算夏普/回撤")
+    parser.add_argument("--qvix-only", action="store_true",
+                        help="只补自算QVIX,不跑基金净值/指数(早间补跑用)")
     args = parser.parse_args()
 
     t0 = time.time()
     fetcher.init_db()
+
+    if args.qvix_only:
+        log.info("仅补 QVIX(不跑基金净值/指数)…")
+        run_qvix_only()
+        log.info("✅ 完成,耗时 %.0f 秒", time.time() - t0)
+        return
 
     if args.recompute_only:
         log.info("仅重算:用已存净值重算夏普 + 回撤…")

@@ -1,0 +1,57 @@
+name: QVIX 早间补跑
+
+on:
+  schedule:
+    # 22:00 UTC = 北京次日 06:00,周二至周六早上(对应周一至周五的收盘)。
+    # 凌晨1点那次跑批(update-daily.yml)如果撞上上交所期权风险指标接口抽风,
+    # 当天 QVIX 会留一个空值,页面就只能显示前一天的数;而跑批自带的"补空值"
+    # 自愈要等到次日凌晨才执行,周五失败的话整个周末都补不上。这里早上再试
+    # 一次,接口这个点基本都正常了。只算 QVIX,不碰基金净值。
+    - cron: "0 22 * * 1-5"
+  workflow_dispatch: {}   # 手动补跑用
+
+permissions:
+  contents: write   # gh release upload 需要
+
+# 跟 update-daily.yml 共用一个并发组。两个 workflow 都是"下载 release 库 →
+# 改 → 传回",同时跑就会互相覆盖(后传的把先传的改动整个盖掉)。正常情况下
+# 两者差约4小时撞不上,但每日跑批遇到全量回填能跑2小时以上、Actions 自己
+# 还有排队延迟,不能只靠时间差。共用并发组让它们排队而不是并行。
+concurrency:
+  group: fund-analyzer-db
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FUND_ANALYZER_DATA: ${{ github.workspace }}/.data
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装依赖(不装 streamlit)
+        run: pip install --quiet requests pandas numpy akshare
+      - name: 取回数据库(Release tag `data`)
+        # 这里不做"下载不到就从零回填"的兜底:补跑的前提就是已经有一份库,
+        # 库都没有的话该由 update-daily.yml 去建,补跑直接失败反而看得见。
+        run: |
+          mkdir -p "$FUND_ANALYZER_DATA"
+          gh release download data --pattern fund_cache.db.gz \
+            --output db.gz --repo "$GITHUB_REPOSITORY"
+          gunzip -c db.gz > "$FUND_ANALYZER_DATA/fund_cache.db" && rm db.gz
+      - name: 补算 QVIX
+        id: qvix
+        run: python update_daily.py --qvix-only
+      - name: 回传数据库(只在真补上了值时)
+        # 大部分早上凌晨那次是好的,这里算出来是同一个数、库没变化,没必要
+        # 白压白传 80MB。changed 由 update_daily.run_qvix_only 写出。
+        if: steps.qvix.outputs.changed == 'true'
+        run: |
+          echo "补上了: ${{ steps.qvix.outputs.filled }}"
+          gzip -9 -c "$FUND_ANALYZER_DATA/fund_cache.db" > fund_cache.db.gz
+          gh release upload data fund_cache.db.gz --clobber \
+            --repo "$GITHUB_REPOSITORY"

@@ -15,6 +15,14 @@ on:
 permissions:
   contents: write   # gh release upload 需要
 
+# 跟 qvix-retry.yml(北京早上6点的 QVIX 补跑)共用一个并发组:两个 workflow
+# 都是"下载 release 库 → 改 → 传回",同时跑会互相覆盖。共用并发组让后到的
+# 那个排队等前一个跑完,而不是并行。cancel-in-progress 必须是 false——取消
+# 跑到一半的跑批等于白跑几十分钟还什么都没写回去。
+concurrency:
+  group: fund-analyzer-db
+  cancel-in-progress: false
+
 jobs:
   update:
     runs-on: ubuntu-latest
