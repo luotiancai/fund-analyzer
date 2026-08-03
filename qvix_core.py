@@ -343,14 +343,22 @@ def fetch_chains(months):
     2次清单+1次报价 = 6次)。行情行格式:
       var hq_str_CON_OP_<code>="买量,买价,最新价,卖价,卖量,持仓,涨幅,行权价,…"
     某月报价没拿全就不放进结果——少几个行权价会让 1/K² 加权求和漏掉整段虚值
-    期权, 算出来偏低且看不出异常。宁可那个月不算。"""
+    期权, 算出来偏低且看不出异常。宁可那个月不算。
+
+    只收标准(M)合约, 丢掉分红调整(A)合约——第43字段是 M/A 标志。510050 每年
+    约11~12月分红一次, 之后数月 A 合约与 M 合约并行挂牌: A 的行权价非标准
+    (如 2.701 夹在 2.70 和 2.75 之间)且基本无人交易、常年零买价, 混进来会在
+    行权价阶梯**中段**触发 term_variance 的"连续两个零买价截断", 把后面报价
+    正常的虚值段整个砍掉, 值悄悄偏低。历史路径(qvix_calc._CONTRACT_RE 只认
+    M)一直就滤, 这里不滤的话实时值和阈值就不是同一把尺子。"""
     codes_by_month = _contract_codes_multi(months)
     if not codes_by_month:
         return {}
     meta = {c: (k, ms) for ms, lst in codes_by_month.items() for c, k in lst}
     text = _get(_HQ + ",".join("CON_OP_" + c for c in meta))
 
-    got = {}
+    got = {ms: [] for ms in codes_by_month}
+    seen = {ms: 0 for ms in codes_by_month}   # 收到的行数, 含被过滤的 A 合约
     for m in re.finditer(r'CON_OP_(\d+)="([^"]*)"', text):
         code, parts = m.group(1), m.group(2).split(",")
         if code not in meta or len(parts) < 8:
@@ -361,11 +369,17 @@ def fetch_chains(months):
             strike = float(parts[7])
         except ValueError:
             continue
+        seen[ms] += 1
+        # 字段不足44个时视同 M 放行: 宁可退回旧行为, 也不要因为新浪改了字段
+        # 数就把整月合约全滤光、天天算不出来。
+        if len(parts) > 43 and parts[43].strip() != "M":
+            continue
         mid = (bid + ask) / 2 if bid > 0 and ask > 0 else last
-        got.setdefault(ms, []).append({"kind": kind, "strike": strike,
-                                       "bid": bid, "mid": mid})
+        got[ms].append({"kind": kind, "strike": strike,
+                        "bid": bid, "mid": mid})
+    # 完整性看"收到的行数"而不是"留下的行数": A 合约是拿到后主动丢的, 不算缺。
     return {ms: rows for ms, rows in got.items()
-            if len(rows) == len(codes_by_month[ms])}
+            if rows and seen[ms] == len(codes_by_month[ms])}
 
 
 def fetch_chain(month_str: str):
