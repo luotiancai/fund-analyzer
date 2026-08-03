@@ -192,10 +192,12 @@ _QVIX_THR_COMBOS = [
 
 @st.cache_data(show_spinner="正在计算候选恐慌阈值…")
 def load_qvix_threshold_combos(cache_key):
-    """按 backtest_qvix.py 同一套口径(minp_ratio=0.97)现算滚动阈值
-    (窗口×分位),供上证指数图叠加展示——与线上生产阈值列(490/
-    0.90,minp=475,fetcher.update_qvix_self_daily 里精确维护,2026-07-27
-    起已从720/0.95对齐到这个口径)算法一致但
+    """按 backtest_qvix.py 同一套口径(minp_ratio=0.97,含 shift(1):
+    第 d 天画的是"截至 d-1 收盘"的分位,与回测信号/实盘用法同口径)现算
+    滚动阈值(窗口×分位),供上证指数图叠加展示——与线上生产阈值列
+    (490/0.90,minp=475,fetcher.update_qvix_self_daily 里精确维护,
+    2026-07-27 起已从720/0.95对齐到这个口径;那列不 shift,存"截至该日
+    收盘"的值,次日实盘拿最后一行来比,语义等价)算法一致但
     独立现算,只用于图上对比展示,不影响生产阈值/策略复盘本身。"""
     hist = fetcher.load_qvix_self_history()
     if hist is None or hist.empty:
@@ -206,7 +208,8 @@ def load_qvix_threshold_combos(cache_key):
     out = hist[["date"]].copy()
     for label, window, pct, _color in _QVIX_THR_COMBOS:
         minp = int(window * 0.97)
-        out[label] = hist["qvix"].rolling(window, min_periods=minp).quantile(pct)
+        out[label] = (hist["qvix"].rolling(window, min_periods=minp)
+                      .quantile(pct).shift(1))
     return out
 
 

@@ -1825,6 +1825,10 @@ def update_qvix_self_daily() -> tuple:
         # 里偶发接口失败/数据缺失(约1.6%的交易日),真设成490会导致
         # 窗口只要出现过一天缺失就整个失真成NaN,475留了约15天的
         # 容错,仍然远比240严格(同 backtest_qvix.py 的 minp_ratio=0.97)。
+        # 这列**故意不 shift**:存的是"截至该日收盘"的分位。实盘用法是次日
+        # 盘中拿最后一行来比(qvix_now.py), 今天的数据天然不在窗口里;
+        # 回测(backtest_qvix.py)在自己那边 shift(1) 达成同一口径。别在
+        # 这里加 shift——那会让实盘比的阈值凭空旧一天。
         hist["threshold"] = hist["qvix"].rolling(490, min_periods=475).quantile(0.90)
         save_qvix_self_threshold(hist["date"].tolist(), hist["threshold"].tolist())
     return vix, note

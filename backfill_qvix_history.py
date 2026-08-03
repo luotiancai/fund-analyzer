@@ -125,6 +125,7 @@ def main():
     hist = fetcher.load_qvix_self_history()
     hist = hist.sort_values("date").reset_index(drop=True)
     # min_periods=475(接近满2年,留约15天容错,理由同 fetcher.update_qvix_self_daily)
+    # 不 shift, 存"截至该日收盘"的值, 理由同 fetcher.update_qvix_self_daily。
     hist["threshold"] = hist["qvix"].rolling(490, min_periods=475).quantile(0.90)
     fetcher.save_qvix_self_threshold(hist["date"].tolist(), hist["threshold"].tolist())
 
