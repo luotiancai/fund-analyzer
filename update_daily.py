@@ -17,6 +17,7 @@ Pipeline (fetcher.run_pipeline):
   手动:     python3 update_daily.py
   仅重算:    python3 update_daily.py --recompute-only
   仅补QVIX:  python3 update_daily.py --qvix-only   (见 run_qvix_only 说明)
+  仅刷规模:   python3 update_daily.py --scales-only (规模覆盖范围扩大后补全用)
   cron:      0 18 * * 1-5  cd /path/to/fund-analyzer && python3 update_daily.py >> update.log 2>&1
 """
 
@@ -105,10 +106,23 @@ def main():
                         help="跳过下载,只用已存净值重算夏普/回撤")
     parser.add_argument("--qvix-only", action="store_true",
                         help="只补自算QVIX,不跑基金净值/指数(早间补跑用)")
+    parser.add_argument("--scales-only", action="store_true",
+                        help="只刷基金季度规模,不跑净值/指数/QVIX"
+                             "(规模覆盖范围扩大后的一次性补全用)")
     args = parser.parse_args()
 
     t0 = time.time()
     fetcher.init_db()
+
+    if args.scales_only:
+        # 规模覆盖范围从「本地有净值的基金」扩到「榜单全部非债基金」后,
+        # 首轮要补约 8000 只、一个多小时。日常跑批里顺带补也行,但那样得等
+        # 到下一次凌晨跑批;单独一条路径可以手动/workflow_dispatch 立刻补。
+        log.info("仅刷新基金季度规模(不跑净值/指数/QVIX)…")
+        n = fetcher.refresh_scale_hist(
+            progress=lambda p, d, t: _log_progress(p, d, t))
+        log.info("✅ 规模刷新完成(实抓 %d 只),耗时 %.0f 秒", n, time.time() - t0)
+        return
 
     if args.qvix_only:
         log.info("仅补 QVIX(不跑基金净值/指数)…")

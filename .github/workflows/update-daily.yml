@@ -10,7 +10,15 @@ on:
     # 注: 万一某天数据还没发布, update_qvix_self_daily 有"补最近15天空值"的
     # 自愈逻辑, 下一次跑批会自动补上, 不需要为此把时间往后推。
     - cron: "0 17 * * 1-5"
-  workflow_dispatch: {}   # 手动触发测试用
+  workflow_dispatch:      # 手动触发测试 / 单项补数据用
+    inputs:
+      mode:
+        description: "跑什么"
+        type: choice
+        default: full
+        options:
+          - full          # 完整跑批(和定时一样)
+          - scales-only   # 只刷基金季度规模(覆盖范围扩大后的一次性补全)
 
 permissions:
   contents: write   # gh release upload 需要
@@ -47,7 +55,13 @@ jobs:
             echo "::warning::release 不存在,将从零全量回填(耗时数小时,建议先用 push_db.sh 上传种子库)"
           fi
       - name: 跑批(增量补净值 + 重算指标 + 刷新上证/QVIX)
-        run: python update_daily.py
+        # scales-only 只刷规模,别的一概不碰;定时触发没有 inputs,默认 full。
+        run: |
+          if [ "${{ github.event.inputs.mode }}" = "scales-only" ]; then
+            python update_daily.py --scales-only
+          else
+            python update_daily.py
+          fi
       - name: 压缩并回传数据库
         run: |
           gzip -9 -c "$FUND_ANALYZER_DATA/fund_cache.db" > fund_cache.db.gz

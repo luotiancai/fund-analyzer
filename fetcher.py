@@ -198,6 +198,13 @@ def init_db():
             saved_at     REAL NOT NULL,
             PRIMARY KEY (code, quarter_end)
         ) WITHOUT ROWID;
+        -- 规模抓取"抓了但一行都没有"的记录(F10 无规模变动表的基金:刚成立、
+        -- 已清盘、场内份额等)。没有这张表的话它们在 fund_scale_hist 里永远
+        -- 留不下痕迹,每天跑批都要重抓一遍(扩到全榜单后是几千次白请求)。
+        CREATE TABLE IF NOT EXISTS fund_scale_miss (
+            code     TEXT PRIMARY KEY,
+            tried_at REAL NOT NULL
+        ) WITHOUT ROWID;
     """)
     # Add per-period max-drawdown / Sharpe / return columns (migration for
     # existing DBs). Returns are recomputed locally from stored NAV because the
@@ -772,14 +779,20 @@ def fetch_fund_scale_hist(code: str, force_refresh: bool = False) -> pd.DataFram
     except Exception as e:
         logger.debug("scale fetch failed for %s: %s", code, e)
 
+    conn = _conn()
     if rows:
-        conn = _conn()
         conn.executemany(
             "INSERT OR REPLACE INTO fund_scale_hist "
             "(code, quarter_end, aum, publish_date, saved_at) VALUES (?, ?, ?, ?, ?)",
             rows)
-        conn.commit()
-        conn.close()
+        conn.execute("DELETE FROM fund_scale_miss WHERE code=?", (code,))
+    else:
+        # 一行都没抓到:记一笔,让 refresh_scale_hist 的 recheck 窗口能跳过它
+        # (否则这只基金在库里毫无痕迹,每次跑批都要重抓)。
+        conn.execute("INSERT OR REPLACE INTO fund_scale_miss (code, tried_at) "
+                     "VALUES (?, ?)", (code, time.time()))
+    conn.commit()
+    conn.close()
     return load_fund_scale_hist(code)
 
 
@@ -828,6 +841,31 @@ def latest_published_quarter(today=None) -> Optional[str]:
     return max(cands) if cands else None
 
 
+def scale_universe() -> list:
+    """需要维护规模历史的基金:榜单里全部非债基金。
+
+    以前只覆盖「本地有净值历史的基金」(list_nav_codes(),约 5.7k 只),
+    但基金列表的规模门槛是对整个榜单(非债约 13.5k 只)生效的,没抓到规模
+    的一律按「未知」放行——门槛因此对大半基金形同虚设,快照模式尤其明显
+    (2022 那会儿有规模的只有 2.5k 只)。所以范围按榜单来。
+    榜单缓存读不到时退回本地净值那批(至少不比以前差)。
+    """
+    try:
+        conn = _conn()
+        row = conn.execute("SELECT data FROM fund_list WHERE id = 1").fetchone()
+        conn.close()
+        if row:
+            df = pd.DataFrame(json.loads(row["data"]))
+            if "type" in df.columns:
+                df = df[~df["type"].map(is_bond)]
+            codes = {str(c).zfill(6) for c in df["code"].dropna()}
+            if codes:
+                return sorted(codes | list_nav_codes())
+    except Exception as e:
+        logger.warning("scale_universe fell back to NAV codes: %s", e)
+    return sorted(list_nav_codes())
+
+
 def refresh_scale_hist(codes: Optional[list] = None,
                        progress: Optional[Callable] = None) -> int:
     """批量刷新基金季度规模。规模是季度数据(一年4次, 各季末后约1个月披露),
@@ -839,7 +877,7 @@ def refresh_scale_hist(codes: Optional[list] = None,
     没出过季报的), 免得每天都去重抓它们。返回实际发生网络抓取的只数。由
     update_daily.py 每日调用(不放进 run_pipeline, 免得拖慢 in-app 更新按钮)。"""
     if codes is None:
-        codes = sorted(list_nav_codes())
+        codes = sorted(scale_universe())
     # 自愈:披露滞后口径变过(如 _SCALE_PUB_LAG 调整)时, 库里存量行的
     # publish_date 会过时。按 quarter_end 批量重算对齐(几十条, 秒级), 免得
     # 靠重抓才更新——否则 have_latest 已命中的基金不会再抓、旧披露日就一直
@@ -856,9 +894,13 @@ def refresh_scale_hist(codes: Optional[list] = None,
         have_latest = {r["code"] for r in conn.execute(
             "SELECT code FROM fund_scale_hist GROUP BY code "
             "HAVING MAX(quarter_end) >= ?", (due,))}
+    _cut = time.time() - 20 * 24 * 3600
     recent = {r["code"] for r in conn.execute(
         "SELECT code FROM fund_scale_hist GROUP BY code "
-        "HAVING MAX(saved_at) > ?", (time.time() - 20 * 24 * 3600,))}
+        "HAVING MAX(saved_at) > ?", (_cut,))}
+    # 抓过但一行都没有的(F10 无规模变动表)同样进 recheck 窗口,不然每天重抓。
+    recent |= {r["code"] for r in conn.execute(
+        "SELECT code FROM fund_scale_miss WHERE tried_at > ?", (_cut,))}
     conn.close()
     fetched = 0
     total = len(codes)
