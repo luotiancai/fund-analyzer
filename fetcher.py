@@ -995,18 +995,32 @@ def compute_sharpe_for_fund(code: str, rf: float = RISK_FREE_RATE) -> Optional[d
 
 # ── Persistent filter-result cache ───────────────────────────────────────────
 
+# 全部筛选结果加起来最多占这么多字节(JSON 原文,约等于建库体积)。
+FILTER_CACHE_BYTES = 64 * 1024 * 1024
+
+
 def save_filter_result(key: str, meta: dict, df: pd.DataFrame):
-    """Store one filter run's top rows + its params/total under `key`."""
+    """Store one filter run's rows + its params/total under `key`."""
     conn = _conn()
     conn.execute(
         "INSERT OR REPLACE INTO filter_results (key, params, data, saved_at) "
         "VALUES (?, ?, ?, ?)",
         (key, json.dumps(meta, ensure_ascii=False),
          df.to_json(orient="split", force_ascii=False), time.time()))
-    # Keep the table bounded: only the 200 most recent filter runs survive.
+    # Keep the table bounded. 一条结果现在存的是全部匹配行(动辄近万行、
+    # 几百 KB),只按条数封顶会把库撑大(整库还要 gzip 传到 Release),
+    # 所以再加一道总字节上限:按时间倒序累计,超过 FILTER_CACHE_BYTES 的
+    # 老结果丢掉。最新一条(rn = 1)无论多大都保留,否则刚存的会被自己删掉。
     conn.execute(
-        "DELETE FROM filter_results WHERE key NOT IN "
-        "(SELECT key FROM filter_results ORDER BY saved_at DESC LIMIT 200)")
+        "DELETE FROM filter_results WHERE key NOT IN ("
+        "  SELECT key FROM ("
+        "    SELECT key,"
+        "      ROW_NUMBER() OVER (ORDER BY saved_at DESC) AS rn,"
+        "      SUM(LENGTH(data)) OVER (ORDER BY saved_at DESC"
+        "        ROWS UNBOUNDED PRECEDING) AS cum"
+        "    FROM filter_results"
+        "  ) WHERE rn = 1 OR (rn <= 200 AND cum <= ?)"
+        ")", (FILTER_CACHE_BYTES,))
     conn.commit()
     conn.close()
 

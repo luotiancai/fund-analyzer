@@ -4,6 +4,7 @@ import datetime as dt
 import gzip
 import hashlib
 import json
+import math
 import os
 import shutil
 import time
@@ -438,6 +439,9 @@ with tab_table:
     # session so later reruns (tab switches, detail lookups) keep the last result.
     if submitted:
         st.session_state.filter_applied = True
+        # 新一轮筛选:回到第 1 页,并清掉上一轮残留的勾选行号。
+        st.session_state.filter_page_no = 1
+        st.session_state.filter_picked = set()
     filter_ready = st.session_state.get("filter_applied", False)
 
     ret_col, mdd_col, sharpe_col = PERIODS[period_label]
@@ -493,8 +497,8 @@ with tab_table:
     table = None
     _hit = None
     if filter_ready:
-        # Persistent result cache: the top-200 rows of every distinct filter run
-        # are stored in SQLite, so repeating one (even after a restart — notably
+        # Persistent result cache: every distinct filter run's full result table
+        # is stored in SQLite, so repeating one (even after a restart — notably
         # the ~1min as-of snapshots) is a single read instead of a recompute.
         # Live-mode keys embed the metrics version, so a daily data update
         # naturally starts a fresh entry; as-of snapshots are immutable history.
@@ -508,9 +512,10 @@ with tab_table:
             # Bumped when the filter rules change (v3: exclude funds younger
             # than the *selected* period window; v4-v6: exclude 债券/固收/偏债
             # types, is_bond 逐步收敛为「含债或固收」; v7: 回撤改按校正收益
-            # 复利口径,与模拟盘一致; v8: 新增「最低规模」过滤 + 规模(亿)列),
+            # 复利口径,与模拟盘一致; v8: 新增「最低规模」过滤 + 规模(亿)列;
+            # v9: 结果不再截断前 200 条,旧条目只有前 200 行、不能再复用),
             # so stale cached results never get served.
-            "rule_ver": 8,
+            "rule_ver": 9,
             # Combines the Sharpe/drawdown recompute timestamp with the fund
             # list's own saved_at: the in-app update button refreshes the list
             # (fresh returns) but skips recompute_all, so last_update_time()
@@ -525,7 +530,7 @@ with tab_table:
             table, _fmeta, _fsaved = _hit
             st.caption(
                 f"⚡ 本次筛选命中缓存（{_fmt_cst(_fsaved, '%Y-%m-%d %H:%M')} 计算）"
-                f" · 共 {_fmeta.get('total', 0):,} 条匹配，显示前 {len(table)} 条"
+                f" · 共 {len(table):,} 条匹配"
             )
 
     if filter_ready and _hit is None:
@@ -659,10 +664,9 @@ with tab_table:
             table = table.reset_index(drop=True)
 
         _total = len(table)
-        table = table.head(200).reset_index(drop=True)
         fetcher.save_filter_result(_fkey, {**_fparams, "total": _total}, table)
         st.caption(
-            f"共 {_total:,} 条匹配（基金总量 {len(fund_df):,}）· 显示并缓存前 {len(table)} 条"
+            f"共 {_total:,} 条匹配（基金总量 {len(fund_df):,}）· 已全部缓存，分页展示"
         )
         if max_dd is not None and mdd_col not in display.columns:
             st.caption("⚠️ 暂无回撤数据。请点击「🔄 更新数据」生成。")
@@ -670,19 +674,53 @@ with tab_table:
     if table is None:
         st.info("👆 设置筛选条件后，点击「🔍 开始筛选」生成基金列表。")
     else:
-        st.caption("点击表头可排序 · 行首打勾（可多选）查看基金在截至日期下最新披露的十大持仓")
+        # ── 分页 ──────────────────────────────────────────────────────────────
+        # 匹配结果全量保留在内存/缓存里,但一次只把当前页切给 st.dataframe——
+        # 上万行一次性渲染会明显拖慢页面。切片保留原行号做索引,所以表格左侧
+        # 显示的就是该基金在全表中的排名。
+        _pc1, _pc2, _pc3 = st.columns([1, 1, 3])
+        with _pc1:
+            _psize = st.selectbox("每页行数", [50, 100, 200, 500, 1000],
+                                  index=2, key="filter_page_size")
+        _npages = max(1, math.ceil(len(table) / _psize))
+        # 换页大小/重新筛选后,session 里残留的页码可能越界——先夹回范围,
+        # 否则 number_input 会因 value 超出 max_value 直接报错。
+        if st.session_state.get("filter_page_no", 1) > _npages:
+            st.session_state.filter_page_no = _npages
+        with _pc2:
+            _page = st.number_input("第几页", min_value=1, max_value=_npages,
+                                    value=1, step=1, key="filter_page_no")
+        _start = (int(_page) - 1) * _psize
+        _end = min(_start + _psize, len(table))
+        with _pc3:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            st.caption(
+                f"共 {len(table):,} 条 · 第 {_page}/{_npages} 页"
+                f"（第 {_start + 1:,}–{_end:,} 条）"
+            )
+
+        st.caption("点击表头可排序 · 行首打勾（可多选，跨页保留）查看基金在截至日期下最新披露的十大持仓")
         _sel = st.dataframe(
-            table,
+            table.iloc[_start:_end],
             use_container_width=True,
             height=560,
             on_select="rerun",
             selection_mode="multi-row",
-            key="filter_table_sel",
+            # 每页一个独立的表格 key:翻页时勾选状态不会按行号错位串到新页。
+            key=f"filter_table_sel_{_psize}_{_page}",
         )
 
         # ── Selected funds: latest top-10 holdings as of the filter's 截至日期,
         # laid out in a grid — fill each row left to right, then wrap. ──
-        _sel_rows = _sel.selection.rows if _sel is not None else []
+        # 勾选返回的是页内行号;换算成全表行号后存进 session,这样翻到别的页
+        # 再回来(或同时勾几页)选中的基金都还在。每次 rerun 只用当前页的
+        # 勾选覆盖本页区间,其余页的选择原样保留。
+        _page_rows = {_start + _r for _r in
+                      (_sel.selection.rows if _sel is not None else [])}
+        _picked = {_i for _i in st.session_state.get("filter_picked", set())
+                   if not (_start <= _i < _end)} | _page_rows
+        st.session_state.filter_picked = _picked
+        _sel_rows = sorted(_picked)
         _asof_lim = (asof_date if asof_mode
                      else dt.date.today()).strftime("%Y-%m-%d")
 
