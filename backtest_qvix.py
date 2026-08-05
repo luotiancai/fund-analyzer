@@ -830,7 +830,14 @@ def main():
         "window": args.window, "pct": args.pct, "ret_col": _ret_col,
         "pick": args.pick, "min_vol_ratio": args.min_vol_ratio,
         "dd_divisor": args.dd_divisor, "min_aum": args.min_aum,
-        "require_drop": not args.no_require_drop,
+        # regime 模式下 require_drop 由代码强制置 True(跌向必须真跌),
+        # 不看命令行——早期几次跑批这里照抄了命令行默认值, 记录跟实际
+        # 行为对不上, 页面上的规则描述跟着说错。
+        "require_drop": True if args.pick == "regime" else not args.no_require_drop,
+        # 择向依据: "day"=信号日当天单日涨跌(现行), "window"=比一个回看
+        # 窗口前(截至前一日, 已弃用)。只对 pick="regime" 有意义, 留着是
+        # 为了历史跑批的规则描述不会被现行口径覆盖掉。
+        "regime_basis": "day" if args.pick == "regime" else None,
     }
     if args.no_save:
         print("--no-save: 这次不落库")

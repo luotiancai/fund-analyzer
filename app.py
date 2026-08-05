@@ -1858,8 +1858,18 @@ with tab_sse:
                     _x_loss = _x_rets[_x_rets <= 0]
                     _x_pick = str(_x_params.get("pick") or "bottom")
                     if _x_pick == "regime":
-                        _rule = (f"信号日**上证当天收涨**→买{_x_win}涨幅最大的,"
-                                 f"**当天收跌**→买{_x_win}跌幅最大的。")
+                        # regime_basis 区分两版择向依据:早期那版比的是"截至
+                        # 前一日的回看窗口",在暴跌当天触发的信号上会把当天
+                        # 那根大阴线排除在方向判断外(2025-04-07 单日 -7.34%
+                        # 却算出近3月 +2.44% 判成"涨"),已弃用但跑批记录还在,
+                        # 规则描述不能拿现行口径去套。
+                        if _x_params.get("regime_basis") == "window":
+                            _rule = (f"信号日上证比{_x_win}前**涨**(截至前一交易日)"
+                                     f"→买{_x_win}涨幅最大的,**跌**→买{_x_win}"
+                                     f"跌幅最大的。")
+                        else:
+                            _rule = (f"信号日**上证当天收涨**→买{_x_win}涨幅最大的,"
+                                     f"**当天收跌**→买{_x_win}跌幅最大的。")
                         if _x_params.get("require_drop"):
                             _rule += "走跌幅分支时选中的基金必须真的是负收益,否则当天不买。"
                         else:
