@@ -87,6 +87,19 @@ NAV_ANOMALIES = {
 #   医药创新(跌得更深且当天规模已够), 累计从+675.40%回落——这是修 bug 后的
 #   真实值, 之前偏高是用了尚不该可见的更旧季度规模所致。
 #
+# ── 对照实验: 按大盘当日涨跌择向(pick="regime", 2026-08-05)──────────────
+# 规则: 信号日看**上证当天**是红是绿(sse_day_change, 单日涨跌), 涨→选回看
+# 窗口内涨幅最大的, 跌→选跌幅最大的。走"跌幅最大"分支时候选必须真的是
+# 负收益(require_drop, 2026-08-05 加): 候选按跌幅从深到浅排, 走到第一个
+# 非负值就当天不操作, 不买涨幅最小的凑数; 走"涨幅最大"分支不受此限。
+# 回看窗口(基金排名)跟随 --lookback: 3m(默认)/1m。
+# 命令: python3 backtest_qvix.py --pick regime [--lookback 1m]
+#
+# 中途试过用"上证比一个回看窗口前是涨是跌"来定方向, 已弃用: 那样
+# 2025-04-07 这种单日 -7.34% 的暴跌日, 按截至前一日的近3月窗口反而算
+# +2.44%、判成"涨"(信号恰恰就在暴跌当天触发, 却把当天那根大阴线排除在
+# 方向判断外)。现在直接看当天这根K线。结果快照见下面两段。
+#
 # 买入日/冠军/类型/波动率比值/阈值/回撤线/大盘线/近3月涨幅/卖出日/收益(费后)/手续费%/期间最高/最大回撤/同期上证/卖出原因
 # 2022-03-15 嘉实港股通新经济指数C(006614)     指数型-股票  2.26 27.47 12.42 5.49  -37.47%  2022-04-21 +12.50%   0.0 +26.8% 11.3%  +0.5% 大盘6.2%>=5.5%
 # 2022-04-25 诺安创新驱动混合C(002051)         混合型-灵活  1.73 26.33  9.11 5.27  -37.80%  2022-07-15 +14.19%   0.0 +23.2%  7.3% +10.2% 大盘5.3%>=5.3%
@@ -292,6 +305,29 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
     return None, 0
 
 
+def sse_day_change(sse_df, asof_date):
+    """信号日**当天**上证的单日涨跌幅(%), 取不到返回 None.
+
+    含当天收盘——这跟 find_champion_on_date 的基金排名口径(严格截到 T-1)
+    故意不同, 因为两者可观测性不一样: 基金净值当晚才公布, 盘中决策看不到
+    今天的基金收益; 而指数是实时的, 恐慌信号触发那一刻抬头就能看见上证
+    今天是红是绿, 何况信号本身(QVIX)用的就是 T 当天的实时值。
+
+    中途试过"比一个回看窗口(近1月/近3月)前是涨是跌"的版本, 已弃用: 那样
+    2025-04-07 这种单日 -7.34% 的暴跌日, 按截至前一日的近3月窗口反而算
+    +2.44%、判成"涨"。改回最直白的"今天这根K线是红是绿"。
+    """
+    end = pd.Timestamp(asof_date)
+    hist = sse_df[sse_df["date"] <= end]
+    if len(hist) < 2 or hist.iloc[-1]["date"] != end:
+        return None
+    prev_close = float(hist.iloc[-2]["close"])
+    cur_close = float(hist.iloc[-1]["close"])
+    if not prev_close:
+        return None
+    return (cur_close / prev_close - 1) * 100
+
+
 def compute_beta(conn, sse_df, code, buy_date):
     """买入日前91天窗口的波动率比值(基金日收益率std / 大盘日收益率std).
 
@@ -353,7 +389,14 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     这条已验证过有效的机制, 以后想重新启用可以传 0.6。
 
     ret_col/pick: 排名依据("ret_1m"近1月/"ret_3m"近3月)和方向
-    ("top"=选最高即冠军/动量, "bottom"=选最低即跌幅最大/反转候选)。
+    ("top"=选最高即冠军/动量, "bottom"=选最低即跌幅最大/反转候选,
+    "regime"=按大盘状态逐信号日择向)。
+
+    pick="regime"(2026-08-05 加): 信号日看上证指数比3个月前是涨是跌
+    (sse_3m_change, 只用T-1及更早收盘, 无未来函数)——涨就选近3月涨幅
+    最大的(顺势/动量), 跌就选近3月跌幅最大的(超跌反转), 并强制关掉
+    require_drop(不再要求候选自身必须真的跌过, 涨市里买的就是涨得最凶
+    那只)。回测结果见文件头的对照快照。
     2026-07-24 起标准策略定为 ret_col="ret_3m"+pick="bottom"(近3月
     跌幅最大)——用2年90%信号实测: 冠军/动量(相关系数≥0.6版本)11笔
     最大亏损-9.40%/平均亏损-5.37%; 近3月跌幅最大12笔最大亏损仅
@@ -535,6 +578,10 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                     "回撤控制线(%)": round(position["fund_dd_limit"], 2),
                     "大盘回撤线(%)": round(position["sse_dd_limit"], 2),
                     "冠军近3月涨幅(前日口径)": f"{position['ret_3m']:+.2f}%",
+                    "上证当日涨跌": (f"{position['sse_chg']:+.1f}%"
+                                if position.get("sse_chg") is not None else "—"),
+                    "选向": {"top": "涨幅最大", "bottom": "跌幅最大"}.get(
+                        position.get("pick_dir"), position.get("pick_dir")),
                     "卖出日": day.strftime("%Y-%m-%d"),
                     "期间最高": f"+{(position['peak_nav']/position['buy_nav']-1)*100:.1f}%",
                     "期间最大回撤": f"{max_dd:.1f}%",
@@ -551,12 +598,27 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
         # ── Step 2: 空仓(含当天刚卖出)且为信号日时买入 ──
         if position is None and day in signal_map:
             threshold = signal_map[day]
+            # pick="regime": 方向由信号日**当天**上证是红是绿决定(见
+            # run_backtest 说明)——收涨就买回看窗口内涨幅最大的, 收跌就买
+            # 跌幅最大的。
+            # require_drop 恒为 True: 走"跌幅最大"分支时, 选中的基金必须
+            # 真的是负收益, 候选按跌幅从深到浅排、走到第一个非负值就当天
+            # 不操作(不退而求其次买涨幅最小的凑数, 那不是"跌幅最大"策略)。
+            # 走"涨幅最大"分支时这个参数不起作用(find_champion_on_date 里
+            # 那条判断带 pick == "bottom" 前提), 追涨那边照买不误。
+            _pick, _req_drop = pick, require_drop
+            sse_chg = sse_day_change(sse, day_str)
+            if pick == "regime":
+                if sse_chg is None:
+                    continue
+                _pick = "top" if sse_chg > 0 else "bottom"
+                _req_drop = True
             code, ret_3m = find_champion_on_date(conn, day_str, exclude_codes,
                                                  sse_df=sse, min_corr=min_corr,
-                                                 ret_col=ret_col, pick=pick,
+                                                 ret_col=ret_col, pick=_pick,
                                                  min_vol_ratio=min_vol_ratio,
                                                  min_aum=min_aum,
-                                                 require_drop=require_drop)
+                                                 require_drop=_req_drop)
             if code is None:
                 continue
 
@@ -597,6 +659,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                 "peak_sse": sse_peak,
                 "buy_sse": sse_peak,
                 "ret_3m": ret_3m,
+                "sse_chg": sse_chg,
+                "pick_dir": _pick,
                 "beta": beta,
                 "fund_dd_limit": fund_dd_limit,
                 "sse_dd_limit": threshold / dd_divisor,
@@ -634,7 +698,11 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                 "恐慌阈值": round(position["threshold"], 2),
                 "回撤控制线(%)": round(position["fund_dd_limit"], 2),
                 "大盘回撤线(%)": round(position["sse_dd_limit"], 2),
-                "冠军近3月涨幅(前日口径)": f"+{position['ret_3m']:.2f}%",
+                "冠军近3月涨幅(前日口径)": f"{position['ret_3m']:+.2f}%",
+                "上证当日涨跌": (f"{position['sse_chg']:+.1f}%"
+                            if position.get("sse_chg") is not None else "—"),
+                "选向": {"top": "涨幅最大", "bottom": "跌幅最大"}.get(
+                    position.get("pick_dir"), position.get("pick_dir")),
                 "卖出日": f"{last_date.strftime('%Y-%m-%d')}(持仓中)",
                 "期间最高": f"+{(position['peak_nav']/position['buy_nav']-1)*100:.1f}%",
                 "期间最大回撤": f"{max_dd:.1f}%",
@@ -701,10 +769,12 @@ def main():
     parser.add_argument("--lookback", choices=["1m", "3m"], default="3m",
                         help="排名依据的区间,默认3m(近3月,91天);"
                              "1m=近1月(30天)")
-    parser.add_argument("--pick", choices=["top", "bottom"], default="bottom",
+    parser.add_argument("--pick", choices=["top", "bottom", "regime"], default="bottom",
                         help="默认bottom=选区间跌幅最大(反转候选,"
                              "2026-07-24定为标准策略);"
-                             "top=选区间涨幅最高(冠军/动量,旧逻辑)")
+                             "top=选区间涨幅最高(冠军/动量,旧逻辑);"
+                             "regime=按大盘状态择向(上证比3个月前涨则选涨幅"
+                             "最大、跌则选跌幅最大, 自动关掉「必须下跌」规则)")
     parser.add_argument("--min-vol-ratio",
                         type=lambda s: None if s.lower() == "none" else float(s),
                         default=1.5,
@@ -724,6 +794,13 @@ def main():
                         help="关掉「跌幅耗尽即不操作」规则:信号日即便所有候选都"
                              "是正收益也照买跌幅最大(涨幅最小)那个。默认保留该"
                              "规则(标准策略:没有真正下跌的标的当天就不买)")
+    parser.add_argument("--no-save", action="store_true",
+                        help="这次不落库。默认每跑一次都追加一条到策略库"
+                             "(strategydb.strategy_runs), 页面能翻到历史每一跑;"
+                             "默认参数那次额外标记为线上标准策略")
+    parser.add_argument("--label", default=None,
+                        help="给这次跑批起个名字(页面上显示)。不给就按参数"
+                             "自动拼一个, 见 fetcher.describe_run")
     args = parser.parse_args()
 
     _ret_col = "ret_1m" if args.lookback == "1m" else "ret_3m"
@@ -740,24 +817,30 @@ def main():
         print("无交易记录")
         return
 
-    # 落库供 app「策略复盘」表读取(页面不再硬编码这张表, 见
-    # fetcher.save_backtest_trades 说明)。只有跑默认参数(=线上标准策略)
-    # 时才写, 免得随手跑一次 --pick top 之类的对照实验就把页面上的
-    # 标准策略明细顶掉。
+    # 落库供 app「策略复盘」区读取(页面不再硬编码这张表, 见
+    # fetcher.save_strategy_run 说明)。每跑一次都追加一条, 不覆盖历史;
+    # 跑默认参数那次额外标记 is_standard, 主复盘表读最新的标准跑批。
+    # 策略库是独立文件(fund_strategy.db), 跟行情主库分开发布。
     _is_standard = (args.window == 490 and args.pct == 0.90
                     and args.min_corr is None and args.lookback == "3m"
                     and args.pick == "bottom" and args.min_vol_ratio == 1.5
                     and args.dd_divisor == 5.0 and args.min_aum == 0.5
                     and not args.no_require_drop)
-    if _is_standard:
-        fetcher.save_backtest_trades(trades, {
-            "window": args.window, "pct": args.pct, "ret_col": _ret_col,
-            "pick": args.pick, "min_vol_ratio": args.min_vol_ratio,
-            "dd_divisor": args.dd_divisor, "min_aum": args.min_aum,
-        })
-        print("已写入 backtest_trades 表(app 复盘表读这里)")
+    _params = {
+        "window": args.window, "pct": args.pct, "ret_col": _ret_col,
+        "pick": args.pick, "min_vol_ratio": args.min_vol_ratio,
+        "dd_divisor": args.dd_divisor, "min_aum": args.min_aum,
+        "require_drop": not args.no_require_drop,
+    }
+    if args.no_save:
+        print("--no-save: 这次不落库")
     else:
-        print("非默认参数, 不写库(页面只展示标准策略明细)")
+        _rid = fetcher.save_strategy_run(trades, _params, label=args.label,
+                                         is_standard=_is_standard)
+        _lbl = args.label or fetcher.describe_run(_params)
+        print(f"已存为策略跑批 #{_rid}「{_lbl}」"
+              + ("(默认参数, 标记为线上标准策略, 主复盘表读它)"
+                 if _is_standard else "(对照实验, 页面历史列表里可翻到)"))
 
     df = pd.DataFrame(trades)
     print(f"\n{'='*110}")
@@ -787,7 +870,7 @@ def main():
     # 输出表格
     display_cols = ["买入日", "冠军(C类全市场,按前一交易日榜单)", "类型",
                     "波动率比值(近3月)", "恐慌阈值", "回撤控制线(%)", "大盘回撤线(%)",
-                    "冠军近3月涨幅(前日口径)", "卖出日", "持有收益",
+                    "冠军近3月涨幅(前日口径)", "上证当日涨跌", "选向", "卖出日", "持有收益",
                     "手续费%", "期间最高", "期间最大回撤", "同期上证", "卖出原因"]
     print(f"\n{df[display_cols].to_string(index=False)}")
 

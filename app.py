@@ -80,8 +80,10 @@ _DB_BASE = os.environ.get("FUND_ANALYZER_RELEASE_BASE") or (
 _CORE_ASSET = _DB_BASE + "fund_cache_core.db.gz"
 _NAV_ASSET = _DB_BASE + "fund_cache_nav.db.gz"
 _FULL_ASSET = _DB_BASE + "fund_cache.db.gz"
+_STRATEGY_ASSET = _DB_BASE + "fund_strategy.db.gz"
 _DB_MARKER = fetcher.CACHE_DB + ".from-release"
 _NAV_MARKER = fetcher.NAV_DB + ".from-release"
+_STRATEGY_MARKER = fetcher.STRATEGY_DB + ".from-release"
 
 
 def _download_gz(url: str, dest: str, marker: str) -> bool:
@@ -127,6 +129,11 @@ def _sync_db_from_release() -> bool:
                and os.path.getsize(fetcher.CACHE_DB) > 1024 * 1024)
     if have_db and not os.path.exists(_DB_MARKER):
         return False                     # 本地自有数据库,不碰
+    # 策略库(回测结果, gz 才十几KB)跟行情数据是两条独立的发布线:行情由
+    # 每日跑批发, 策略由 push_strategy.sh 发, 互不覆盖(见 fetcher.STRATEGY_DB)。
+    # 同步拉——它小到不值得起线程, 而且复盘区首屏就要用。拉不到不影响
+    # 主流程: _conn() 会 ATTACH 出一个空库, 复盘区自己显示"暂无回测明细"。
+    _download_gz(_STRATEGY_ASSET, fetcher.STRATEGY_DB, _STRATEGY_MARKER)
     if _download_gz(_CORE_ASSET, fetcher.CACHE_DB, _DB_MARKER):
         fetcher.LAZY_NAV = True          # 重表另库,由 _start_nav_download 接
         return True
@@ -266,12 +273,23 @@ def load_qvix_threshold_combos(cache_key):
 
 
 @st.cache_data(show_spinner=False)
-def load_backtest_trades(cache_key, table="backtest_trades"):
-    """回测明细(backtest_trades 表,backtest_qvix.py 跑完落库)。
-    table 见 fetcher.BACKTEST_TABLES——默认标准策略,对照实验各有一张独立表。
-    cache_key 传数据库文件的 mtime:云端换快照、本地重跑回测都会让它变,
-    缓存随即失效,不需要额外的失效逻辑。"""
-    return fetcher.load_backtest_trades(table)
+def load_backtest_trades(cache_key):
+    """最新一次标准策略跑批的明细(策略库 strategy_runs,backtest_qvix.py
+    跑完落库)。cache_key 传数据库文件的 mtime:云端换快照、本地重跑回测
+    都会让它变,缓存随即失效,不需要额外的失效逻辑。"""
+    return fetcher.load_backtest_trades()
+
+
+@st.cache_data(show_spinner=False)
+def load_strategy_runs(cache_key):
+    """历次回测跑批的摘要(不含明细),新的在前。"""
+    return fetcher.list_strategy_runs()
+
+
+@st.cache_data(show_spinner=False)
+def load_strategy_run_detail(cache_key, run_id):
+    """某一次跑批的明细 → (DataFrame, params, run_at)。"""
+    return fetcher.load_strategy_run(run_id)
 
 
 @st.cache_data(show_spinner="正在加载VIX恐慌指数数据…")
@@ -1687,8 +1705,8 @@ with tab_sse:
             # 需重算。动态线(QVIX/实际σ×入场定死/每日跟随,k=2~6)无稳健
             # 增益——恐慌日按入场波动率定线永远给宽线,反而丢掉恐慌后反弹守
             # 利润的功能。重议条件:QVIX 中枢驻留 35+。
-            # 复盘明细改读 backtest_trades 表(backtest_qvix.py 跑完自动落库,
-            # 见 fetcher.save_backtest_trades)。以前这张表连同上面这段统计
+            # 复盘明细读策略库里最新一次**标准策略**跑批(backtest_qvix.py
+            # 跑完自动落库, 见 fetcher.save_strategy_run)。以前这段统计
             # 数字全是硬编码在这里的列表字面量:每次重跑回测都得把十几列
             # 数字手抄一遍进页面, 抄错没人发现, 页面上的数和回测真正跑出来
             # 的数也随时可能对不上(实测就对不上过)。现在回测落库、页面读库,
@@ -1697,7 +1715,7 @@ with tab_sse:
                 os.path.getmtime(fetcher.CACHE_DB))
             if _bt_df is None or _bt_df.empty:
                 st.info("暂无回测明细——跑一次 `python3 backtest_qvix.py` "
-                        "会写入 backtest_trades 表, 页面随即显示。")
+                        "会往策略库追加一条标准跑批, 页面随即显示。")
                 _review_df, _review_trigger = None, []
             else:
                 # 未平仓的那笔不计入统计(卖出日带"(持仓中)"标记)
@@ -1796,96 +1814,121 @@ with tab_sse:
                         "备注": st.column_config.Column(width="large"),
                     })
 
-        # ── 对照实验(2026-08-05):不是线上实盘规则,只挂上来做对比 ──────
-        # 选基改成"按大盘当日涨跌择向":信号日看**上证当天**是红是绿,
-        # 涨→买回看窗口内涨幅最大的,跌→买跌幅最大的,并去掉标准策略里
-        # "候选自身必须真的跌过"那条(见 backtest_qvix.py 文件头的对照快照)。
-        # 两张表的差别只在基金排名的回看窗口(近3月/近1月),方向判定都是
-        # 当天单日涨跌。明细各存一张独立表(fetcher.BACKTEST_TABLES),上面
-        # 标准策略读的 backtest_trades 一个字没动。
-        # 「备注」不给对照表挂:那份人工点评(backtest_notes)是对着标准策略
+        # ── 历次回测跑批(2026-08-05):不是线上实盘规则,只挂上来做对比 ──
+        # backtest_qvix.py 每跑一次就往策略库追加一条(fetcher.save_strategy_run),
+        # 这里把非标准策略的那些按时间倒序列出来,选中哪条就展开哪条的明细。
+        # 以前是"一个方案一张固定表、同名整表覆盖",换个参数重跑就把上一次
+        # 冲掉了;现在每跑必留痕,回头想比哪两版都翻得到。
+        # 策略库是独立文件(fund_strategy.db),跟 400MB 的行情主库彻底分开,
+        # 见 fetcher.STRATEGY_DB 说明。
+        # 「备注」不给这些跑批挂:那份人工点评(backtest_notes)是对着标准策略
         # 选出的基金写的,对照实验同一个买入日往往选的是另一只,挂过去
         # 就是张冠李戴。
-        for _x_key in ("regime_3m", "regime_1m"):
-            _x_tbl, _x_title = fetcher.BACKTEST_TABLES[_x_key]
-            _x_df, _x_params, _x_at = load_backtest_trades(
-                os.path.getmtime(fetcher.CACHE_DB), _x_tbl)
-            if _x_df is None or _x_df.empty:
-                continue
-            _x_win = "近1月" if _x_params.get("ret_col") == "ret_1m" else "近3月"
-            with st.expander(f"🧪 {_x_title}(对照实验,非线上规则)",
+        _runs = [r for r in load_strategy_runs(os.path.getmtime(fetcher.STRATEGY_DB))
+                 if not r["is_standard"]]
+        if _runs:
+            with st.expander(f"🧪 历次对照回测({len(_runs)} 次,非线上规则)",
                              expanded=False):
-                _x_open = _x_df["卖出日"].astype(str).str.contains("持仓中")
-                _x_done = _x_df[~_x_open]
-                _x_rets = pd.to_numeric(_x_done["费后收益"],
-                                        errors="coerce").dropna()
-                _x_days = pd.to_numeric(_x_done["持有天数"],
-                                        errors="coerce").dropna()
-                _x_n, _x_wins = len(_x_rets), int((_x_rets > 0).sum())
-                _x_cum = ((1 + _x_rets / 100).prod() - 1) * 100
-                _x_ex = ((1 + _x_rets.drop(_x_rets.idxmax()) / 100).prod() - 1) * 100
-                _x_loss = _x_rets[_x_rets <= 0]
-                st.caption(
-                    f"规则:信号日**上证当天收涨**→买{_x_win}涨幅最大的,"
-                    f"**当天收跌**→买{_x_win}跌幅最大的;不再要求候选自身"
-                    f"必须下跌过。"
-                    f"其余(波动率比值≥1.5、规模≥5000万、双止损)与标准策略一致。"
-                    f"　{_x_n} 笔已完成:胜率 {_x_wins / _x_n * 100:.1f}%"
-                    f"({_x_wins}/{_x_n}),费后复利 {_x_cum:+.2f}%,"
-                    f"平均持有 {_x_days.mean():.0f} 天,"
-                    f"平均费后 {_x_rets.mean():+.2f}%,"
-                    f"最佳 {_x_rets.max():+.2f}% / 最差 {_x_rets.min():+.2f}%,"
-                    f"剔除最佳那笔其余 {_x_n - 1} 笔仍有 {_x_ex:+.2f}%。"
-                    f"亏损笔:"
-                    + ("、".join(f"{v:+.2f}%" for v in _x_loss)
-                       if len(_x_loss) else "无") +
-                    "。⚠️ 对照实验,只用来跟标准策略比,不是线上在用的规则;"
-                    "样本十几笔、跨度6年,统计上很薄。"
-                    + (f"(明细跑于 {_fmt_cst(_x_at, '%Y-%m-%d %H:%M')})"
-                       if _x_at else ""))
+                def _run_caption(r):
+                    _t = _fmt_cst(r["run_at"], "%m-%d %H:%M") or "—"
+                    _w = f"{r['win_rate']:.0f}%" if r["win_rate"] is not None else "—"
+                    _c = f"{r['cum_return']:+.0f}%" if r["cum_return"] is not None else "—"
+                    return f"{_t} · {r['label']} · {r['n_trades']}笔 胜率{_w} 复利{_c}"
 
-                # 逐笔方向不同(有的买涨幅最大、有的买跌幅最大),标的那列
-                # 只能中性叫"选中标的",具体方向看「选向」列。
-                _x_tgt = "选中标的(C类全市场,按前一交易日榜单)"
-                _x_ret = f"{_x_win}涨跌(前日口径)"
-                _x_view = _x_df.rename(columns={
-                    "冠军(C类全市场,按前一交易日榜单)": _x_tgt,
-                    "冠军近3月涨幅(前日口径)": _x_ret,
-                })
-                _x_view = _x_view[[c for c in [
-                    "买入日", _x_tgt, "类型", "买入时规模(亿)",
-                    "波动率比值(近3月)", "恐慌阈值", "回撤控制线(%)",
-                    "大盘回撤线(%)", _x_ret, "上证当日涨跌", "选向",
-                    "卖出日", "持有收益", "期间最高", "期间最大回撤", "同期上证",
-                ] if c in _x_view.columns]].copy()
+                _sel = st.radio(
+                    "选一次跑批看明细", [r["id"] for r in _runs],
+                    format_func=lambda i: _run_caption(
+                        next(r for r in _runs if r["id"] == i)),
+                    key="strategy_run_pick")
+                _x_df, _x_params, _x_at = load_strategy_run_detail(
+                    os.path.getmtime(fetcher.STRATEGY_DB), _sel)
+                if _x_df is None or _x_df.empty:
+                    st.info("这次跑批没有明细。")
+                else:
+                    _x_win = "近1月" if _x_params.get("ret_col") == "ret_1m" else "近3月"
+                    _x_open = _x_df["卖出日"].astype(str).str.contains("持仓中")
+                    _x_done = _x_df[~_x_open]
+                    _x_rets = pd.to_numeric(_x_done["费后收益"],
+                                            errors="coerce").dropna()
+                    _x_days = pd.to_numeric(_x_done["持有天数"],
+                                            errors="coerce").dropna()
+                    _x_n, _x_wins = len(_x_rets), int((_x_rets > 0).sum())
+                    _x_cum = ((1 + _x_rets / 100).prod() - 1) * 100
+                    _x_ex = ((1 + _x_rets.drop(_x_rets.idxmax()) / 100).prod() - 1) * 100
+                    _x_loss = _x_rets[_x_rets <= 0]
+                    _x_pick = str(_x_params.get("pick") or "bottom")
+                    if _x_pick == "regime":
+                        _rule = (f"信号日**上证当天收涨**→买{_x_win}涨幅最大的,"
+                                 f"**当天收跌**→买{_x_win}跌幅最大的。")
+                        if _x_params.get("require_drop"):
+                            _rule += "走跌幅分支时选中的基金必须真的是负收益,否则当天不买。"
+                        else:
+                            _rule += "不要求候选自身下跌过。"
+                    elif _x_pick == "top":
+                        _rule = f"买{_x_win}涨幅最大的(动量)。"
+                    else:
+                        _rule = f"买{_x_win}跌幅最大的(反转)。"
+                    st.caption(
+                        f"规则:{_rule}"
+                        f"其余(波动率比值≥{_x_params.get('min_vol_ratio', 1.5)}、"
+                        f"规模≥{_x_params.get('min_aum', 0.5)}亿、双止损)"
+                        f"与标准策略一致。"
+                        f"　{_x_n} 笔已完成:胜率 {_x_wins / _x_n * 100:.1f}%"
+                        f"({_x_wins}/{_x_n}),费后复利 {_x_cum:+.2f}%,"
+                        f"平均持有 {_x_days.mean():.0f} 天,"
+                        f"平均费后 {_x_rets.mean():+.2f}%,"
+                        f"最佳 {_x_rets.max():+.2f}% / 最差 {_x_rets.min():+.2f}%,"
+                        f"剔除最佳那笔其余 {_x_n - 1} 笔仍有 {_x_ex:+.2f}%。"
+                        f"亏损笔:"
+                        + ("、".join(f"{v:+.2f}%" for v in _x_loss)
+                           if len(_x_loss) else "无") +
+                        "。⚠️ 对照实验,只用来跟标准策略比,不是线上在用的规则;"
+                        "样本十几笔、跨度6年,统计上很薄。"
+                        + (f"(跑于 {_fmt_cst(_x_at, '%Y-%m-%d %H:%M')})"
+                           if _x_at else ""))
 
-                # 不复用上面标准策略块里的 _trig_of:那个定义在"标准策略有
-                # 数据"的分支里, 标准表空着时它根本没被定义过, 这里引用就是
-                # NameError。两行的事, 各管各的。
-                def _x_trig_of(reason):
-                    _r = str(reason)
-                    _f, _s = "基金" in _r, "大盘" in _r
-                    return "both" if _f and _s else ("fund" if _f else
-                                                     ("sse" if _s else ""))
-                _x_trig = [_x_trig_of(r) for r in _x_df["卖出原因"]]
-                _x_cols = list(_x_view.columns)
+                    # 择向策略逐笔方向不同(有的买涨幅最大、有的买跌幅最大),
+                    # 标的那列只能中性叫"选中标的",具体方向看「选向」列。
+                    _x_tgt = "选中标的(C类全市场,按前一交易日榜单)"
+                    _x_ret = f"{_x_win}涨跌(前日口径)"
+                    _x_view = _x_df.rename(columns={
+                        "冠军(C类全市场,按前一交易日榜单)": _x_tgt,
+                        "冠军近3月涨幅(前日口径)": _x_ret,
+                    })
+                    _x_view = _x_view[[c for c in [
+                        "买入日", _x_tgt, "类型", "买入时规模(亿)",
+                        "波动率比值(近3月)", "恐慌阈值", "回撤控制线(%)",
+                        "大盘回撤线(%)", _x_ret, "上证当日涨跌", "选向",
+                        "卖出日", "持有收益", "期间最高", "期间最大回撤", "同期上证",
+                    ] if c in _x_view.columns]].copy()
 
-                def _x_style(row, _trig=_x_trig, _cols=_x_cols):
-                    _s = [""] * len(row)
-                    if _trig[row.name] in ("fund", "both"):
-                        _s[_cols.index("回撤控制线(%)")] = \
-                            "background-color: #ffdca8; color: #1a1a1a"
-                    if _trig[row.name] in ("sse", "both"):
-                        _s[_cols.index("大盘回撤线(%)")] = \
-                            "background-color: #c9e2ff; color: #1a1a1a"
-                    return _s
+                    # 不复用上面标准策略块里的 _trig_of:那个定义在"标准策略有
+                    # 数据"的分支里, 标准表空着时它根本没被定义过, 这里引用就是
+                    # NameError。两行的事, 各管各的。
+                    def _x_trig_of(reason):
+                        _r = str(reason)
+                        _f, _s = "基金" in _r, "大盘" in _r
+                        return "both" if _f and _s else ("fund" if _f else
+                                                         ("sse" if _s else ""))
+                    _x_trig = [_x_trig_of(r) for r in _x_df["卖出原因"]]
+                    _x_cols = list(_x_view.columns)
 
-                _x_cfg = {c: st.column_config.Column(width="small")
-                          for c in _x_cols}
-                _x_cfg[_x_tgt] = st.column_config.Column(width="medium")
-                st.dataframe(
-                    _x_view.style.apply(_x_style, axis=1)
-                    .format(precision=2, na_rep=""),
-                    use_container_width=True, hide_index=True,
-                    height=(len(_x_view) + 1) * 35 + 3,
-                    column_config=_x_cfg)
+                    def _x_style(row, _trig=_x_trig, _cols=_x_cols):
+                        _s = [""] * len(row)
+                        if _trig[row.name] in ("fund", "both"):
+                            _s[_cols.index("回撤控制线(%)")] = \
+                                "background-color: #ffdca8; color: #1a1a1a"
+                        if _trig[row.name] in ("sse", "both"):
+                            _s[_cols.index("大盘回撤线(%)")] = \
+                                "background-color: #c9e2ff; color: #1a1a1a"
+                        return _s
+
+                    _x_cfg = {c: st.column_config.Column(width="small")
+                              for c in _x_cols}
+                    _x_cfg[_x_tgt] = st.column_config.Column(width="medium")
+                    st.dataframe(
+                        _x_view.style.apply(_x_style, axis=1)
+                        .format(precision=2, na_rep=""),
+                        use_container_width=True, hide_index=True,
+                        height=(len(_x_view) + 1) * 35 + 3,
+                        column_config=_x_cfg)

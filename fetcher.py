@@ -77,6 +77,23 @@ HEAVY_TABLES = ("fund_nav_daily", "fund_holdings", "fund_scale_hist")
 LAZY_NAV = False       # app.py 在云端两段式模式下置 True
 _nav_ready = False     # 重表库是否已落地并接管(仅 LAZY_NAV 下有意义)
 
+# ── 策略库(独立文件, 跟行情数据彻底分开)─────────────────────────────────────
+# 回测结果只有几十 KB, 却曾经跟 400MB 的行情主库存在一起——发布一次策略
+# 结果要整库上传, 2026-08-05 就因此出过事故: 本地库的行情数据停在 07-30,
+# 为了推两张回测表跑了 push_db.sh, 把云端每日跑批攒到 08-04 的行情整个
+# 盖回 07-30。分库之后:
+#   · 发策略 = 传一个 10KB 的 gz(push_strategy.sh), 碰不到行情数据;
+#   · 每日跑批只传 fund_cache*.db.gz 那三个资产, 永远盖不到策略库;
+#   · 两边可以同时发, 互不等待。
+# 不做惰性加载(nav 那套是因为 63MB 值得等), 这个文件太小, _conn() 里
+# 无条件 ATTACH。SQLite 对不存在的路径会在 ATTACH 时建空库, 所以首次跑
+# 不用特殊处理。
+STRATEGY_DB = os.path.join(_DATA_DIR, "fund_strategy.db")
+# 主库里绝不能留同名表:SQLite 解析不带库名的表名是 temp→main→attached,
+# main 里留个空表会把 ATTACH 上来的真表整个遮蔽掉(nav 那边踩过, 见
+# adopt_nav_db)。所以下面所有 SQL 一律写全 strategydb.xxx。
+STRATEGY_TABLES = ("strategy_runs", "backtest_notes")
+
 
 def nav_ready() -> bool:
     """重表(净值/持仓/规模)是否已可用。本地单库恒为 True。"""
@@ -132,6 +149,16 @@ def _conn():
     # 表遮蔽、查到空结果,不会报错。
     if LAZY_NAV and os.path.exists(NAV_DB):
         conn.execute("ATTACH DATABASE ? AS navdb", (NAV_DB,))
+    # 策略库无条件挂上(见 STRATEGY_DB 说明)。云端只读容器里文件可能还没
+    # 下下来, ATTACH 会就地建个空库, 查出来是空结果而不是报错。
+    conn.execute("ATTACH DATABASE ? AS strategydb", (STRATEGY_DB,))
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS strategydb.strategy_runs ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, run_at REAL, label TEXT,"
+        " params TEXT, trades TEXT, is_standard INTEGER DEFAULT 0,"
+        " n_trades INTEGER, win_rate REAL, cum_return REAL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS strategydb.backtest_notes ("
+                 "buy_date TEXT PRIMARY KEY, note TEXT, saved_at REAL)")
     return conn
 
 
@@ -1812,86 +1839,146 @@ def save_qvix_self_threshold(dates: list, thresholds: list) -> None:
     conn.close()
 
 
-# 对照实验的回测明细各存一张独立表, 表结构跟 backtest_trades 完全一样
-# (id=1 单行 + JSON blob)。为什么不在 backtest_trades 里加个 variant 列分槽:
-# 那张表是线上标准策略在用的, 改结构要迁移老库、还要动 app 的读法,
-# 而对照实验本来就是偶尔跑一次的旁支——多建两张表零风险, 标准策略那条
-# 路径一个字都不用碰。表名写死在这里, 不接受外部拼接。
-BACKTEST_TABLES = {
-    "standard": ("backtest_trades", "标准策略:近3月跌幅最大"),
-    "regime_3m": ("backtest_regime_3m", "对照:大盘当日涨跌择向(近3月排名)"),
-    "regime_1m": ("backtest_regime_1m", "对照:大盘当日涨跌择向(近1月排名)"),
-}
+def _run_summary(trades: list) -> tuple:
+    """(笔数, 胜率%, 累计费后复利%) —— 只统计已平仓的笔。
+
+    未平仓那笔的标记在「卖出日」上("YYYY-MM-DD(持仓中)"), 不在「卖出原因」
+    里(那里写"未触发"), 把浮盈当已实现会同时污染胜率和累计收益。
+    """
+    done = [t for t in trades if "持仓中" not in str(t.get("卖出日", ""))]
+    rets = [t.get("费后收益") for t in done]
+    rets = [float(r) for r in rets if r is not None]
+    if not rets:
+        return len(done), None, None
+    wins = sum(1 for r in rets if r > 0)
+    cum = 1.0
+    for r in rets:
+        cum *= (1 + r / 100)
+    return len(rets), wins / len(rets) * 100, (cum - 1) * 100
 
 
-def save_backtest_trades(trades: list, params: Optional[dict] = None,
-                         table: str = "backtest_trades") -> None:
-    """标准策略回测明细落库(表 backtest_trades),供 app「策略复盘」表直接读。
+def describe_run(params: dict) -> str:
+    """按参数自动拼一个人看得懂的方案名(没给 --label 时用)。"""
+    p = params or {}
+    win = "近1月" if p.get("ret_col") == "ret_1m" else "近3月"
+    pick = p.get("pick")
+    if pick == "regime":
+        head = f"大盘当日涨跌择向·{win}排名"
+    elif pick == "top":
+        head = f"{win}涨幅最大"
+    else:
+        head = f"{win}跌幅最大"
+    bits = [head]
+    if p.get("require_drop"):
+        bits.append("跌向须真跌")
+    if p.get("min_vol_ratio"):
+        bits.append(f"波动≥{p['min_vol_ratio']}")
+    if p.get("min_aum"):
+        bits.append(f"规模≥{p['min_aum']}亿")
+    if p.get("dd_divisor") and p["dd_divisor"] != 5.0:
+        bits.append(f"止损除数{p['dd_divisor']}")
+    return " · ".join(bits)
 
-    table 只用于对照实验(见 BACKTEST_TABLES), 默认写标准策略那张。
 
-    以前这张表是硬编码在 app.py 里的一堆列表字面量,每次重跑回测都要手抄
-    一遍数字进页面——既容易抄错,也让"页面上的数"和"回测真正跑出来的数"
-    随时可能对不上。改成回测跑完直接落库、页面读库,跑批推一次库页面就
-    跟着变,不用改代码。
+def save_strategy_run(trades: list, params: Optional[dict] = None,
+                      label: Optional[str] = None,
+                      is_standard: bool = False) -> int:
+    """把**一次**回测的结果追加进 strategydb.strategy_runs, 返回 run id。
 
-    整表覆盖(每次回测都是全量重跑,增量没有意义)。trades 原样存 JSON,
-    以后回测多加一列也不用动表结构。params 记录跑这次用的参数,页面上
-    要标注口径时可以取。"""
-    if table not in {t for t, _ in BACKTEST_TABLES.values()}:
-        raise ValueError(f"未知的回测明细表: {table}")
+    每跑一次存一条, 不覆盖历史——以前是"一个方案一张表、同名整表覆盖",
+    换个参数重跑就把上一次的结果冲掉了, 想回头对比只能重跑。现在每次
+    都留痕, 页面上按时间列出来随便翻。
+
+    trades 原样存 JSON(回测多加一列也不用动表结构), params 记录这次跑的
+    参数, 汇总指标(笔数/胜率/累计收益)顺手算好存下来, 免得页面为了画
+    一个列表把每条的明细全解一遍。
+
+    is_standard=True 标记这条是"线上标准策略"那一跑, 主复盘表读最新的
+    那条标准跑批(见 load_backtest_trades)。"""
+    n, win, cum = _run_summary(trades)
     conn = _conn()
-    conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ("
-                 "id INTEGER PRIMARY KEY, data TEXT, params TEXT, saved_at REAL)")
-    conn.execute(f"DELETE FROM {table}")
-    conn.execute(
-        f"INSERT INTO {table} (id, data, params, saved_at) VALUES (1,?,?,?)",
-        (json.dumps(trades, ensure_ascii=False, default=str),
+    cur = conn.execute(
+        "INSERT INTO strategydb.strategy_runs "
+        "(run_at, label, params, trades, is_standard, n_trades, win_rate, cum_return) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (time.time(), label or describe_run(params),
          json.dumps(params or {}, ensure_ascii=False, default=str),
-         time.time()))
+         json.dumps(trades, ensure_ascii=False, default=str),
+         1 if is_standard else 0, n, win, cum))
     conn.commit()
+    run_id = cur.lastrowid
     conn.close()
+    return run_id
 
 
-def load_backtest_trades(table: str = "backtest_trades") -> tuple:
-    """→ (DataFrame, params dict, saved_at unix秒)。没跑过回测返回
-    (None, {}, None)——调用方(app)据此决定是否隐藏整个复盘区。
-    table 见 BACKTEST_TABLES(默认标准策略那张)。"""
-    if table not in {t for t, _ in BACKTEST_TABLES.values()}:
-        raise ValueError(f"未知的回测明细表: {table}")
+def list_strategy_runs(limit: int = 50) -> list:
+    """→ [{id, run_at, label, params, is_standard, n_trades, win_rate,
+    cum_return}, ...],新的在前。不带 trades(明细按需再取, 见
+    load_strategy_run), 免得列一页把几十份明细全读进内存。"""
     conn = _conn()
-    conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ("
-                 "id INTEGER PRIMARY KEY, data TEXT, params TEXT, saved_at REAL)")
-    row = conn.execute(
-        f"SELECT data, params, saved_at FROM {table} WHERE id=1").fetchone()
+    rows = conn.execute(
+        "SELECT id, run_at, label, params, is_standard, n_trades, win_rate,"
+        " cum_return FROM strategydb.strategy_runs "
+        "ORDER BY run_at DESC, id DESC LIMIT ?", (limit,)).fetchall()
     conn.close()
-    if not row or not row["data"]:
+    out = []
+    for r in rows:
+        try:
+            p = json.loads(r["params"]) if r["params"] else {}
+        except Exception:
+            p = {}
+        out.append({"id": r["id"], "run_at": r["run_at"], "label": r["label"],
+                    "params": p, "is_standard": bool(r["is_standard"]),
+                    "n_trades": r["n_trades"], "win_rate": r["win_rate"],
+                    "cum_return": r["cum_return"]})
+    return out
+
+
+def load_strategy_run(run_id: int) -> tuple:
+    """→ (DataFrame, params dict, run_at unix秒);取不到返回 (None, {}, None)。"""
+    conn = _conn()
+    row = conn.execute(
+        "SELECT trades, params, run_at FROM strategydb.strategy_runs WHERE id=?",
+        (run_id,)).fetchone()
+    conn.close()
+    if not row or not row["trades"]:
         return None, {}, None
     try:
-        trades = json.loads(row["data"])
+        trades = json.loads(row["trades"])
         params = json.loads(row["params"]) if row["params"] else {}
     except Exception as e:
-        logger.warning("回测明细解析失败: %s", e)
+        logger.warning("回测明细解析失败(run %s): %s", run_id, e)
         return None, {}, None
     if not trades:
-        return None, params, row["saved_at"]
-    return pd.DataFrame(trades), params, row["saved_at"]
+        return None, params, row["run_at"]
+    return pd.DataFrame(trades), params, row["run_at"]
+
+
+def load_backtest_trades() -> tuple:
+    """最新一次**标准策略**跑批的明细 → (DataFrame, params, run_at)。
+    没跑过返回 (None, {}, None)——调用方(app)据此决定是否隐藏整个复盘区。"""
+    conn = _conn()
+    row = conn.execute(
+        "SELECT id FROM strategydb.strategy_runs WHERE is_standard=1 "
+        "ORDER BY run_at DESC, id DESC LIMIT 1").fetchone()
+    conn.close()
+    if not row:
+        return None, {}, None
+    return load_strategy_run(row["id"])
 
 
 def save_backtest_notes(notes: dict) -> None:
-    """回测逐笔点评落库(表 backtest_notes,按买入日索引)。
+    """回测逐笔点评落库(strategydb.backtest_notes,按买入日索引)。
 
-    单独一张表而不是塞进 backtest_trades:那张表每次回测整表覆盖,
-    分开写只是省事(不用去改 JSON blob),不是为了长期保存点评——
-    点评本来就是每次重跑回测后重写一遍的。
+    单独一张表而不是塞进 strategy_runs 的 JSON:点评是人写的、跨多次
+    跑批复用(同一个买入日换了参数还是那天的行情), 而 strategy_runs
+    每跑一次追加一条, 塞进去就得每次重抄一遍。
     upsert 语义:只覆盖传进来的买入日。"""
     conn = _conn()
-    conn.execute("CREATE TABLE IF NOT EXISTS backtest_notes ("
-                 "buy_date TEXT PRIMARY KEY, note TEXT, saved_at REAL)")
     now = time.time()
     conn.executemany(
-        "INSERT OR REPLACE INTO backtest_notes (buy_date, note, saved_at) "
-        "VALUES (?,?,?)",
+        "INSERT OR REPLACE INTO strategydb.backtest_notes "
+        "(buy_date, note, saved_at) VALUES (?,?,?)",
         [(str(d), str(n), now) for d, n in notes.items()])
     conn.commit()
     conn.close()
@@ -1900,9 +1987,8 @@ def save_backtest_notes(notes: dict) -> None:
 def load_backtest_notes() -> dict:
     """{买入日: 点评};没有则空 dict。"""
     conn = _conn()
-    conn.execute("CREATE TABLE IF NOT EXISTS backtest_notes ("
-                 "buy_date TEXT PRIMARY KEY, note TEXT, saved_at REAL)")
-    rows = conn.execute("SELECT buy_date, note FROM backtest_notes").fetchall()
+    rows = conn.execute(
+        "SELECT buy_date, note FROM strategydb.backtest_notes").fetchall()
     conn.close()
     return {r["buy_date"]: r["note"] for r in rows}
 
