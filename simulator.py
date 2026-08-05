@@ -50,7 +50,13 @@ def init_sim_db():
         );
     """)
     # The trading calendar (MIN/MAX/DISTINCT over date) needs this; one-time build.
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_nav_date ON fund_nav_daily(date)")
+    # 云端两段式下净值表可能还没落地(此刻 main 里是空占位表),建在占位表上
+    # 没意义也没害处;真表到位后由 fetcher.adopt_nav_db 负责建索引。
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_nav_date ON fund_nav_daily(date)")
+    except Exception:
+        pass
     # Archives carry their run's start date (migration for existing DBs).
     try:
         conn.execute("ALTER TABLE sim_archives ADD COLUMN start_date TEXT")

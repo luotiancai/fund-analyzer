@@ -17,9 +17,20 @@ trap 'rm -rf "$TMPDIR"' EXIT
 echo "压缩 $(du -h "$DB" | cut -f1) 的数据库…"
 gzip -9 -c "$DB" > "$TMPDIR/fund_cache.db.gz"
 
+# 应用侧启动只拉 core(gz ~2MB),重表(净值/持仓/规模)首屏之后后台拉。
+# 整库那份仍要传:每日跑批拿它当上一轮的底子,也是应用侧的回退路径。
+echo "切分两段式快照…"
+python3 build_snapshot.py "$DB" \
+  "$TMPDIR/fund_cache_core.db" "$TMPDIR/fund_cache_nav.db"
+gzip -9 -c "$TMPDIR/fund_cache_core.db" > "$TMPDIR/fund_cache_core.db.gz"
+gzip -9 -c "$TMPDIR/fund_cache_nav.db"  > "$TMPDIR/fund_cache_nav.db.gz"
+
 gh release create data --title "数据快照" \
-  --notes "每日跑批产物 fund_cache.db.gz,应用启动时自动拉取,请勿手动改动" \
+  --notes "每日跑批产物,应用启动时自动拉取,请勿手动改动" \
   2>/dev/null || true
-echo "上传 $(du -h "$TMPDIR/fund_cache.db.gz" | cut -f1)…"
-gh release upload data "$TMPDIR/fund_cache.db.gz" --clobber
+echo "上传 $(du -ch "$TMPDIR"/*.gz | tail -1 | cut -f1)…"
+gh release upload data \
+  "$TMPDIR/fund_cache.db.gz" \
+  "$TMPDIR/fund_cache_core.db.gz" \
+  "$TMPDIR/fund_cache_nav.db.gz" --clobber
 echo "✅ 已上传,线上页面最迟 1 小时内自动换用新快照"

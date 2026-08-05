@@ -53,5 +53,11 @@ jobs:
         run: |
           echo "补上了: ${{ steps.qvix.outputs.filled }}"
           gzip -9 -c "$FUND_ANALYZER_DATA/fund_cache.db" > fund_cache.db.gz
-          gh release upload data fund_cache.db.gz --clobber \
-            --repo "$GITHUB_REPOSITORY"
+          # QVIX 只落在 core 那一半(qvix_self_history),重表没动;但 core 与
+          # nav 必须同版本发布,否则应用侧两半的数据日期会对不上。
+          python build_snapshot.py "$FUND_ANALYZER_DATA/fund_cache.db" \
+            fund_cache_core.db fund_cache_nav.db
+          gzip -9 -c fund_cache_core.db > fund_cache_core.db.gz
+          gzip -9 -c fund_cache_nav.db  > fund_cache_nav.db.gz
+          gh release upload data fund_cache.db.gz fund_cache_core.db.gz \
+            fund_cache_nav.db.gz --clobber --repo "$GITHUB_REPOSITORY"

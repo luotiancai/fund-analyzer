@@ -65,6 +65,23 @@ CACHE_DB = os.path.join(_DATA_DIR, "fund_cache.db")
 _LEGACY_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "fund_cache.db")
 
+# ── 云端两段式快照 ────────────────────────────────────────────────────────────
+# 净值/持仓/规模这三张表占整库 99%(净值表 250MB + 它的 date 索引 120MB,
+# 其余所有表加起来 9MB),而首屏(上证指数+QVIX+榜单)一行都不读它们——要等
+# 用户点进筛选/详情/模拟盘才用得上。所以云端把库切成两段(见
+# build_snapshot.py):core 启动时同步拉(gz 2MB,拉完首屏立刻能画),重表库
+# 首屏之后后台拉(gz 63MB),落地后 ATTACH 进来接管。
+# 本地是单库,LAZY_NAV 恒为 False,下面这些全部不生效。
+NAV_DB = os.path.join(_DATA_DIR, "fund_cache_nav.db")
+HEAVY_TABLES = ("fund_nav_daily", "fund_holdings", "fund_scale_hist")
+LAZY_NAV = False       # app.py 在云端两段式模式下置 True
+_nav_ready = False     # 重表库是否已落地并接管(仅 LAZY_NAV 下有意义)
+
+
+def nav_ready() -> bool:
+    """重表(净值/持仓/规模)是否已可用。本地单库恒为 True。"""
+    return not LAZY_NAV or _nav_ready
+
 
 def _migrate_db_location():
     """One-time move of an existing fund_cache.db out of the project dir.
@@ -108,7 +125,83 @@ def _conn():
     # lock instead of failing with "database is locked".
     conn = sqlite3.connect(CACHE_DB, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
+    # 重表在另一个库里时挂上来:SQLite 解析不带库名的表名会依次找
+    # temp→main→attached,所以那七十来处 "FROM fund_nav_daily" 一个字都不用
+    # 改。挂载条件用文件是否存在(os.replace 让它原子出现)而不是
+    # _nav_ready:后者要等 main 里的空占位表删掉才置位,提前挂上只是被占位
+    # 表遮蔽、查到空结果,不会报错。
+    if LAZY_NAV and os.path.exists(NAV_DB):
+        conn.execute("ATTACH DATABASE ? AS navdb", (NAV_DB,))
     return conn
+
+
+def adopt_nav_db():
+    """重表库落盘后让它接管:删掉 main 里的空占位表(否则会遮蔽 ATTACH 上来
+    的真表),再把 idx_nav_date 建回去。
+
+    索引不随快照下发(它占 120MB,是整库三成,却是纯派生数据):4.9M 行现建
+    实测 1~2 秒,比多下 17MB(gz)划算。
+    """
+    global _nav_ready
+    conn = sqlite3.connect(CACHE_DB, timeout=30)
+    try:
+        for t in HEAVY_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {t}")
+        conn.commit()
+    finally:
+        conn.close()
+    conn = _conn()
+    try:
+        # 必须写成 navdb.idx_nav_date:CREATE INDEX 不带库名一律建在 main,
+        # 而 SQLite 要求索引和表同库,表在 navdb 里的话会直接报 no such
+        # table(读表名的 temp→main→attached 解析顺序在这儿不适用)。
+        conn.execute("CREATE INDEX IF NOT EXISTS navdb.idx_nav_date "
+                     "ON fund_nav_daily(date)")
+        conn.commit()
+    finally:
+        conn.close()
+    # 索引建完才解锁 UI:置位早了的话,刚放行的模拟盘头几秒要全表扫日期。
+    # 这期间查询本身是对的(占位表已删,_conn 已挂上 navdb),只是慢。
+    _nav_ready = True
+    logger.info("nav db adopted: %s", NAV_DB)
+
+
+# 重表的建表语句单独拎出来:云端两段式下它们由 navdb 提供,main 里不能有
+# 同名表,否则会遮蔽 ATTACH 上来的真表(见 _conn / adopt_nav_db)。
+_DDL_HEAVY = """
+    -- One row per fund per day: appends are single-row INSERTs instead of
+    -- rewriting a whole per-fund JSON blob (the old fund_nav design, which
+    -- churned ~20KB of freelist pages per fund per update).
+    CREATE TABLE IF NOT EXISTS fund_nav_daily (
+        code          TEXT NOT NULL,
+        date          TEXT NOT NULL,    -- ISO yyyy-mm-dd
+        nav           REAL,
+        daily_ret_pct REAL,
+        acc_nav       REAL,
+        PRIMARY KEY (code, date)
+    ) WITHOUT ROWID;
+    -- Quarterly top-10 holdings (stocks + bonds) per fund, one year of
+    -- quarters per row, stored as normalized JSON records.
+    CREATE TABLE IF NOT EXISTS fund_holdings (
+        code     TEXT NOT NULL,
+        year     TEXT NOT NULL,
+        data     TEXT NOT NULL,
+        saved_at REAL NOT NULL,
+        PRIMARY KEY (code, year)
+    ) WITHOUT ROWID;
+    -- 基金季度规模(期末净资产)历史,来自 pingzhongdata 的
+    -- Data_fluctuationScale。一支基金一季一行,aum 单位亿元,publish_date
+    -- 是该季报的估算披露日(季末+滞后天数,见 _SCALE_PUB_LAG),供回测/选基
+    -- 按"信号日当时能看到的最新一期"取规模、避免未来函数。
+    CREATE TABLE IF NOT EXISTS fund_scale_hist (
+        code         TEXT NOT NULL,
+        quarter_end  TEXT NOT NULL,   -- ISO yyyy-mm-dd(季末)
+        aum          REAL,            -- 期末净资产,亿元
+        publish_date TEXT NOT NULL,   -- 估算披露日 ISO yyyy-mm-dd
+        saved_at     REAL NOT NULL,
+        PRIMARY KEY (code, quarter_end)
+    ) WITHOUT ROWID;
+"""
 
 
 def init_db():
@@ -122,17 +215,6 @@ def init_db():
             data     TEXT    NOT NULL,
             saved_at REAL    NOT NULL
         );
-        -- One row per fund per day: appends are single-row INSERTs instead of
-        -- rewriting a whole per-fund JSON blob (the old fund_nav design, which
-        -- churned ~20KB of freelist pages per fund per update).
-        CREATE TABLE IF NOT EXISTS fund_nav_daily (
-            code          TEXT NOT NULL,
-            date          TEXT NOT NULL,    -- ISO yyyy-mm-dd
-            nav           REAL,
-            daily_ret_pct REAL,
-            acc_nav       REAL,
-            PRIMARY KEY (code, date)
-        ) WITHOUT ROWID;
         -- Per-fund freshness + newest stored date, so gap detection and TTL
         -- checks never have to scan fund_nav_daily.
         CREATE TABLE IF NOT EXISTS fund_nav_meta (
@@ -153,15 +235,6 @@ def init_db():
             value    REAL,
             saved_at REAL NOT NULL
         );
-        -- Quarterly top-10 holdings (stocks + bonds) per fund, one year of
-        -- quarters per row, stored as normalized JSON records.
-        CREATE TABLE IF NOT EXISTS fund_holdings (
-            code     TEXT NOT NULL,
-            year     TEXT NOT NULL,
-            data     TEXT NOT NULL,
-            saved_at REAL NOT NULL,
-            PRIMARY KEY (code, year)
-        ) WITHOUT ROWID;
         -- Top rows (200) of each distinct filter run, keyed by a hash of the
         -- filter params (+ metrics version in live mode), so repeating a
         -- filter is a read instead of a recompute — across restarts too.
@@ -186,18 +259,6 @@ def init_db():
             index_code TEXT NOT NULL,
             saved_at   REAL NOT NULL
         );
-        -- 基金季度规模(期末净资产)历史,来自 pingzhongdata 的
-        -- Data_fluctuationScale。一支基金一季一行,aum 单位亿元,publish_date
-        -- 是该季报的估算披露日(季报quarter_end+滞后天数,见 _SCALE_PUB_LAG),
-        -- 供回测/选基按"信号日当时能看到的最新一期"取规模、避免未来函数。
-        CREATE TABLE IF NOT EXISTS fund_scale_hist (
-            code         TEXT NOT NULL,
-            quarter_end  TEXT NOT NULL,   -- ISO yyyy-mm-dd(季末)
-            aum          REAL,            -- 期末净资产,亿元
-            publish_date TEXT NOT NULL,   -- 估算披露日 ISO yyyy-mm-dd
-            saved_at     REAL NOT NULL,
-            PRIMARY KEY (code, quarter_end)
-        ) WITHOUT ROWID;
         -- 规模抓取"抓了但一行都没有"的记录(F10 无规模变动表的基金:刚成立、
         -- 已清盘、场内份额等)。没有这张表的话它们在 fund_scale_hist 里永远
         -- 留不下痕迹,每天跑批都要重抓一遍(扩到全榜单后是几千次白请求)。
@@ -206,6 +267,12 @@ def init_db():
             tried_at REAL NOT NULL
         ) WITHOUT ROWID;
     """)
+    # 重表:本地/单库模式照常建。云端两段式下重表库还没落地时先建空占位表,
+    # 让所有查询返回空结果而不是 "no such table" 把页面炸掉;落地后由
+    # adopt_nav_db 删掉占位表、让 ATTACH 上来的真表接管(之后不能再建回去,
+    # 否则又把真表遮蔽了)。
+    if not (LAZY_NAV and _nav_ready):
+        conn.executescript(_DDL_HEAVY)
     # Add per-period max-drawdown / Sharpe / return columns (migration for
     # existing DBs). Returns are recomputed locally from stored NAV because the
     # EastMoney rank list's 近X收益率 columns lag its own nav_date in the

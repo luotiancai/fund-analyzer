@@ -63,10 +63,18 @@ jobs:
             python update_daily.py
           fi
       - name: 压缩并回传数据库
+        # 三个资产:整库(下次跑批的底子 + 应用侧回退路径)、core(应用启动时
+        # 同步拉,gz ~2MB)、nav(重表,应用首屏之后后台拉)。拆分口径见
+        # build_snapshot.py。
         run: |
           gzip -9 -c "$FUND_ANALYZER_DATA/fund_cache.db" > fund_cache.db.gz
+          python build_snapshot.py "$FUND_ANALYZER_DATA/fund_cache.db" \
+            fund_cache_core.db fund_cache_nav.db
+          gzip -9 -c fund_cache_core.db > fund_cache_core.db.gz
+          gzip -9 -c fund_cache_nav.db  > fund_cache_nav.db.gz
+          ls -lh fund_cache*.gz
           gh release create data --title "数据快照" \
-            --notes "每日跑批产物 fund_cache.db.gz,应用启动时自动拉取,请勿手动改动" \
+            --notes "每日跑批产物,应用启动时自动拉取,请勿手动改动" \
             --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
-          gh release upload data fund_cache.db.gz --clobber \
-            --repo "$GITHUB_REPOSITORY"
+          gh release upload data fund_cache.db.gz fund_cache_core.db.gz \
+            fund_cache_nav.db.gz --clobber --repo "$GITHUB_REPOSITORY"

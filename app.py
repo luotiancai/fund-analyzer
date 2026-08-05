@@ -7,6 +7,7 @@ import json
 import math
 import os
 import shutil
+import threading
 import time
 from zoneinfo import ZoneInfo
 import numpy as np
@@ -66,12 +67,54 @@ def _get_rf() -> float:
 # ── 云端数据引导 ──────────────────────────────────────────────────────────────
 # Streamlit Community Cloud 的容器磁盘是临时的:数据库由 GitHub Actions 每日
 # 跑批后上传到 Release(tag `data`,见 .github/workflows/update-daily.yml),
-# 应用启动时/每小时比对 asset 的 updated_at,变了才重新下载(~gzip 压缩传输)。
+# 应用启动时/每小时比对 asset 的版本戳,变了才重新下载(gzip 压缩传输)。
 # 本地开发机(库已存在且无 marker 文件)完全跳过,零网络开销。
 # marker 同时充当"云端只读模式"开关:存在则隐藏「更新数据」按钮。
-_DB_ASSET_URL = ("https://github.com/luotiancai/fund-analyzer/"
-                 "releases/download/data/fund_cache.db.gz")
+#
+# 快照是两段式的(见 build_snapshot.py):core 只有 gz 2MB,首屏(上证+QVIX+
+# 榜单)要的表全在里面,同步拉;净值/持仓/规模三张重表 gz 63MB,首屏一行都
+# 不读,启动后台拉、落地后 ATTACH 接管。整库快照 fund_cache.db.gz 仍在
+# Release 里(跑批要拿它当底子),两段式资产缺失时自动退回去拉它。
+_DB_BASE = os.environ.get("FUND_ANALYZER_RELEASE_BASE") or (
+    "https://github.com/luotiancai/fund-analyzer/releases/download/data/")
+_CORE_ASSET = _DB_BASE + "fund_cache_core.db.gz"
+_NAV_ASSET = _DB_BASE + "fund_cache_nav.db.gz"
+_FULL_ASSET = _DB_BASE + "fund_cache.db.gz"
 _DB_MARKER = fetcher.CACHE_DB + ".from-release"
+_NAV_MARKER = fetcher.NAV_DB + ".from-release"
+
+
+def _download_gz(url: str, dest: str, marker: str) -> bool:
+    """拉 gz 资产解压到 dest,marker 存版本戳;返回 dest 是否就位。
+
+    直连下载地址(302 到对象存储),不走 api.github.com:未认证 API 每 IP
+    每小时限 60 次,Streamlit Cloud 出口 IP 共享极易 403,引导一失败就退成
+    空库。用响应头 ETag 当版本戳,没变就提前断开不下载。
+    """
+    have = os.path.exists(dest) and os.path.getsize(dest) > 1024
+    try:
+        dl = requests.get(url, stream=True, timeout=600)
+        dl.raise_for_status()
+    except Exception:
+        return have                      # 拉不到:有旧快照就先用着
+    with dl:
+        stamp = (dl.headers.get("ETag")
+                 or dl.headers.get("Last-Modified") or "")
+        if (have and stamp and os.path.exists(marker)
+                and open(marker).read().strip() == stamp):
+            return True                  # 版本没变
+        tmp = dest + ".tmp"
+        try:
+            with open(tmp, "wb") as f, gzip.GzipFile(fileobj=dl.raw) as gz:
+                shutil.copyfileobj(gz, f)
+            os.replace(tmp, dest)
+            with open(marker, "w") as m:
+                m.write(stamp)
+            return True
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            return have                  # 下载失败:继续用旧快照
 
 
 @st.cache_resource(ttl=3600, show_spinner="正在同步云端数据库…")
@@ -84,38 +127,46 @@ def _sync_db_from_release() -> bool:
                and os.path.getsize(fetcher.CACHE_DB) > 1024 * 1024)
     if have_db and not os.path.exists(_DB_MARKER):
         return False                     # 本地自有数据库,不碰
-    try:
-        # 直连下载地址(302 到对象存储),不走 api.github.com:未认证 API
-        # 每 IP 每小时限 60 次,Streamlit Cloud 出口 IP 共享极易 403,
-        # 引导一失败就退成空库。用响应头 ETag 当版本戳,没变就不重下。
-        dl = requests.get(_DB_ASSET_URL, stream=True, timeout=600)
-        dl.raise_for_status()
-    except Exception:
-        return have_db                   # 拉不到:有旧快照就先用着
-    with dl:
-        stamp = (dl.headers.get("ETag")
-                 or dl.headers.get("Last-Modified") or "")
-        if (have_db and stamp
-                and open(_DB_MARKER).read().strip() == stamp):
-            return True                  # 版本没变,提前断开不下载
-        tmp = fetcher.CACHE_DB + ".tmp"
+    if _download_gz(_CORE_ASSET, fetcher.CACHE_DB, _DB_MARKER):
+        fetcher.LAZY_NAV = True          # 重表另库,由 _start_nav_download 接
+        return True
+    return _download_gz(_FULL_ASSET, fetcher.CACHE_DB, _DB_MARKER) or have_db
+
+
+@st.cache_resource(ttl=3600, show_spinner=False)
+def _start_nav_download():
+    """后台线程拉重表库,拉完让它接管。首屏不等这个线程。
+
+    起线程而不是同步拉:63MB 挡在首屏前面就白拆了。期间需要净值的三处
+    (筛选/详情/模拟盘)由 fetcher.nav_ready() 挡住,显示"加载中"而不是
+    拿空表算出一堆看着合理的错数。
+
+    TTL 与 _sync_db_from_release 一致(1h):跑批发新快照后 core 会换成当天
+    的,重表这半也得跟着换,否则两半的数据日期能差出一天。ETag 没变时
+    _download_gz 直接返回、不重下,adopt_nav_db 本身幂等,空跑代价接近零。
+    """
+    def _work():
         try:
-            with open(tmp, "wb") as f, gzip.GzipFile(fileobj=dl.raw) as gz:
-                shutil.copyfileobj(gz, f)
-            os.replace(tmp, fetcher.CACHE_DB)
-            with open(_DB_MARKER, "w") as m:
-                m.write(stamp)
-            return True
+            if _download_gz(_NAV_ASSET, fetcher.NAV_DB, _NAV_MARKER):
+                fetcher.adopt_nav_db()
         except Exception:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-            if have_db:
-                return True              # 下载失败:继续用旧快照
-            raise
+            fetcher.logger.exception("nav db 后台下载失败")
+
+    t = threading.Thread(target=_work, name="nav-db-download", daemon=True)
+    t.start()
+    return t
 
 
 _IS_CLOUD = _sync_db_from_release()
 _init_db_once()
+if fetcher.LAZY_NAV:
+    _start_nav_download()
+
+
+def _nav_notice(what: str):
+    """重表还在后台下载时的占位提示。"""
+    st.info(f"⏳ 正在后台加载净值数据（约 60MB，仅本次启动需要一次），"
+            f"{what}要等它就位。稍等十几秒后再点一次即可。")
 
 # ── 更新数据(仅本地)────────────────────────────────────────────────────────
 # 侧边栏已整体移除:云端数据由每日跑批自动更新,无需任何入口;
@@ -443,6 +494,11 @@ with tab_table:
         st.session_state.filter_page_no = 1
         st.session_state.filter_picked = set()
     filter_ready = st.session_state.get("filter_applied", False)
+    # 筛选要读净值(重算指标、按区间剔除历史不足的基金),云端重表还在后台
+    # 下载时先挡住:空表算出来的结果看着像模像样,其实全错。
+    if filter_ready and not fetcher.nav_ready():
+        _nav_notice("筛选")
+        filter_ready = False
 
     ret_col, mdd_col, sharpe_col = PERIODS[period_label]
 
@@ -848,6 +904,10 @@ with tab_table:
 # ─── Tab 2: Fund detail ───────────────────────────────────────────────────────
 with tab_detail:
     code_input = st.text_input("输入基金代码（6位数字）", placeholder="例如 000001")
+    # 净值/持仓/规模都在重表里,云端后台下载完之前当作"没输入代码"处理。
+    if code_input and not fetcher.nav_ready():
+        _nav_notice("基金详情")
+        code_input = ""
     if code_input:
         with st.spinner(f"加载 {code_input} 净值历史…"):
             nav_df = load_nav(code_input.strip().zfill(6))
@@ -986,7 +1046,10 @@ with tab_sim:
     _code_names = dict(zip(fund_df["code"], fund_df["name"]))
     sim_date = simulator.get_current_date()
 
-    if sim_date is None:
+    # 模拟盘的交易日历、成交净值、持仓市值全部来自净值表。
+    if not fetcher.nav_ready():
+        _nav_notice("模拟盘")
+    elif sim_date is None:
         st.warning("本地还没有净值数据，请先点击侧边栏「🔄 更新数据」。")
     else:
         # Flash message from the previous action (survives st.rerun).
