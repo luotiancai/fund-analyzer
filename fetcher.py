@@ -1819,8 +1819,8 @@ def save_qvix_self_threshold(dates: list, thresholds: list) -> None:
 # 路径一个字都不用碰。表名写死在这里, 不接受外部拼接。
 BACKTEST_TABLES = {
     "standard": ("backtest_trades", "标准策略:近3月跌幅最大"),
-    "regime_3m": ("backtest_regime_3m", "对照:按大盘择向(3月口径)"),
-    "regime_1m": ("backtest_regime_1m", "对照:按大盘择向(1月口径)"),
+    "regime_3m": ("backtest_regime_3m", "对照:大盘当日涨跌择向(近3月排名)"),
+    "regime_1m": ("backtest_regime_1m", "对照:大盘当日涨跌择向(近1月排名)"),
 }
 
 
