@@ -1812,8 +1812,23 @@ def save_qvix_self_threshold(dates: list, thresholds: list) -> None:
     conn.close()
 
 
-def save_backtest_trades(trades: list, params: Optional[dict] = None) -> None:
+# 对照实验的回测明细各存一张独立表, 表结构跟 backtest_trades 完全一样
+# (id=1 单行 + JSON blob)。为什么不在 backtest_trades 里加个 variant 列分槽:
+# 那张表是线上标准策略在用的, 改结构要迁移老库、还要动 app 的读法,
+# 而对照实验本来就是偶尔跑一次的旁支——多建两张表零风险, 标准策略那条
+# 路径一个字都不用碰。表名写死在这里, 不接受外部拼接。
+BACKTEST_TABLES = {
+    "standard": ("backtest_trades", "标准策略:近3月跌幅最大"),
+    "regime_3m": ("backtest_regime_3m", "对照:按大盘择向(3月口径)"),
+    "regime_1m": ("backtest_regime_1m", "对照:按大盘择向(1月口径)"),
+}
+
+
+def save_backtest_trades(trades: list, params: Optional[dict] = None,
+                         table: str = "backtest_trades") -> None:
     """标准策略回测明细落库(表 backtest_trades),供 app「策略复盘」表直接读。
+
+    table 只用于对照实验(见 BACKTEST_TABLES), 默认写标准策略那张。
 
     以前这张表是硬编码在 app.py 里的一堆列表字面量,每次重跑回测都要手抄
     一遍数字进页面——既容易抄错,也让"页面上的数"和"回测真正跑出来的数"
@@ -1823,12 +1838,14 @@ def save_backtest_trades(trades: list, params: Optional[dict] = None) -> None:
     整表覆盖(每次回测都是全量重跑,增量没有意义)。trades 原样存 JSON,
     以后回测多加一列也不用动表结构。params 记录跑这次用的参数,页面上
     要标注口径时可以取。"""
+    if table not in {t for t, _ in BACKTEST_TABLES.values()}:
+        raise ValueError(f"未知的回测明细表: {table}")
     conn = _conn()
-    conn.execute("CREATE TABLE IF NOT EXISTS backtest_trades ("
+    conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ("
                  "id INTEGER PRIMARY KEY, data TEXT, params TEXT, saved_at REAL)")
-    conn.execute("DELETE FROM backtest_trades")
+    conn.execute(f"DELETE FROM {table}")
     conn.execute(
-        "INSERT INTO backtest_trades (id, data, params, saved_at) VALUES (1,?,?,?)",
+        f"INSERT INTO {table} (id, data, params, saved_at) VALUES (1,?,?,?)",
         (json.dumps(trades, ensure_ascii=False, default=str),
          json.dumps(params or {}, ensure_ascii=False, default=str),
          time.time()))
@@ -1836,14 +1853,17 @@ def save_backtest_trades(trades: list, params: Optional[dict] = None) -> None:
     conn.close()
 
 
-def load_backtest_trades() -> tuple:
+def load_backtest_trades(table: str = "backtest_trades") -> tuple:
     """→ (DataFrame, params dict, saved_at unix秒)。没跑过回测返回
-    (None, {}, None)——调用方(app)据此决定是否隐藏整个复盘区。"""
+    (None, {}, None)——调用方(app)据此决定是否隐藏整个复盘区。
+    table 见 BACKTEST_TABLES(默认标准策略那张)。"""
+    if table not in {t for t, _ in BACKTEST_TABLES.values()}:
+        raise ValueError(f"未知的回测明细表: {table}")
     conn = _conn()
-    conn.execute("CREATE TABLE IF NOT EXISTS backtest_trades ("
+    conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ("
                  "id INTEGER PRIMARY KEY, data TEXT, params TEXT, saved_at REAL)")
     row = conn.execute(
-        "SELECT data, params, saved_at FROM backtest_trades WHERE id=1").fetchone()
+        f"SELECT data, params, saved_at FROM {table} WHERE id=1").fetchone()
     conn.close()
     if not row or not row["data"]:
         return None, {}, None
