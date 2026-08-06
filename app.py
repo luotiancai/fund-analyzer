@@ -1878,11 +1878,18 @@ with tab_sse:
                         _rule = f"买{_x_win}涨幅最大的(动量)。"
                     else:
                         _rule = f"买{_x_win}跌幅最大的(反转)。"
+                    # 过滤条件逐项列出来, 不写"与标准策略一致"——对照实验
+                    # 改的可能正是其中某一项(如规模门槛), 那句话会自相矛盾。
+                    # 跟标准策略(波动≥1.5/规模≥0.5亿)不同的值加粗标出来。
+                    def _mark(val, std):
+                        return f"**{val}**" if val != std else f"{val}"
+                    _vr = _x_params.get("min_vol_ratio", 1.5)
+                    _aum = _x_params.get("min_aum", 0.5)
                     st.caption(
                         f"规则:{_rule}"
-                        f"其余(波动率比值≥{_x_params.get('min_vol_ratio', 1.5)}、"
-                        f"规模≥{_x_params.get('min_aum', 0.5)}亿、双止损)"
-                        f"与标准策略一致。"
+                        f"候选须满足波动率比值≥{_mark(_vr, 1.5)}、"
+                        f"规模≥{_mark(_aum, 0.5)}亿,双止损口径同标准策略"
+                        f"(粗体=与标准策略不同的参数)。"
                         f"　{_x_n} 笔已完成:胜率 {_x_wins / _x_n * 100:.1f}%"
                         f"({_x_wins}/{_x_n}),费后复利 {_x_cum:+.2f}%,"
                         f"平均持有 {_x_days.mean():.0f} 天,"

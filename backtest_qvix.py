@@ -305,6 +305,36 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
     return None, 0
 
 
+def sse_change_asof(sse_df, asof_date, days=91):
+    """信号日视角下上证相对 ~days 天前的涨跌幅(%), **截至前一交易日**。
+
+    跟 sse_day_change 是两种择向依据, 各有各的道理, 由 --regime-basis 选:
+      · "window"(本函数): 跟基金排名对齐。基金排名只能是 T-1 口径(净值
+        当晚才公布), 那么"大盘在这个排名窗口里是涨是跌"也用同一个窗口的
+        终点, 两边口径一致;
+      · "day"(sse_day_change): 跟信号对齐。QVIX 信号用的是 T 当天的实时值,
+        指数也是实时的, 决策那一刻就能看见今天这根K线。
+    这套系统本来就混时间轴(信号看 T、排名看 T-1), 没有唯一正确的对齐方式。
+
+    基准点取"最后一个可见交易日往前 days 个自然日"的最近收盘, 落在非
+    交易日就顺延到之前最近那天。days 由调用方按 ret_col 传
+    (fetcher.RETURN_DAYS: ret_1m=30/ret_3m=91)。
+    """
+    end = pd.Timestamp(asof_date)
+    hist = sse_df[sse_df["date"] < end]
+    if hist.empty:
+        return None
+    last_date = hist.iloc[-1]["date"]
+    last_close = float(hist.iloc[-1]["close"])
+    ref = hist[hist["date"] <= last_date - timedelta(days=days)]
+    if ref.empty or not ref.iloc[-1]["close"]:
+        return None
+    ref_close = float(ref.iloc[-1]["close"])
+    if not ref_close:
+        return None
+    return (last_close / ref_close - 1) * 100
+
+
 def sse_day_change(sse_df, asof_date):
     """信号日**当天**上证的单日涨跌幅(%), 取不到返回 None.
 
@@ -375,7 +405,8 @@ def get_fund_nav_after(conn, code, from_date):
 def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  min_corr: float = None, ret_col: str = "ret_3m", pick: str = "bottom",
                  min_vol_ratio: float = 1.5, dd_divisor: float = 5.0,
-                 min_aum: float = 0.5, require_drop: bool = True):
+                 min_aum: float = 0.5, require_drop: bool = True,
+                 regime_basis: str = "day", no_same_day_rebuy: bool = False):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
     的 475/490 那套道理)。默认 490/0.90 是当前线上在用的参数
@@ -529,6 +560,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
         day_str = day.strftime("%Y-%m-%d")
         sse_close = float(day_row["close"])
 
+        sold_today = None      # 今天止损卖出的代码(供 no_same_day_rebuy 用)
+
         # ── Step 1: 持仓时逐日检查双止损 ──
         if position is not None:
             nav_series = position["nav_map"]
@@ -593,27 +626,34 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                     "_sell_date": day,
                     "_ret_pct": ret_pct,
                 })
+                sold_today = code
                 position = None
 
         # ── Step 2: 空仓(含当天刚卖出)且为信号日时买入 ──
         if position is None and day in signal_map:
             threshold = signal_map[day]
-            # pick="regime": 方向由信号日**当天**上证是红是绿决定(见
-            # run_backtest 说明)——收涨就买回看窗口内涨幅最大的, 收跌就买
-            # 跌幅最大的。
-            # require_drop 恒为 True: 走"跌幅最大"分支时, 选中的基金必须
-            # 真的是负收益, 候选按跌幅从深到浅排、走到第一个非负值就当天
-            # 不操作(不退而求其次买涨幅最小的凑数, 那不是"跌幅最大"策略)。
-            # 走"涨幅最大"分支时这个参数不起作用(find_champion_on_date 里
-            # 那条判断带 pick == "bottom" 前提), 追涨那边照买不误。
+            # pick="regime": 方向由大盘状态决定, 依据看 regime_basis
+            # ("day"=信号日当天单日涨跌 / "window"=比一个回看窗口前、截至
+            # 前一交易日, 见两个函数的 docstring)。收涨买涨幅最大, 收跌买
+            # 跌幅最大; require_drop 照常传下去(走"跌幅最大"分支时要不要求
+            # 候选真的是负收益, 由参数定, 不在这里硬写)。
             _pick, _req_drop = pick, require_drop
-            sse_chg = sse_day_change(sse, day_str)
+            if regime_basis == "window":
+                sse_chg = sse_change_asof(sse, day_str,
+                                          fetcher.RETURN_DAYS[ret_col])
+            else:
+                sse_chg = sse_day_change(sse, day_str)
             if pick == "regime":
                 if sse_chg is None:
                     continue
                 _pick = "top" if sse_chg > 0 else "bottom"
-                _req_drop = True
-            code, ret_3m = find_champion_on_date(conn, day_str, exclude_codes,
+            # 止损卖出当天不许再买回同一只:双止损刚喊撤退就原地买回,
+            # 等于止损白做(#6 的 2024-11-18 就是这样, 卖出 017513 当天
+            # 又买回 017513, 接着亏 10.47%)。开关默认关, 保持旧行为。
+            _excl = exclude_codes
+            if no_same_day_rebuy and sold_today:
+                _excl = (set(exclude_codes) if exclude_codes else set()) | {sold_today}
+            code, ret_3m = find_champion_on_date(conn, day_str, _excl,
                                                  sse_df=sse, min_corr=min_corr,
                                                  ret_col=ret_col, pick=_pick,
                                                  min_vol_ratio=min_vol_ratio,
@@ -794,6 +834,12 @@ def main():
                         help="关掉「跌幅耗尽即不操作」规则:信号日即便所有候选都"
                              "是正收益也照买跌幅最大(涨幅最小)那个。默认保留该"
                              "规则(标准策略:没有真正下跌的标的当天就不买)")
+    parser.add_argument("--regime-basis", choices=["day", "window"], default="day",
+                        help="pick=regime 时的择向依据: day(默认)=信号日当天"
+                             "单日涨跌; window=比一个回看窗口前(截至前一交易日,"
+                             "跟基金排名同口径)")
+    parser.add_argument("--no-same-day-rebuy", action="store_true",
+                        help="止损卖出当天不许再买回同一只基金(默认允许)")
     parser.add_argument("--no-save", action="store_true",
                         help="这次不落库。默认每跑一次都追加一条到策略库"
                              "(strategydb.strategy_runs), 页面能翻到历史每一跑;"
@@ -810,7 +856,9 @@ def main():
                           min_vol_ratio=args.min_vol_ratio,
                           dd_divisor=args.dd_divisor,
                           min_aum=args.min_aum,
-                          require_drop=not args.no_require_drop)
+                          require_drop=not args.no_require_drop,
+                          regime_basis=args.regime_basis,
+                          no_same_day_rebuy=args.no_same_day_rebuy)
     elapsed = time.time() - t0
 
     if not trades:
@@ -830,14 +878,11 @@ def main():
         "window": args.window, "pct": args.pct, "ret_col": _ret_col,
         "pick": args.pick, "min_vol_ratio": args.min_vol_ratio,
         "dd_divisor": args.dd_divisor, "min_aum": args.min_aum,
-        # regime 模式下 require_drop 由代码强制置 True(跌向必须真跌),
-        # 不看命令行——早期几次跑批这里照抄了命令行默认值, 记录跟实际
-        # 行为对不上, 页面上的规则描述跟着说错。
-        "require_drop": True if args.pick == "regime" else not args.no_require_drop,
-        # 择向依据: "day"=信号日当天单日涨跌(现行), "window"=比一个回看
-        # 窗口前(截至前一日, 已弃用)。只对 pick="regime" 有意义, 留着是
-        # 为了历史跑批的规则描述不会被现行口径覆盖掉。
-        "regime_basis": "day" if args.pick == "regime" else None,
+        "require_drop": not args.no_require_drop,
+        # 择向依据("day"=当天单日涨跌 / "window"=比回看窗口前、截至前一日),
+        # 只对 pick="regime" 有意义。页面按它描述规则, 不同跑批各说各的。
+        "regime_basis": args.regime_basis if args.pick == "regime" else None,
+        "no_same_day_rebuy": args.no_same_day_rebuy,
     }
     if args.no_save:
         print("--no-save: 这次不落库")
