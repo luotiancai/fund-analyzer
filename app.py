@@ -1694,7 +1694,8 @@ with tab_sse:
         # 2018 年起(2015-2017 期权刚上市流动性薄、QVIX 计算噪声偏大,
         # 已整段剔除, 见 fetcher.py)。
         with st.expander("📜 策略复盘:QVIX 2年90%信号 + 近3月跌幅最大"
-                         "(波动率比值≥1.5 + 规模≥2亿,反转策略) + 基金/大盘双止损逐日盯盘",
+                         "(波动率比值≥1.5 + 规模≥2亿;无真跌则改买涨幅最大;"
+                         "止损后顺延至标的换掉) + 基金/大盘双止损逐日盯盘",
                           expanded=True):
             # 5% 定线依据(2026-07 校准,别随手改):大盘线 = 恐慌阈值/5,常态
             # 波动率(QVIX 20)下 ≈ 4 倍日σ;历史 12 次触发的固定线网格回测显示
@@ -1741,9 +1742,13 @@ with tab_sse:
                     f"{_n - 1} 笔累计仍有 {_cum_ex:+.2f}%——别把它当期望值,"
                     f"不依赖那笔运气结论也成立。亏损笔:{_loss_txt}。"
                     "样本只有个位数、跨度6年,统计上很薄,别当成可靠预期。"
-                    "候选须同时满足\"真正下跌 + 波动率比值≥1.5 + 规模≥2亿\","
-                    "其余信号日一律跳过不操作(2020年下半年那波尤其明显,"
-                    "QVIX反复触发但从没凑出过合格候选)。规模按信号日当时"
+                    "候选须同时满足\"真正下跌 + 波动率比值≥1.5 + 规模≥2亿\";"
+                    "当天找不到真跌的合格候选就改买涨幅最大的那只(2026-08-06 加,"
+                    "「选向」列标出每笔走的哪条分支)。止损平仓后若又选中同一只,"
+                    "就一路跳过信号日直到选出不同标的才建仓(2026-08-06 加)"
+                    "——2024-11-18 卖出北证50后它在随后12个连续信号日里一直是"
+                    "涨幅冠军,这条规则让策略空仓等到2025-04-07,避开了那波回调。"
+                    "规模按信号日当时"
                     "已披露的最新季报口径(无未来函数),排掉了几十万~几千万"
                     "规模、净值易失真的迷你基金。橙色=触发基金回撤线离场,"
                     "蓝色=触发大盘回撤线离场,两格都染色=同日两条线双双触发;"
@@ -1762,15 +1767,19 @@ with tab_sse:
                                                      ("sse" if _s else ""))
                 _review_trigger = [_trig_of(r) for r in _bt_df["卖出原因"]]
 
+                # 列名中性化:2026-08-06 加了 fallback_top 之后, 标准策略里
+                # 有几笔走的是"跌幅耗尽→改买涨幅最大"分支, 那几行的区间收益
+                # 是正的, 再叫"近3月跌幅最大标的/近3月跌幅"就是错的。具体
+                # 每笔走的哪条分支看「选向」列。
+                _std_tgt = "选中标的(C类全市场,按前一交易日榜单)"
                 _review_df = _bt_df.rename(columns={
-                    "冠军(C类全市场,按前一交易日榜单)":
-                        "近3月跌幅最大标的(C类全市场,按前一交易日榜单)",
-                    "冠军近3月涨幅(前日口径)": "近3月跌幅(前日口径)",
+                    "冠军(C类全市场,按前一交易日榜单)": _std_tgt,
+                    "冠军近3月涨幅(前日口径)": "近3月涨跌(前日口径)",
                 })
                 _review_df = _review_df[[c for c in [
-                    "买入日", "近3月跌幅最大标的(C类全市场,按前一交易日榜单)",
+                    "买入日", _std_tgt,
                     "类型", "买入时规模(亿)", "波动率比值(近3月)", "恐慌阈值",
-                    "回撤控制线(%)", "大盘回撤线(%)", "近3月跌幅(前日口径)",
+                    "回撤控制线(%)", "大盘回撤线(%)", "近3月涨跌(前日口径)", "选向",
                     "卖出日", "持有收益", "期间最高", "期间最大回撤", "同期上证",
                 ] if c in _review_df.columns]].copy()
                 # 「备注」是人工点评(backtest_notes 表), 算不出来、只能人写,
@@ -1796,21 +1805,12 @@ with tab_sse:
                     .format(precision=2, na_rep=""),
                     use_container_width=True, hide_index=True,
                     height=(len(_review_df) + 1) * 35 + 3,
+                    # 除标的名(medium)和备注(large)外一律 small; 按实际列名
+                    # 现拼, 免得选基口径一换列名对不上、宽度配置整个失效。
                     column_config={
-                        "买入日": st.column_config.Column(width="small"),
-                        "近3月跌幅最大标的(C类全市场,按前一交易日榜单)": st.column_config.Column(width="medium"),
-                        "类型": st.column_config.Column(width="small"),
-                        "买入时规模(亿)": st.column_config.Column(width="small"),
-                        "波动率比值(近3月)": st.column_config.Column(width="small"),
-                        "恐慌阈值": st.column_config.Column(width="small"),
-                        "回撤控制线(%)": st.column_config.Column(width="small"),
-                        "大盘回撤线(%)": st.column_config.Column(width="small"),
-                        "近3月跌幅(前日口径)": st.column_config.Column(width="small"),
-                        "卖出日": st.column_config.Column(width="small"),
-                        "持有收益": st.column_config.Column(width="small"),
-                        "期间最高": st.column_config.Column(width="small"),
-                        "期间最大回撤": st.column_config.Column(width="small"),
-                        "同期上证": st.column_config.Column(width="small"),
+                        **{c: st.column_config.Column(width="small")
+                           for c in _review_df.columns},
+                        _std_tgt: st.column_config.Column(width="medium"),
                         "备注": st.column_config.Column(width="large"),
                     })
 

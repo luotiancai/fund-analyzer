@@ -1,6 +1,8 @@
 """
 回测: QVIX恐慌信号买入 + 双止损(基金回撤控制线 / 大盘回撤线)
 - 买入: QVIX > 2年90分位阈值, 且资金可用(空仓或当天恰好卖出)
+  · 找不到"真正跌过"的合格候选时改买涨幅最大的(fallback_top)
+  · 止损平仓后若又选中同一只, 一路顺延信号日直到标的换掉(defer_until_different)
 - 标的: 前一交易日近3月冠军(C类全市场, 规模≥2亿), 冠军排名复用 fetcher.compute_
   metrics_asof——与 app.py「基金列表」页"截至日期"筛选完全同口径(按日
   收益率连乘, 正确处理分红除权, 自带单日|收益率|>30%异常值过滤), 而非
@@ -42,19 +44,30 @@ NAV_ANOMALIES = {
 # QVIX 2年90分位信号(window=490,pct=0.90) + 近3月跌幅最大(ret_col=
 # "ret_3m",pick="bottom") + 候选波动率比值≥1.5(min_vol_ratio=1.5) +
 # 候选规模≥2亿(min_aum=2.0, 2026-08-06 从0.5亿提高, 见 min_aum 说明) +
-# 跌幅耗尽(候选按跌幅从深到浅排, 找到第一个非负值就当天不操作, 不退而
-# 求其次买涨幅最小的) + 排除QDII/海外/持有期锁定基金(港股通/沪港深/
-# 恒生系列不再排除, 见 _HK_RE 定义处说明), 命令:
+# 跌幅耗尽时改买涨幅最大(fallback_top, 2026-08-06 加; 候选按跌幅从深到浅
+# 排, 找到第一个非负值说明没有真跌的了, 这时掉头去拿涨幅冠军, 而不是退而
+# 求其次买涨幅最小的) + 止损平仓后若又选中同一只则顺延信号日直到标的换掉
+# (defer_until_different, 2026-08-06 加) + 排除QDII/海外/持有期锁定基金
+# (港股通/沪港深/恒生系列不再排除, 见 _HK_RE 定义处说明), 命令:
 #   python3 backtest_qvix.py
 # (以上全部是当前 run_backtest 的默认值, 不用额外传参——含 window=490/
 # pct=0.90, 2026-07-27 起生产阈值列/通知邮件也已对齐这个口径,
 # 默认值随之从 720/0.95 改过来; min_aum=0.5 于 2026-07-28 加入)
 #
 #   笔数  胜率        累计收益(费后复利)  平均持有  平均收益(费后)
-#   9    8/9=88.9%   +570.36%           71天      +28.51%
-#   (剔除单笔运气021528财通成长优选混合C+140.47%后, 剩8笔仍有+178.77%,
-#   只有一笔小亏-0.06%——9笔里唯一的亏损, 且亏得极小)
-#   样本只有9笔、跨6年, 统计上很薄, 别当成可靠预期。
+#   11   9/11=81.8%  +857.12%           64天      +27.42%
+#   (剔除单笔运气002112德邦鑫星+148.11%后, 剩10笔仍有+285.76%; 最差单笔
+#   -3.20%)
+#   样本只有11笔、跨6年, 统计上很薄, 别当成可靠预期。
+#
+#   2026-08-06 这版相对上一版(9笔/77.8%/+575.51%)的差异全部来自新加的
+#   两条规则:
+#     · fallback_top 带进 2020-07-06/07-16/2024-10-09 三笔(跌幅耗尽日改
+#       买涨幅冠军), 这三笔本身平均只有+12.4%, 但垫高了本金基数;
+#     · defer_until_different 删掉 2024-11-18 那笔追高北证50的-10.47%
+#       ——止损卖出017513后它在12个连续信号日里霸榜整整一个月(近3月涨幅
+#       +99.7%→+114.7%), 顺延规则一路跳过, 空仓到2025-04-07 才等到跌幅
+#       分支给出德邦鑫星。这条规则的价值不在"换个标的买", 在强制空仓。
 #
 #   本次(2026-07-31)相对上一版快照(2026-07-28: 8笔/6-8=75%/+490.48%)的
 #   全部差异, 都来自当天两处修复, 策略规则本身一个字没动:
@@ -411,8 +424,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  min_vol_ratio: float = 1.5, dd_divisor: float = 5.0,
                  min_aum: float = 2.0, require_drop: bool = True,
                  regime_basis: str = "day", no_same_day_rebuy: bool = False,
-                 max_aum: float = None, fallback_top: bool = False,
-                 defer_until_different: bool = False):
+                 max_aum: float = None, fallback_top: bool = True,
+                 defer_until_different: bool = True):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
     的 475/490 那套道理)。默认 490/0.90 是当前线上在用的参数
@@ -904,16 +917,14 @@ def main():
                         help="基金规模上限(亿元, 同 --min-aum 的季报口径),"
                              "默认不设上限。配合 --min-aum 可以只取某个规模"
                              "区间, 如 --min-aum 0.5 --max-aum 10")
-    parser.add_argument("--fallback-top", action="store_true",
-                        help="当天找不到真正下跌的合格候选时, 改买涨幅最大的"
-                             "(默认是放弃这一天不操作)。跟 --no-require-drop"
-                             "不同: 那个是买跌幅最小(往往微涨)的, 这个是掉头"
-                             "去拿涨幅冠军")
-    parser.add_argument("--defer-until-different", action="store_true",
-                        help="止损平仓后, 只要选出来还是同一只基金就一直跳过"
-                             "信号日, 直到选出不同标的才建仓(默认照买)。"
-                             "跟 --no-same-day-rebuy 不同: 那个是当天换一只"
-                             "别的买, 这个是空仓等到标的真正换掉")
+    parser.add_argument("--no-fallback-top", dest="fallback_top",
+                        action="store_false",
+                        help="关掉「找不到真跌的就改买涨幅最大」这条(2026-08-06"
+                             "起是标准规则)。关掉后当天直接放弃不操作")
+    parser.add_argument("--no-defer-until-different", dest="defer_until_different",
+                        action="store_false",
+                        help="关掉「止损后顺延到标的真正换掉」这条(2026-08-06"
+                             "起是标准规则)。关掉后止损当天照买回同一只")
     parser.add_argument("--regime-basis", choices=["day", "window"], default="day",
                         help="pick=regime 时的择向依据: day(默认)=信号日当天"
                              "单日涨跌; window=比一个回看窗口前(截至前一交易日,"
@@ -956,8 +967,8 @@ def main():
                     and args.min_corr is None and args.lookback == "3m"
                     and args.pick == "bottom" and args.min_vol_ratio == 1.5
                     and args.dd_divisor == 5.0 and args.min_aum == 2.0
-                    and args.max_aum is None and not args.fallback_top
-                    and not args.defer_until_different
+                    and args.max_aum is None and args.fallback_top
+                    and args.defer_until_different
                     and not args.no_require_drop)
     _params = {
         "window": args.window, "pct": args.pct, "ret_col": _ret_col,
