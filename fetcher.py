@@ -845,6 +845,8 @@ def fetch_fund_scale_hist(code: str, force_refresh: bool = False) -> pd.DataFram
     conn.close()
 
     rows = []
+    answered = False   # 请求确实拿到了可解析的 content 字段(区分「没有规模表」
+                       # 和「请求失败/被限流」——见下面 fund_scale_miss 处说明)
     try:
         r = requests.get(
             _EM_F10_URL,
@@ -856,6 +858,7 @@ def fetch_fund_scale_hist(code: str, force_refresh: bool = False) -> pd.DataFram
         # 后面还跟别的字段, 所以非贪婪匹配到第一个闭合双引号即为整张表。
         m = re.search(r'content:"(.*?)"', r.text, re.DOTALL)
         html = m.group(1) if m else ""
+        answered = r.status_code == 200 and m is not None
         # 表列: 日期 | 期间申购 | 期间赎回 | 期末总份额 | 期末净资产(亿元) | 净资产变动率
         for tr in re.findall(r"<tr>(.*?)</tr>", html, re.DOTALL):
             tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.DOTALL)
@@ -880,9 +883,17 @@ def fetch_fund_scale_hist(code: str, force_refresh: bool = False) -> pd.DataFram
             "(code, quarter_end, aum, publish_date, saved_at) VALUES (?, ?, ?, ?, ?)",
             rows)
         conn.execute("DELETE FROM fund_scale_miss WHERE code=?", (code,))
-    else:
-        # 一行都没抓到:记一笔,让 refresh_scale_hist 的 recheck 窗口能跳过它
-        # (否则这只基金在库里毫无痕迹,每次跑批都要重抓)。
+    elif answered:
+        # 请求成功、页面里确实没有规模变动表(场内份额/刚成立/已清盘): 记一笔,
+        # 让 refresh_scale_hist 的 recheck 窗口能跳过它(否则这只基金在库里毫无
+        # 痕迹, 每次跑批都要重抓)。
+        #
+        # 只在 answered 时记。2026-08-04 那次全榜单扩量跑批(d649f8b)就是栽在
+        # 这里: 上万次 0.15s 间隔的请求触发东财限流, 返回体里没有 content 字段,
+        # 当时的代码把这 5524 只一律记成「没有规模表」, 20 天 recheck 窗口又让
+        # 它们一直不被重抓——基金列表的规模门槛因此对其中大半基金形同虚设,
+        # A/C 合并口径下这些兄弟份额还会被当成 0 规模。抽检 20 只重抓, 20 只
+        # 全都有数据。所以失败一律不留痕, 宁可下次重抓。
         conn.execute("INSERT OR REPLACE INTO fund_scale_miss (code, tried_at) "
                      "VALUES (?, ?)", (code, time.time()))
     conn.commit()
@@ -890,9 +901,53 @@ def fetch_fund_scale_hist(code: str, force_refresh: bool = False) -> pd.DataFram
     return load_fund_scale_hist(code)
 
 
-def fund_aum_asof(code: str, date, fetch_if_missing: bool = True) -> Optional[float]:
-    """信号日 date 当时能看到的最新一期基金规模(亿元);无可用数据返回 None。
-    只用 publish_date <= date 的季度,避免用到尚未披露的规模(未来函数)。"""
+# ── A/C 份额合并 ────────────────────────────────────────────────────────────
+# 东财 gmbd 接口按**基金代码**给期末净资产, 而 A 类/C 类是两个独立代码, 拿到
+# 的是各自份额类别的净资产, 不是整只基金的。但 A/C 只是同一份基金合同下的
+# 不同收费方式(A 前端申购费、C 销售服务费), 共用一个投资组合、一个托管账户:
+#   · 「规模太小、净值容易被单笔申赎搅动」这个风险来自整个组合, 不分份额类别;
+#   · 清盘线(《运作管理办法》第41条: 连续60个工作日基金资产净值低于5000万)
+#     和发起式基金满3年不足2亿自动终止, 条文主体都是「基金」, 按合并口径算。
+# 所以规模门槛要用合并规模。份额类别之间没有公开的关联字段, 只能按名称配对:
+# 去掉名称末尾的类别字母即为同一只基金(已核对榜单 20072 只, 分组后 0 组出现
+# 同名不同 type 的撞车, 且回测选中过的 9 只 C 类都能正确配到 A 类)。
+_SHARE_SUFFIX_RE = re.compile(r"[ABCDEFHIOQRYZ]$")
+_SIBLING_MAP = None   # {code: (同一只基金的全部份额代码, 含自身)}, 进程内缓存
+
+
+def _build_sibling_map() -> dict:
+    """从榜单缓存建「代码 → 同基金全部份额代码」映射。读不到榜单时返回空 dict
+    (调用方退化成单份额口径, 不报错)。"""
+    try:
+        conn = _conn()
+        row = conn.execute("SELECT data FROM fund_list WHERE id = 1").fetchone()
+        conn.close()
+        if not row:
+            return {}
+        df = pd.DataFrame(json.loads(row["data"]))
+        df["code"] = df["code"].astype(str).str.zfill(6)
+        df["base"] = df["name"].astype(str).map(lambda n: _SHARE_SUFFIX_RE.sub("", n))
+        out = {}
+        for _, sub in df.groupby("base"):
+            fam = tuple(sorted(sub["code"]))
+            for c in fam:
+                out[c] = fam
+        return out
+    except Exception as e:
+        logger.warning("sibling map build failed: %s", e)
+        return {}
+
+
+def share_class_siblings(code: str) -> tuple:
+    """同一只基金的全部份额类别代码(含自身)。配不上时只返回自身。"""
+    global _SIBLING_MAP
+    if _SIBLING_MAP is None:
+        _SIBLING_MAP = _build_sibling_map()
+    return _SIBLING_MAP.get(str(code).zfill(6), (str(code).zfill(6),))
+
+
+def _aum_asof_one(code: str, date, fetch_if_missing: bool = True) -> Optional[float]:
+    """单个代码(单一份额类别)在 date 当时可见的最新一期期末净资产(亿元)。"""
     df = load_fund_scale_hist(code)
     if df.empty and fetch_if_missing:
         df = fetch_fund_scale_hist(code)
@@ -903,10 +958,34 @@ def fund_aum_asof(code: str, date, fetch_if_missing: bool = True) -> Optional[fl
     return float(avail["aum"].iloc[-1]) if not avail.empty else None
 
 
-def funds_aum_asof(codes: list, date) -> dict:
+def fund_aum_asof(code: str, date, fetch_if_missing: bool = True,
+                  merge_classes: bool = True) -> Optional[float]:
+    """信号日 date 当时能看到的最新一期基金规模(亿元);无可用数据返回 None。
+    只用 publish_date <= date 的季度,避免用到尚未披露的规模(未来函数)。
+
+    merge_classes=True(默认, 2026-08-06 起): 把同一只基金的各份额类别(A/C/E…)
+    的期末净资产**加总**, 见上面 A/C 份额合并那段说明。各类别取「各自当时可见
+    的最新一期」再相加(C 类往往比 A 类晚成立、季报期数不齐, 按期数对齐会白丢
+    数据)。查得到规模的类别才计入, 整只基金一个类别都查不到才返回 None——所以
+    兄弟份额缺数据时是**偏小**(保守), 不会凭空放大。"""
+    codes = share_class_siblings(code) if merge_classes else (code,)
+    total = None
+    for c in codes:
+        # 兄弟份额只读库不触网: 它们本来就在 scale_universe(榜单全部非债)的
+        # 每日刷新范围内, 为凑一个门槛值去逐只补抓会把回测拖成小时级。
+        v = _aum_asof_one(c, date, fetch_if_missing=(c == code and fetch_if_missing))
+        if v is not None:
+            total = v if total is None else total + v
+    return total
+
+
+def funds_aum_asof(codes: list, date, merge_classes: bool = True) -> dict:
     """批量版 fund_aum_asof: 一次 SQL 取多只基金在 date 当时可见的最新一期
     规模(亿元)。返回 {code: aum 或 None}(codes 里查不到的也给 None)。纯读
-    库、不触发网络, 供 app 列表按需给整页基金标规模。"""
+    库、不触发网络, 供 app 列表按需给整页基金标规模。
+
+    merge_classes 同 fund_aum_asof, 默认按 A/C 合并口径加总, 保证列表上显示的
+    规模跟回测门槛用的是同一个数。"""
     if not codes:
         return {}
     dstr = pd.Timestamp(date).strftime("%Y-%m-%d")
@@ -920,7 +999,13 @@ def funds_aum_asof(codes: list, date) -> dict:
         "  ON f.code = t.code AND f.quarter_end = t.mq", (dstr,)).fetchall()
     conn.close()
     got = {r["code"]: r["aum"] for r in rows}
-    return {c: got.get(c) for c in codes}
+    if not merge_classes:
+        return {c: got.get(c) for c in codes}
+    out = {}
+    for c in codes:
+        vals = [got[s] for s in share_class_siblings(c) if got.get(s) is not None]
+        out[c] = sum(vals) if vals else None
+    return out
 
 
 def latest_published_quarter(today=None) -> Optional[str]:
@@ -1873,12 +1958,23 @@ def describe_run(params: dict) -> str:
         bits.append("跌向须真跌")
     if p.get("min_vol_ratio"):
         bits.append(f"波动≥{p['min_vol_ratio']}")
+    if p.get("fallback_top"):
+        bits.append("无真跌改买涨幅最大")
+    if p.get("defer_until_different"):
+        bits.append("接力同一只则顺延")
+    if p.get("no_same_day_rebuy"):
+        bits.append("止损当天禁买回")
     if p.get("min_aum") and p.get("max_aum"):
         bits.append(f"规模{p['min_aum']}~{p['max_aum']}亿")
     elif p.get("min_aum"):
         bits.append(f"规模≥{p['min_aum']}亿")
     elif p.get("max_aum"):
         bits.append(f"规模≤{p['max_aum']}亿")
+    # 规模口径只在非标准(旧单份额)时点出来: 合并是 2026-08-06 起的标准动作,
+    # 每条标签都缀一句反而是噪声; 旧口径不标出来则会被误当成同口径比较。
+    if p.get("min_aum") or p.get("max_aum"):
+        if p.get("aum_basis", "single") != "merged":
+            bits.append("规模单份额口径")
     if p.get("dd_divisor") and p["dd_divisor"] != 5.0:
         bits.append(f"止损除数{p['dd_divisor']}")
     return " · ".join(bits)

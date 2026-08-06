@@ -25,6 +25,10 @@ DB = os.path.expanduser("~/.local/share/fund-analyzer/fund_cache.db")
 # 基金规模(AUM)过滤:规模数据(季度期末净资产,亿元)存在 fund_cache.db 的
 # fund_scale_hist 表, 取数/按信号日取值的逻辑都在 fetcher(见
 # fetcher.fund_aum_asof, 无未来函数——只用已披露的季报)。这里直接调它。
+# 2026-08-06 起口径改为 **A/C 份额合并**: 数据源按基金代码给净资产, 而 A/C 是
+# 同一份基金合同下的两个代码, 单看 C 类会系统性低估整只基金的规模(如财通成长
+# 优选 2025-04-07: C 类 1.36亿, 合并 21.43亿)。门槛想挡的"迷你基金净值易被单笔
+# 申赎搅动"和清盘线都是整只基金口径, 详见 fetcher 里 A/C 份额合并那段。
 
 # 已核实的净值异常(直连东财源头核对过, 不是本地缓存问题, 但明显非真实
 # 市场收益): 014939 同泰产业升级混合C 2025-03-31 单位净值单日 +68.7%
@@ -38,12 +42,13 @@ NAV_ANOMALIES = {
     "014939": [(pd.Timestamp("2025-03-31"), 1.6249 / 0.9630)],
 }
 
-# ── 标准策略回测参考快照(2026-08-03, 数据/规则变了要重跑, 别当成结论)──
+# ── 标准策略回测参考快照(2026-08-06, 数据/规则变了要重跑, 别当成结论)──
 # 上面这段窗口×分位对比、以及后面出现过的"涨幅冠军+相关系数过滤"都是
 # 中途淘汰的旧方案, 历史版本见 git 历史, 不再列在这里。当前标准策略是
 # QVIX 2年90分位信号(window=490,pct=0.90) + 近3月跌幅最大(ret_col=
 # "ret_3m",pick="bottom") + 候选波动率比值≥1.5(min_vol_ratio=1.5) +
-# 候选规模≥2亿(min_aum=2.0, 2026-08-06 从0.5亿提高, 见 min_aum 说明) +
+# 候选规模≥2亿(min_aum=2.0, 2026-08-06 从0.5亿提高, 见 min_aum 说明;
+# 规模按 A/C 份额合并计算, aum_basis="merged", 同日改) +
 # 跌幅耗尽时改买涨幅最大(fallback_top, 2026-08-06 加; 候选按跌幅从深到浅
 # 排, 找到第一个非负值说明没有真跌的了, 这时掉头去拿涨幅冠军, 而不是退而
 # 求其次买涨幅最小的) + 止损平仓后若又选中同一只则顺延信号日直到标的换掉
@@ -55,10 +60,26 @@ NAV_ANOMALIES = {
 # 默认值随之从 720/0.95 改过来; min_aum=0.5 于 2026-07-28 加入)
 #
 #   笔数  胜率        累计收益(费后复利)  平均持有  平均收益(费后)
-#   11   9/11=81.8%  +857.12%           64天      +27.42%
-#   (剔除单笔运气002112德邦鑫星+148.11%后, 剩10笔仍有+285.76%; 最差单笔
-#   -3.20%)
+#   11   9/11=81.8%  +1022.26%          64天      +28.86%
+#   (剔除单笔运气021528财通成长优选+140.47%后, 剩10笔仍有+366.70%; 单笔
+#   几何均值+24.58%; 亏损只有2笔, -3.20%和-0.06%)
 #   样本只有11笔、跨6年, 统计上很薄, 别当成可靠预期。
+#
+#   2026-08-06(晚) 规模口径改 A/C 合并后重跑(跑批#19)。同参数、只换口径的
+#   对照(--aum-basis single, 跑批#20)是 11笔/81.8%/+857.12%, 精确复现改口径
+#   前的#18——所以下面这 +165 个点的差异全部来自口径本身:
+#     买入日        旧单份额口径                    合并口径(现标准)
+#     2022-04-25   泰信鑫选(-30.69%)  →+32.64%    诺安创新驱动(-37.80%)  →+14.19%
+#     2022-10-24   嘉实港股通新经济(-25.42%)→+29.28%  富国港股通互联网联接(-26.93%)→+49.70%
+#     2024-02-05   中欧医疗创新(-33.52%)→+5.52%   汇丰晋信时代先锋(-34.29%)→+15.18%
+#     2024-09-26   前海开源沪港深农业(-17.63%)→+6.23%  华富健康文娱(-22.41%)→+18.05%
+#     2025-04-07   德邦鑫星(-13.12%)  →+148.11%   财通成长优选(-22.35%)  →+140.47%
+#   另外6笔标的完全相同。规律是一致的: 合并后规模变大, 原先被2亿门槛误杀的
+#   基金重新合格, 每次都选到**跌得更深**的那只(近3月跌幅一列全部更负)——旧
+#   口径不是"更严格", 而是在随机踢掉"C类份额小、A类才是主力"的那批合格标的。
+#   5笔里4笔改善、1笔(2025-04-07)略变差。⚠️ 但这仍是11笔的样本, +165个点
+#   同样可能是换标的的噪声; 改口径的理由是口径本身对(清盘线/申赎冲击都按
+#   整只基金算), 不是因为回测数字更好看。
 #
 #   2026-08-06 这版相对上一版(9笔/77.8%/+575.51%)的差异全部来自新加的
 #   两条规则:
@@ -228,7 +249,8 @@ def _corr_with_market(conn, sse_df, code, window_start, window_end):
 def find_champion_on_date(conn, asof_date, exclude_codes=None,
                           sse_df=None, min_corr=None,
                           ret_col="ret_3m", pick="top", min_vol_ratio=None,
-                          min_aum=None, require_drop=True, max_aum=None):
+                          min_aum=None, require_drop=True, max_aum=None,
+                          aum_basis="merged"):
     """找 asof_date 当天视角下排名第一的标的(排除 exclude_codes). 返回 (code, ret).
 
     复用 fetcher.compute_metrics_asof——按日收益率连乘计算区间收益(正确
@@ -311,7 +333,8 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
             # 首轮抓规模的网络请求(之后走 fund_scale_hist 缓存)。规模数据
             # 缺失(None)按不达标处理——宁可跳过也不买一只连规模都查不到的
             # 基金(多是极小/新基金)。
-            aum = fetcher.fund_aum_asof(code, asof_date)
+            aum = fetcher.fund_aum_asof(code, asof_date,
+                                        merge_classes=(aum_basis == "merged"))
             if aum is None:
                 continue
             if min_aum is not None and aum < min_aum:
@@ -425,7 +448,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  min_aum: float = 2.0, require_drop: bool = True,
                  regime_basis: str = "day", no_same_day_rebuy: bool = False,
                  max_aum: float = None, fallback_top: bool = True,
-                 defer_until_different: bool = True):
+                 defer_until_different: bool = True,
+                 aum_basis: str = "merged"):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
     的 475/490 那套道理)。默认 490/0.90 是当前线上在用的参数
@@ -488,7 +512,13 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     最初加这道门槛(2026-07-28, 0.5亿)是因为"跌幅最大"排在最前面的常是几十万~
     几千万规模的迷你/僵尸基金, 净值容易被单笔申赎搅动失真。
 
-    2026-08-06 四档实测(其余参数全默认, 各9笔, 买卖日期完全相同, 只换标的):
+    ⚠️ 口径变更(2026-08-06): 规模改为 A/C 份额**合并**(见文件头说明)。同一个
+    数字在新口径下宽松得多——C 类通常只占整只基金的一小部分。下面那张四档表
+    是**旧的单份额口径**下测的, 只能当历史记录看, 不能拿来给合并口径定档;
+    合并口径的重测结果见文件头的快照。
+
+    2026-08-06 四档实测(旧·单份额口径, 其余参数全默认, 各9笔, 买卖日期完全
+    相同, 只换标的):
       门槛     胜率     复利      单笔几何均值  剔最佳后   亏损笔数
       0.5亿   88.9%   +570.36%   +23.54%     +178.77%    1
       1.5亿   88.9%   +426.82%   +20.28%     +161.07%    1
@@ -711,7 +741,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                                                  min_vol_ratio=min_vol_ratio,
                                                  min_aum=min_aum,
                                                  require_drop=_req_drop,
-                                                 max_aum=max_aum)
+                                                 max_aum=max_aum,
+                                                 aum_basis=aum_basis)
             # 兜底: 当天找不到"真正跌过"的合格候选时(跌幅耗尽, 或者跌的那些
             # 都过不了波动率/规模门槛), 标准策略是直接放弃这一天; 打开
             # fallback_top 则改买涨幅最大的那只。注意这跟 require_drop=False
@@ -722,7 +753,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                     conn, day_str, _excl, sse_df=sse, min_corr=min_corr,
                     ret_col=ret_col, pick="top",
                     min_vol_ratio=min_vol_ratio, min_aum=min_aum,
-                    require_drop=False, max_aum=max_aum)
+                    require_drop=False, max_aum=max_aum, aum_basis=aum_basis)
                 if code is not None:
                     _pick = "top"      # 供「选向」列区分这笔走的是兜底分支
             if code is None:
@@ -785,7 +816,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                 # 买入日当时已披露的最新一期季报规模(as-of, 无未来函数),
                 # 即策略选基那天实际能看到的规模。选基环节已经查过一次,
                 # 这里走 fund_scale_hist 缓存, 不产生额外网络请求。
-                "buy_aum": fetcher.fund_aum_asof(code, day_str),
+                "buy_aum": fetcher.fund_aum_asof(
+                    code, day_str, merge_classes=(aum_basis == "merged")),
             }
 
     # Close open position
@@ -911,6 +943,11 @@ def main():
                         help="关掉「跌幅耗尽即不操作」规则:信号日即便所有候选都"
                              "是正收益也照买跌幅最大(涨幅最小)那个。默认保留该"
                              "规则(标准策略:没有真正下跌的标的当天就不买)")
+    parser.add_argument("--aum-basis", choices=["merged", "single"], default="merged",
+                        help="规模口径: merged(默认)=同一只基金的 A/C 等份额"
+                             "类别合并计算; single=只算被选中那个代码的份额"
+                             "类别(2026-08-06 之前的旧口径, 系统性低估)。"
+                             "同一个 --min-aum 数值在两种口径下松紧差很多。")
     parser.add_argument("--max-aum",
                         type=lambda s: None if s.lower() == "none" else float(s),
                         default=None,
@@ -952,7 +989,8 @@ def main():
                           defer_until_different=args.defer_until_different,
                           require_drop=not args.no_require_drop,
                           regime_basis=args.regime_basis,
-                          no_same_day_rebuy=args.no_same_day_rebuy)
+                          no_same_day_rebuy=args.no_same_day_rebuy,
+                          aum_basis=args.aum_basis)
     elapsed = time.time() - t0
 
     if not trades:
@@ -968,6 +1006,7 @@ def main():
                     and args.pick == "bottom" and args.min_vol_ratio == 1.5
                     and args.dd_divisor == 5.0 and args.min_aum == 2.0
                     and args.max_aum is None and args.fallback_top
+                    and args.aum_basis == "merged"
                     and args.defer_until_different
                     and not args.no_require_drop)
     _params = {
@@ -982,6 +1021,10 @@ def main():
         # 只对 pick="regime" 有意义。页面按它描述规则, 不同跑批各说各的。
         "regime_basis": args.regime_basis if args.pick == "regime" else None,
         "no_same_day_rebuy": args.no_same_day_rebuy,
+        # 规模口径。2026-08-06 之前的跑批是 "single"(只算被选中那个代码的
+        # 份额类别), 之后是 "merged"(A/C 等份额合并)。同一个 min_aum 数值
+        # 在两种口径下松紧完全不同, 历史跑批之间比较时必须先看这一项。
+        "aum_basis": args.aum_basis,
     }
     if args.no_save:
         print("--no-save: 这次不落库")
