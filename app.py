@@ -1888,7 +1888,10 @@ with tab_sse:
                     st.caption(
                         f"规则:{_rule}"
                         f"候选须满足波动率比值≥{_mark(_vr, 1.5)}、"
-                        f"规模≥{_mark(_aum, 2.0)}亿,双止损口径同标准策略"
+                        + (f"规模**{_aum}~{_x_params['max_aum']}亿**"
+                           if _x_params.get("max_aum") else
+                           f"规模≥{_mark(_aum, 2.0)}亿")
+                        + f",双止损口径同标准策略"
                         f"(粗体=与标准策略不同的参数)。"
                         f"　{_x_n} 笔已完成:胜率 {_x_wins / _x_n * 100:.1f}%"
                         f"({_x_wins}/{_x_n}),费后复利 {_x_cum:+.2f}%,"

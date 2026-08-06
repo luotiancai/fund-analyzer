@@ -1873,8 +1873,12 @@ def describe_run(params: dict) -> str:
         bits.append("跌向须真跌")
     if p.get("min_vol_ratio"):
         bits.append(f"波动≥{p['min_vol_ratio']}")
-    if p.get("min_aum"):
+    if p.get("min_aum") and p.get("max_aum"):
+        bits.append(f"规模{p['min_aum']}~{p['max_aum']}亿")
+    elif p.get("min_aum"):
         bits.append(f"规模≥{p['min_aum']}亿")
+    elif p.get("max_aum"):
+        bits.append(f"规模≤{p['max_aum']}亿")
     if p.get("dd_divisor") and p["dd_divisor"] != 5.0:
         bits.append(f"止损除数{p['dd_divisor']}")
     return " · ".join(bits)

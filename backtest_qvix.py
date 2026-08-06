@@ -215,7 +215,7 @@ def _corr_with_market(conn, sse_df, code, window_start, window_end):
 def find_champion_on_date(conn, asof_date, exclude_codes=None,
                           sse_df=None, min_corr=None,
                           ret_col="ret_3m", pick="top", min_vol_ratio=None,
-                          min_aum=None, require_drop=True):
+                          min_aum=None, require_drop=True, max_aum=None):
     """找 asof_date 当天视角下排名第一的标的(排除 exclude_codes). 返回 (code, ret).
 
     复用 fetcher.compute_metrics_asof——按日收益率连乘计算区间收益(正确
@@ -293,13 +293,17 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
             vr = compute_beta(conn, sse_df, code, asof_date)
             if vr < min_vol_ratio:
                 continue
-        if min_aum is not None:
+        if min_aum is not None or max_aum is not None:
             # 规模过滤放在最后:前面便宜的DB过滤先淘汰掉大部分候选, 减少
             # 首轮抓规模的网络请求(之后走 fund_scale_hist 缓存)。规模数据
             # 缺失(None)按不达标处理——宁可跳过也不买一只连规模都查不到的
             # 基金(多是极小/新基金)。
             aum = fetcher.fund_aum_asof(code, asof_date)
-            if aum is None or aum < min_aum:
+            if aum is None:
+                continue
+            if min_aum is not None and aum < min_aum:
+                continue
+            if max_aum is not None and aum > max_aum:
                 continue
         return code, round(candidates[code], 2)
     return None, 0
@@ -406,7 +410,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  min_corr: float = None, ret_col: str = "ret_3m", pick: str = "bottom",
                  min_vol_ratio: float = 1.5, dd_divisor: float = 5.0,
                  min_aum: float = 2.0, require_drop: bool = True,
-                 regime_basis: str = "day", no_same_day_rebuy: bool = False):
+                 regime_basis: str = "day", no_same_day_rebuy: bool = False,
+                 max_aum: float = None):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
     的 475/490 那套道理)。默认 490/0.90 是当前线上在用的参数
@@ -478,11 +483,28 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     总复利在四档间上下弹跳(570→427→576→436)、没有趋势, 主要是换标的的
     噪声; 真正单调的是亏损笔数(1→1→2→3)和胜率(88.9→88.9→77.8→66.7),
     方向都是门槛越高越差。剔除最佳一笔后也是 0.5亿 最优。
-    **按这组数据 0.5亿 表现最好, 2亿 的总复利优势(+5个点)完全来自单笔运气
-    (2025-04-07 德邦鑫星 +148.11%)**——2026-08-06 仍定 2亿 为标准是用户的
-    选择(倾向更大更稳的基金), 不是回测结论支持的。样本只有9笔、每档只差
-    几只标的, 这组对比本身也支撑不了精确定档, 别拿它当依据反复调。
-    传 None 关掉过滤。"""
+    **但这组对比不构成证据**: 9笔样本、每档只差1~2只标的, 换一只标的就能
+    翻转排序(2亿 的复利优势 +5个点全部来自 2025-04-07 德邦鑫星 +148.11% 那
+    一笔)。它既不能说明 0.5亿 更好, 也不能说明 2亿 更好——回测在这个样本量
+    上对规模门槛没有区分力, 别拿这张表当调参依据。
+
+    2026-08-06 定 2亿 的理由不在回测里, 在两条回测**看不到**的地方:
+      ① 幸存者偏差: 规模连续60个工作日低于5000万可触发清盘, 而净值库里
+         只有活下来的基金, 被清盘的根本不在候选池。min_aum=0.5 的历史表现
+         天然被高估, 且这个偏差跑多少次回测都不会暴露;
+      ② 常理: 2亿的基金比5000万的基金在流动性、抗单笔申赎冲击、运作稳定性
+         上都更健康——这正是当初(2026-07-28)加规模门槛想要的东西, 只是当时
+         把线画在了0.5亿。
+    上面那张四档表留着, 是为了记录"提高门槛没有可见的收益代价", 不是为了
+    支持某一档。
+
+    传 None 关掉过滤。
+
+    max_aum: 候选规模上限(亿元), 默认 None(不设上限)。用来验证"大基金船大
+    难掉头、超跌反弹弹性被摊薄"这个猜测——2026-08-06 的四档下限实测里,
+    规模最大的那笔(2024-02-05 中欧医疗创新 45.45亿)恰好是全表跑输大盘最多
+    的一笔(+5.52% vs 同期上证+12.8%)。设了上限就能把这类超大盘基金挡在
+    候选池外, 单独看剩下的中小盘表现如何。"""
     conn = get_conn()
 
     # Load fund names and types from JSON cache
@@ -669,7 +691,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                                                  ret_col=ret_col, pick=_pick,
                                                  min_vol_ratio=min_vol_ratio,
                                                  min_aum=min_aum,
-                                                 require_drop=_req_drop)
+                                                 require_drop=_req_drop,
+                                                 max_aum=max_aum)
             if code is None:
                 continue
 
@@ -846,6 +869,12 @@ def main():
                         help="关掉「跌幅耗尽即不操作」规则:信号日即便所有候选都"
                              "是正收益也照买跌幅最大(涨幅最小)那个。默认保留该"
                              "规则(标准策略:没有真正下跌的标的当天就不买)")
+    parser.add_argument("--max-aum",
+                        type=lambda s: None if s.lower() == "none" else float(s),
+                        default=None,
+                        help="基金规模上限(亿元, 同 --min-aum 的季报口径),"
+                             "默认不设上限。配合 --min-aum 可以只取某个规模"
+                             "区间, 如 --min-aum 0.5 --max-aum 10")
     parser.add_argument("--regime-basis", choices=["day", "window"], default="day",
                         help="pick=regime 时的择向依据: day(默认)=信号日当天"
                              "单日涨跌; window=比一个回看窗口前(截至前一交易日,"
@@ -868,6 +897,7 @@ def main():
                           min_vol_ratio=args.min_vol_ratio,
                           dd_divisor=args.dd_divisor,
                           min_aum=args.min_aum,
+                          max_aum=args.max_aum,
                           require_drop=not args.no_require_drop,
                           regime_basis=args.regime_basis,
                           no_same_day_rebuy=args.no_same_day_rebuy)
@@ -885,11 +915,13 @@ def main():
                     and args.min_corr is None and args.lookback == "3m"
                     and args.pick == "bottom" and args.min_vol_ratio == 1.5
                     and args.dd_divisor == 5.0 and args.min_aum == 2.0
+                    and args.max_aum is None
                     and not args.no_require_drop)
     _params = {
         "window": args.window, "pct": args.pct, "ret_col": _ret_col,
         "pick": args.pick, "min_vol_ratio": args.min_vol_ratio,
         "dd_divisor": args.dd_divisor, "min_aum": args.min_aum,
+        "max_aum": args.max_aum,
         "require_drop": not args.no_require_drop,
         # 择向依据("day"=当天单日涨跌 / "window"=比回看窗口前、截至前一日),
         # 只对 pick="regime" 有意义。页面按它描述规则, 不同跑批各说各的。
