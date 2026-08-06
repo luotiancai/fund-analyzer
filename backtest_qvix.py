@@ -12,7 +12,7 @@
   逐交易日检查, 先到先卖(双线在买入日锁定, 与 app.py 复盘口径一致)
   波动率比值 = 基金日收益率std / 大盘日收益率std(纯波动对比, 不按相关系数加权)
 """
-import sys, os, time, sqlite3, io, re
+import sys, os, time, sqlite3, io, re, functools
 import numpy as np
 import pandas as pd
 from datetime import timedelta
@@ -246,6 +246,23 @@ def _corr_with_market(conn, sse_df, code, window_start, window_end):
     return None if pd.isna(c) else c
 
 
+# compute_metrics_asof 是整个回测最贵的一步: 实测单次约 9.2s(逐只 SQL 2.0s
+# + 逐只 _metrics_from_nav 6.3s, 后者是 4000+ 次函数调用的固定开销, 跟数据
+# 量关系不大), 一次标准回测要调 ~35 次, 占总耗时九成以上。
+#
+# 而 fallback_top / defer_until_different 这两条规则会让同一个信号日**调两次**
+# ——跌幅分支一次, 涨幅兜底再一次, 两次的 (asof, ret_col) 完全相同, 结果必然
+# 一样。缓存掉重复的那次即可, 实测 #18 那版 15 个信号日属于这种情况。
+#
+# 缓存放在回测这层而不是 fetcher 里: fetcher 那个函数 app 也在用(「基金列表」
+# 页的"截至日期"筛选), 进程级缓存会在数据库刷新后继续返回陈旧结果; 而回测
+# 是一次性的只读跑批, 期间净值库不会变, 缓存必然安全。
+# maxsize 给 4 就够(重复调用总是紧挨着的同一天), 留点余量防以后调整顺序。
+@functools.lru_cache(maxsize=4)
+def _metrics_asof_cached(asof_date, ret_col):
+    return fetcher.compute_metrics_asof(asof_date, cols={ret_col})
+
+
 def find_champion_on_date(conn, asof_date, exclude_codes=None,
                           sse_df=None, min_corr=None,
                           ret_col="ret_3m", pick="top", min_vol_ratio=None,
@@ -294,7 +311,7 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
     min_vol_ratio=1(候选振幅至少要跟大盘同量级, 用户原话"我是来发财
     的,不是来保本的")。
     """
-    metrics = fetcher.compute_metrics_asof(asof_date, cols={ret_col})
+    metrics = _metrics_asof_cached(asof_date, ret_col)
     if not metrics:
         return None, 0
     candidates = {
