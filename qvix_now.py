@@ -164,17 +164,22 @@ def main() -> int:
     # 本来就看得见, 再弹一次是噪音。
     notify = "--notify" in sys.argv
 
-    # 先把自算历史和恐慌阈值刷到最新。
-    # 本机**没有**任何定时任务(云端那份跑批只更新 Release 里的快照, 不会回流
-    # 到本地库), 所以不在这里刷, 下面打印的阈值就会一直停在最后一次手动跑批
-    # 那天的值, 而且看不出来是旧的。这一步只打一次上交所官方接口(境外也通的
-    # 那个)+一次滚动分位, 几秒钟, 顺带自愈最近15天的空值。
+    # 先把 QVIX 历史和恐慌阈值同步到最新, 否则下面打印的阈值会停在旧值、
+    # 而且看不出来是旧的。
+    #
+    # 这里原来是调 fetcher.update_qvix_self_daily() 自己算 —— 当时的理由是
+    # "云端跑批只更新 Release 快照, 不会回流到本地库"。有了 sync_down 之后
+    # 那个前提不成立了, 而且本机算的正是云端凌晨已经算好的同一个数(两边都
+    # 是补"上一个已收盘交易日", 同一个上交所接口)。改成直接拉云端那份:
+    #   · 少打一次上交所接口 + 少算一次滚动分位;
+    #   · market.db 从此只有云端一个写入方, 本地纯消费, 不会有覆盖问题。
+    # 注意**盘中实时值不入库** —— 它只落 qvix_now.json(见下面 OUT), 所以
+    # 同步整个文件替换不会碰掉任何本机自产的数据。
     try:
-        v, note = fetcher.update_qvix_self_daily()
-        if v is None:
-            log.warning("自算历史刷新未成功(%s), 阈值可能不是最新", note)
+        import sync_down
+        sync_down.sync(["market"], quiet=True)
     except Exception as e:
-        log.warning("自算历史刷新失败(%s), 阈值可能不是最新", e)
+        log.warning("QVIX 历史同步失败(%s), 阈值可能不是最新", e)
 
     phase, as_of = fetcher.qvix_phase()
     now = fetcher.datetime.now(fetcher._CST)

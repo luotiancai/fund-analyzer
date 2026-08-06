@@ -923,6 +923,30 @@ def _apply_chain_fees(trades):
             del t[k]
 
 
+def _sync_before_run():
+    """跑之前先跟云端对一下数据, 有更新就拉。
+
+    为什么要自动做而不是靠人记得敲 sync_down.py: 回测结果会写进
+    strategy_runs, 默认参数那次还会被标成**线上标准策略**。拿比线上旧几天
+    的净值跑出一个"标准策略"推上线, 是个不出声的错误 —— 2026-08-06 本地就
+    正好比线上少 23,266 行净值而没人察觉。
+
+    代价很小: 远端没变时只有一次 `gh release view`(几百字节、约 1 秒), 零
+    下载。断网/gh 没登录不阻断回测, 只提示一句然后用本地数据跑。
+    """
+    import sync_down
+    try:
+        pulled = sync_down.sync(sync_down.ALL)
+    except Exception as e:
+        print(f"⚠️  跳过云端同步({e}), 用本地现有数据跑。"
+              "\n   本地可能比线上旧 —— 这次结果别当标准策略推上线。")
+        return
+    if pulled:
+        print(f"已从云端更新: {', '.join(pulled)}")
+    else:
+        print("本地数据已是云端最新。")
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="QVIX恐慌信号回测")
@@ -994,7 +1018,12 @@ def main():
     parser.add_argument("--label", default=None,
                         help="给这次跑批起个名字(页面上显示)。不给就按参数"
                              "自动拼一个, 见 fetcher.describe_run")
+    parser.add_argument("--no-sync", action="store_true",
+                        help="跳过启动时的云端数据同步(离线跑时用)")
     args = parser.parse_args()
+
+    if not args.no_sync:
+        _sync_before_run()
 
     _ret_col = "ret_1m" if args.lookback == "1m" else "ret_3m"
     t0 = time.time()

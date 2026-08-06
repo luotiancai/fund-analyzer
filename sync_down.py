@@ -59,6 +59,43 @@ def status():
         print(f"{name:10}{loc:>12}{rem:>12}  {upd:18}{st}")
 
 
+def sync(names, refresh=False, quiet=False) -> list:
+    """同步指定的库, 返回实际重新下载了的库名。
+
+    远端没变的直接跳过(零流量), 所以每次跑之前都调一遍的代价只有一次
+    `gh release view`(几百字节、约 1 秒)。供 backtest_qvix.py 启动时调用。
+    """
+    remote = cloud_assets.asset_times()
+    if not remote:
+        raise RuntimeError("取不到 Release 资产列表(gh 没登录? 断网?)")
+    pulled = []
+    for n in names:
+        stamp_key = f"{cloud_assets.ASSET_OF[n]}@{fetcher.DB_PATH[n]}"
+        was = cloud_assets._stamps().get(stamp_key)
+        try:
+            cloud_assets.fetch(n, dest=fetcher.DB_PATH[n], remote_times=remote,
+                               refresh=refresh)
+        except FileNotFoundError:
+            if not quiet:
+                print(f"  {n}: 云端没有这个资产, 跳过")
+            continue
+        if cloud_assets._stamps().get(stamp_key) != was:
+            pulled.append(n)
+    if "nav" in pulled:
+        # 索引不随资产下发(纯派生数据, 占净值库三成), 落地后现建 1~2 秒。
+        # 只在真的重新拉了 nav 时才建 —— 没拉的话索引本来就还在。
+        if not quiet:
+            print("建 nav.idx_nav_date …", end="", flush=True)
+        conn = fetcher._conn()
+        conn.execute("CREATE INDEX IF NOT EXISTS nav.idx_nav_date "
+                     "ON fund_nav_daily(date)")
+        conn.commit()
+        conn.close()
+        if not quiet:
+            print(" 好了")
+    return pulled
+
+
 def main():
     argv = [a for a in sys.argv[1:] if not a.startswith("--")]
     if "--status" in sys.argv:
@@ -69,24 +106,8 @@ def main():
     if bad:
         raise SystemExit(f"未知的库: {', '.join(bad)}\n"
                          f"可选: {', '.join(fetcher.DB_PATH)}")
-    remote = cloud_assets.asset_times()
     print(f"同步 {', '.join(names)} → {fetcher._DATA_DIR}")
-    for n in names:
-        try:
-            # 直接落到真实数据目录(不是 peek 的缓存): 这是"用", 不是"看"。
-            cloud_assets.fetch(n, dest=fetcher.DB_PATH[n], remote_times=remote,
-                               refresh="--refresh" in sys.argv)
-        except FileNotFoundError:
-            print(f"  {n}: 云端没有这个资产, 跳过")
-    if "nav" in names:
-        # 索引不随资产下发(纯派生数据, 占净值库三成), 落地后现建。
-        print("建 nav.idx_nav_date …", end="", flush=True)
-        conn = fetcher._conn()
-        conn.execute("CREATE INDEX IF NOT EXISTS nav.idx_nav_date "
-                     "ON fund_nav_daily(date)")
-        conn.commit()
-        conn.close()
-        print(" 好了")
+    sync(names, refresh="--refresh" in sys.argv)
     print("✅ 同步完成")
 
 
