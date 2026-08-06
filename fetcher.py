@@ -2100,7 +2100,7 @@ def describe_run(params: dict) -> str:
 def save_strategy_run(trades: list, params: Optional[dict] = None,
                       label: Optional[str] = None,
                       is_standard: bool = False) -> int:
-    """把**一次**回测的结果追加进 strategydb.strategy_runs, 返回 run id。
+    """把**一次**回测的结果追加进 strategy.strategy_runs, 返回 run id。
 
     每跑一次存一条, 不覆盖历史——以前是"一个方案一张表、同名整表覆盖",
     换个参数重跑就把上一次的结果冲掉了, 想回头对比只能重跑。现在每次
@@ -2115,7 +2115,7 @@ def save_strategy_run(trades: list, params: Optional[dict] = None,
     n, win, cum = _run_summary(trades)
     conn = _conn()
     cur = conn.execute(
-        "INSERT INTO strategydb.strategy_runs "
+        "INSERT INTO strategy.strategy_runs "
         "(run_at, label, params, trades, is_standard, n_trades, win_rate, cum_return) "
         "VALUES (?,?,?,?,?,?,?,?)",
         (time.time(), label or describe_run(params),
@@ -2135,7 +2135,7 @@ def list_strategy_runs(limit: int = 50) -> list:
     conn = _conn()
     rows = conn.execute(
         "SELECT id, run_at, label, params, is_standard, n_trades, win_rate,"
-        " cum_return FROM strategydb.strategy_runs "
+        " cum_return FROM strategy.strategy_runs "
         "ORDER BY run_at DESC, id DESC LIMIT ?", (limit,)).fetchall()
     conn.close()
     out = []
@@ -2155,7 +2155,7 @@ def load_strategy_run(run_id: int) -> tuple:
     """→ (DataFrame, params dict, run_at unix秒);取不到返回 (None, {}, None)。"""
     conn = _conn()
     row = conn.execute(
-        "SELECT trades, params, run_at FROM strategydb.strategy_runs WHERE id=?",
+        "SELECT trades, params, run_at FROM strategy.strategy_runs WHERE id=?",
         (run_id,)).fetchone()
     conn.close()
     if not row or not row["trades"]:
@@ -2176,7 +2176,7 @@ def load_backtest_trades() -> tuple:
     没跑过返回 (None, {}, None)——调用方(app)据此决定是否隐藏整个复盘区。"""
     conn = _conn()
     row = conn.execute(
-        "SELECT id FROM strategydb.strategy_runs WHERE is_standard=1 "
+        "SELECT id FROM strategy.strategy_runs WHERE is_standard=1 "
         "ORDER BY run_at DESC, id DESC LIMIT 1").fetchone()
     conn.close()
     if not row:
@@ -2185,7 +2185,7 @@ def load_backtest_trades() -> tuple:
 
 
 def save_backtest_notes(notes: dict) -> None:
-    """回测逐笔点评落库(strategydb.backtest_notes,按买入日索引)。
+    """回测逐笔点评落库(strategy.backtest_notes,按买入日索引)。
 
     单独一张表而不是塞进 strategy_runs 的 JSON:点评是人写的、跨多次
     跑批复用(同一个买入日换了参数还是那天的行情), 而 strategy_runs
@@ -2194,7 +2194,7 @@ def save_backtest_notes(notes: dict) -> None:
     conn = _conn()
     now = time.time()
     conn.executemany(
-        "INSERT OR REPLACE INTO strategydb.backtest_notes "
+        "INSERT OR REPLACE INTO strategy.backtest_notes "
         "(buy_date, note, saved_at) VALUES (?,?,?)",
         [(str(d), str(n), now) for d, n in notes.items()])
     conn.commit()
@@ -2205,7 +2205,7 @@ def load_backtest_notes() -> dict:
     """{买入日: 点评};没有则空 dict。"""
     conn = _conn()
     rows = conn.execute(
-        "SELECT buy_date, note FROM strategydb.backtest_notes").fetchall()
+        "SELECT buy_date, note FROM strategy.backtest_notes").fetchall()
     conn.close()
     return {r["buy_date"]: r["note"] for r in rows}
 

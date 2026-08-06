@@ -1013,7 +1013,7 @@ def main():
                         help="止损卖出当天不许再买回同一只基金(默认允许)")
     parser.add_argument("--no-save", action="store_true",
                         help="这次不落库。默认每跑一次都追加一条到策略库"
-                             "(strategydb.strategy_runs), 页面能翻到历史每一跑;"
+                             "(strategy.strategy_runs), 页面能翻到历史每一跑;"
                              "默认参数那次额外标记为线上标准策略")
     parser.add_argument("--label", default=None,
                         help="给这次跑批起个名字(页面上显示)。不给就按参数"
