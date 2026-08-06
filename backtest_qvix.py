@@ -1,7 +1,7 @@
 """
 回测: QVIX恐慌信号买入 + 双止损(基金回撤控制线 / 大盘回撤线)
 - 买入: QVIX > 2年90分位阈值, 且资金可用(空仓或当天恰好卖出)
-- 标的: 前一交易日近3月冠军(C类全市场, 规模≥5000万), 冠军排名复用 fetcher.compute_
+- 标的: 前一交易日近3月冠军(C类全市场, 规模≥2亿), 冠军排名复用 fetcher.compute_
   metrics_asof——与 app.py「基金列表」页"截至日期"筛选完全同口径(按日
   收益率连乘, 正确处理分红除权, 自带单日|收益率|>30%异常值过滤), 而非
   简化的 end_nav/anchor_nav-1(曾把 2020-07-16 算错成广发医疗保健夺冠,
@@ -41,7 +41,7 @@ NAV_ANOMALIES = {
 # 中途淘汰的旧方案, 历史版本见 git 历史, 不再列在这里。当前标准策略是
 # QVIX 2年90分位信号(window=490,pct=0.90) + 近3月跌幅最大(ret_col=
 # "ret_3m",pick="bottom") + 候选波动率比值≥1.5(min_vol_ratio=1.5) +
-# 候选规模≥5000万(min_aum=0.5, 2026-07-28 新增, 见 min_aum 说明) +
+# 候选规模≥2亿(min_aum=2.0, 2026-08-06 从0.5亿提高, 见 min_aum 说明) +
 # 跌幅耗尽(候选按跌幅从深到浅排, 找到第一个非负值就当天不操作, 不退而
 # 求其次买涨幅最小的) + 排除QDII/海外/持有期锁定基金(港股通/沪港深/
 # 恒生系列不再排除, 见 _HK_RE 定义处说明), 命令:
@@ -405,7 +405,7 @@ def get_fund_nav_after(conn, code, from_date):
 def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  min_corr: float = None, ret_col: str = "ret_3m", pick: str = "bottom",
                  min_vol_ratio: float = 1.5, dd_divisor: float = 5.0,
-                 min_aum: float = 0.5, require_drop: bool = True,
+                 min_aum: float = 2.0, require_drop: bool = True,
                  regime_basis: str = "day", no_same_day_rebuy: bool = False):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
@@ -462,16 +462,27 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     大盘回撤线=阈值/dd_divisor。默认5.0(线上在用口径), 可传4/6等回测
     更宽/更窄的止损带对效果的影响。
 
-    min_aum: 候选基金规模下限(亿元), 默认0.5(=5000万, 2026-07-28定为标准
-    参数)。规模来自 fetcher.fund_aum_asof(信号日当时能看到的最新一期季报,
-    无未来函数——季报有披露滞后, 只用已披露的)。低于门槛、或那天还查不到
-    任何已披露季报(多是成立太新的迷你基金)的候选跳过、往下一名找。起因:
-    "跌幅最大"排在最前面的常是几十万~几千万规模的迷你/僵尸基金, 净值容易
-    被单笔申赎搅动失真, 选出的"冠军"是噪声(如2026-03原本选中东方城镇消费
-    主题C, 规模仅几万)。实测加0.5亿门槛后累计收益(费后复利)从+470.41%变到
-    +490.48%(2026-07-29修正规模披露日口径后的值; 修正前一度显示+675.40%,
-    是错用了更旧季度规模所致), 主要是把那笔垃圾换成正常规模标的; 5000万 vs
-    1亿量级差别不大, 选5000万即可。传 None 关掉过滤。"""
+    min_aum: 候选基金规模下限(亿元), 默认2.0(=2亿, 2026-08-06 定为标准,
+    此前是0.5亿)。规模来自 fetcher.fund_aum_asof(信号日当时能看到的最新
+    一期季报, 无未来函数——季报有披露滞后, 只用已披露的)。低于门槛、或那天
+    还查不到任何已披露季报(多是成立太新的迷你基金)的候选跳过、往下一名找。
+    最初加这道门槛(2026-07-28, 0.5亿)是因为"跌幅最大"排在最前面的常是几十万~
+    几千万规模的迷你/僵尸基金, 净值容易被单笔申赎搅动失真。
+
+    2026-08-06 四档实测(其余参数全默认, 各9笔, 买卖日期完全相同, 只换标的):
+      门槛     胜率     复利      单笔几何均值  剔最佳后   亏损笔数
+      0.5亿   88.9%   +570.36%   +23.54%     +178.77%    1
+      1.5亿   88.9%   +426.82%   +20.28%     +161.07%    1
+      2亿     77.8%   +575.51%   +23.65%     +172.26%    2
+      3亿     66.7%   +436.21%   +20.51%     +116.12%    3
+    总复利在四档间上下弹跳(570→427→576→436)、没有趋势, 主要是换标的的
+    噪声; 真正单调的是亏损笔数(1→1→2→3)和胜率(88.9→88.9→77.8→66.7),
+    方向都是门槛越高越差。剔除最佳一笔后也是 0.5亿 最优。
+    **按这组数据 0.5亿 表现最好, 2亿 的总复利优势(+5个点)完全来自单笔运气
+    (2025-04-07 德邦鑫星 +148.11%)**——2026-08-06 仍定 2亿 为标准是用户的
+    选择(倾向更大更稳的基金), 不是回测结论支持的。样本只有9笔、每档只差
+    几只标的, 这组对比本身也支撑不了精确定档, 别拿它当依据反复调。
+    传 None 关掉过滤。"""
     conn = get_conn()
 
     # Load fund names and types from JSON cache
@@ -826,9 +837,10 @@ def main():
                              "6=更窄止损带")
     parser.add_argument("--min-aum",
                         type=lambda s: None if s.lower() == "none" else float(s),
-                        default=0.5,
+                        default=2.0,
                         help="基金规模下限(亿元,信号日当时能看到的最新季报口径),"
-                             "默认0.5=5000万(2026-07-28标准);1=1亿;传none关闭。"
+                             "默认2.0=2亿(2026-08-06标准);0.5=5000万(旧标准);"
+                             "传none关闭。"
                              "低于门槛或查不到规模的候选跳过、往下一名找")
     parser.add_argument("--no-require-drop", action="store_true",
                         help="关掉「跌幅耗尽即不操作」规则:信号日即便所有候选都"
@@ -872,7 +884,7 @@ def main():
     _is_standard = (args.window == 490 and args.pct == 0.90
                     and args.min_corr is None and args.lookback == "3m"
                     and args.pick == "bottom" and args.min_vol_ratio == 1.5
-                    and args.dd_divisor == 5.0 and args.min_aum == 0.5
+                    and args.dd_divisor == 5.0 and args.min_aum == 2.0
                     and not args.no_require_drop)
     _params = {
         "window": args.window, "pct": args.pct, "ret_col": _ret_col,
