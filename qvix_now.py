@@ -18,9 +18,11 @@
 怎么用:
   · 自动: launchd 在工作日 14:40 跑一次, 就这一次(见
     ~/Library/LaunchAgents/com.fundanalyzer.qvix.plist), 加 --notify 把结果
-    推成 macOS 通知。不自动补跑: 这台机器不是一直有网, 但补跑要么打扰、
-    要么无声无息, 不如让人知道"今天这次没成"——失败会弹一个不会自动消失的
-    对话框, 回来双击 qvix.command 手动跑一次即可。
+    推成 macOS 通知。成功和失败**都**弹一个不会自动消失的对话框(必须点
+    "知道了"才关掉)——14:40 跑的时候人多半不在电脑前, 横幅几秒就滑走了,
+    等回来什么都看不到。不自动补跑: 这台机器不是一直有网, 但补跑要么打扰、
+    要么无声无息, 不如让人知道"今天这次没成", 回来双击 qvix.command
+    手动跑一次即可。
     节假日不用管: 脚本自己查交易日历(qvix_phase), 非交易日静默退出。
   · 手动: 双击 qvix.command, 每次都现算, 不加 --notify(终端里本来就看得见)。
   跑完把当前 QVIX、恐慌阈值、距触发还差多少直接打在屏幕上, 并写到本地
@@ -55,10 +57,15 @@ OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qvix_now.json")
 CONF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qvix_notify.conf")
 
 
-def _osa(script: str) -> None:
-    """跑一段 AppleScript。失败静默——通知不出来不该影响主流程。"""
+def _osa(script: str, timeout: float = 20) -> None:
+    """跑一段 AppleScript。失败静默——通知不出来不该影响主流程。
+
+    timeout=None 用于 display dialog 这种要一直等人点的脚本: subprocess 的
+    timeout 到点会**杀掉 osascript**, 弹窗跟着消失, 那"必须点击才能关闭"就
+    成了空话(这条之前踩过——失败弹窗写着不会自动消失, 实际 20 秒就没了)。
+    阻塞的代价是这个进程一直挂着等人点, 对一天只跑一次的定时任务可以接受。"""
     try:
-        subprocess.run(["osascript", "-e", script], timeout=20,
+        subprocess.run(["osascript", "-e", script], timeout=timeout,
                        capture_output=True)
     except Exception as e:
         log.debug("通知失败: %s", e)
@@ -125,11 +132,18 @@ def _send_imessage(msg: str) -> bool:
 
 
 def _notify_ok(title: str, msg: str) -> None:
-    """成功: 横幅通知, 看一眼就走, 不打断。同时发一条 iMessage 到手机——
-    14:40 跑的时候人多半不在电脑前, 横幅几秒就没了。"""
+    """成功: 跟失败一样弹**不会自动消失**的对话框, 必须点"知道了"才关掉。
+
+    原来成功走的是横幅(display notification), 几秒就滑走了——14:40 跑的时候
+    人多半不在电脑前, 等回来横幅早没了, 于是"今天到底跑没跑、QVIX 是多少"
+    只能自己去翻 qvix_now.json。改成对话框后, 不管人什么时候回到电脑前, 那
+    一天的结果都还挂在屏幕上等着。
+    iMessage 照发, 且必须在弹窗**之前**发(理由同 _notify_fail: dialog 会一直
+    阻塞)。"""
     t, m = title.replace('"', "'"), msg.replace('"', "'")
-    _osa(f'display notification "{m}" with title "{t}"')
     _send_imessage(f"{t}\n{m}")
+    _osa(f'display dialog "{m}" with title "{t}" '
+         'buttons {"知道了"} default button 1', timeout=None)
 
 
 def _notify_fail(msg: str) -> None:
@@ -142,7 +156,7 @@ def _notify_fail(msg: str) -> None:
     # 的话短信要等你回到电脑前才发得出去, 正好把这条通道的意义抵消掉。
     _send_imessage("QVIX 定时任务失败\n" + msg)
     _osa('display dialog "' + m + '" with title "QVIX 定时任务失败" '
-         'buttons {"知道了"} default button 1 with icon caution')
+         'buttons {"知道了"} default button 1 with icon caution', timeout=None)
 
 
 def main() -> int:
