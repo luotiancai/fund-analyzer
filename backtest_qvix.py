@@ -411,7 +411,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  min_vol_ratio: float = 1.5, dd_divisor: float = 5.0,
                  min_aum: float = 2.0, require_drop: bool = True,
                  regime_basis: str = "day", no_same_day_rebuy: bool = False,
-                 max_aum: float = None):
+                 max_aum: float = None, fallback_top: bool = False):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
     的 475/490 那套道理)。默认 490/0.90 是当前线上在用的参数
@@ -693,6 +693,19 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                                                  min_aum=min_aum,
                                                  require_drop=_req_drop,
                                                  max_aum=max_aum)
+            # 兜底: 当天找不到"真正跌过"的合格候选时(跌幅耗尽, 或者跌的那些
+            # 都过不了波动率/规模门槛), 标准策略是直接放弃这一天; 打开
+            # fallback_top 则改买涨幅最大的那只。注意这跟 require_drop=False
+            # 不是一回事——那个是退而求其次买"跌幅最小(往往是微涨)"的, 还在
+            # 榜单尾部捞; 这里是掉头去榜单另一头拿涨幅冠军。
+            if code is None and fallback_top and _pick == "bottom":
+                code, ret_3m = find_champion_on_date(
+                    conn, day_str, _excl, sse_df=sse, min_corr=min_corr,
+                    ret_col=ret_col, pick="top",
+                    min_vol_ratio=min_vol_ratio, min_aum=min_aum,
+                    require_drop=False, max_aum=max_aum)
+                if code is not None:
+                    _pick = "top"      # 供「选向」列区分这笔走的是兜底分支
             if code is None:
                 continue
 
@@ -875,6 +888,11 @@ def main():
                         help="基金规模上限(亿元, 同 --min-aum 的季报口径),"
                              "默认不设上限。配合 --min-aum 可以只取某个规模"
                              "区间, 如 --min-aum 0.5 --max-aum 10")
+    parser.add_argument("--fallback-top", action="store_true",
+                        help="当天找不到真正下跌的合格候选时, 改买涨幅最大的"
+                             "(默认是放弃这一天不操作)。跟 --no-require-drop"
+                             "不同: 那个是买跌幅最小(往往微涨)的, 这个是掉头"
+                             "去拿涨幅冠军")
     parser.add_argument("--regime-basis", choices=["day", "window"], default="day",
                         help="pick=regime 时的择向依据: day(默认)=信号日当天"
                              "单日涨跌; window=比一个回看窗口前(截至前一交易日,"
@@ -898,6 +916,7 @@ def main():
                           dd_divisor=args.dd_divisor,
                           min_aum=args.min_aum,
                           max_aum=args.max_aum,
+                          fallback_top=args.fallback_top,
                           require_drop=not args.no_require_drop,
                           regime_basis=args.regime_basis,
                           no_same_day_rebuy=args.no_same_day_rebuy)
@@ -915,13 +934,14 @@ def main():
                     and args.min_corr is None and args.lookback == "3m"
                     and args.pick == "bottom" and args.min_vol_ratio == 1.5
                     and args.dd_divisor == 5.0 and args.min_aum == 2.0
-                    and args.max_aum is None
+                    and args.max_aum is None and not args.fallback_top
                     and not args.no_require_drop)
     _params = {
         "window": args.window, "pct": args.pct, "ret_col": _ret_col,
         "pick": args.pick, "min_vol_ratio": args.min_vol_ratio,
         "dd_divisor": args.dd_divisor, "min_aum": args.min_aum,
         "max_aum": args.max_aum,
+        "fallback_top": args.fallback_top,
         "require_drop": not args.no_require_drop,
         # 择向依据("day"=当天单日涨跌 / "window"=比回看窗口前、截至前一日),
         # 只对 pick="regime" 有意义。页面按它描述规则, 不同跑批各说各的。
