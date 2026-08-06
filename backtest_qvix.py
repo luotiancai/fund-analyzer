@@ -411,7 +411,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  min_vol_ratio: float = 1.5, dd_divisor: float = 5.0,
                  min_aum: float = 2.0, require_drop: bool = True,
                  regime_basis: str = "day", no_same_day_rebuy: bool = False,
-                 max_aum: float = None, fallback_top: bool = False):
+                 max_aum: float = None, fallback_top: bool = False,
+                 defer_until_different: bool = False):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
     的 475/490 那套道理)。默认 490/0.90 是当前线上在用的参数
@@ -584,6 +585,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
 
     trades = []
     position = None
+    last_closed_code = None    # 上一笔平仓的标的, 见 defer_until_different
 
     # 逐交易日走: 持仓时每天检查双止损线, 空仓(或当天刚卖出)遇信号日则买入
     all_days = sse[sse["date"] >= _signal_floor]
@@ -594,6 +596,9 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
         sse_close = float(day_row["close"])
 
         sold_today = None      # 今天止损卖出的代码(供 no_same_day_rebuy 用)
+        # last_closed_code 在循环外维护(见下面赋值处): 上一笔平仓的标的,
+        # defer_until_different 用它把"又选中同一只"的信号日一路跳过去,
+        # 直到某个信号日选出不同标的为止。
 
         # ── Step 1: 持仓时逐日检查双止损 ──
         if position is not None:
@@ -660,6 +665,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                     "_ret_pct": ret_pct,
                 })
                 sold_today = code
+                last_closed_code = code
                 position = None
 
         # ── Step 2: 空仓(含当天刚卖出)且为信号日时买入 ──
@@ -708,6 +714,15 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                     _pick = "top"      # 供「选向」列区分这笔走的是兜底分支
             if code is None:
                 continue
+            # 又选中上一笔刚平仓的那只 → 这个信号日整个跳过, 一路顺延到
+            # 某个信号日选出**不同**标的为止(不是只延一天: 信号日常常是
+            # 连续的, 只延一天的话第二天大概率还是同一只, 实测 2024-11-18
+            # 延到 11-19 选出来的还是 017513, 白延一天还多付0.5%手续费)。
+            # 跟 no_same_day_rebuy 的区别: 那个是当天换一只别的买(实测只
+            # 会换成同指数的另一只壳, 敞口没变), 这个是空仓等到标的真正
+            # 换掉——止损既然喊了撤退, 就真的从这个标的上退出来。
+            if defer_until_different and code == last_closed_code:
+                continue
 
             # 获取当天买入净值
             row = conn.execute(
@@ -736,6 +751,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
             # 预载基金净值序列, 供逐日止损检查
             nav_map = dict(get_fund_nav_after(conn, code, actual_buy_date))
 
+            last_closed_code = None    # 已经换到别的标的, 顺延约束解除
             position = {
                 "code": code,
                 "buy_date": actual_buy_date,
@@ -893,6 +909,11 @@ def main():
                              "(默认是放弃这一天不操作)。跟 --no-require-drop"
                              "不同: 那个是买跌幅最小(往往微涨)的, 这个是掉头"
                              "去拿涨幅冠军")
+    parser.add_argument("--defer-until-different", action="store_true",
+                        help="止损平仓后, 只要选出来还是同一只基金就一直跳过"
+                             "信号日, 直到选出不同标的才建仓(默认照买)。"
+                             "跟 --no-same-day-rebuy 不同: 那个是当天换一只"
+                             "别的买, 这个是空仓等到标的真正换掉")
     parser.add_argument("--regime-basis", choices=["day", "window"], default="day",
                         help="pick=regime 时的择向依据: day(默认)=信号日当天"
                              "单日涨跌; window=比一个回看窗口前(截至前一交易日,"
@@ -917,6 +938,7 @@ def main():
                           min_aum=args.min_aum,
                           max_aum=args.max_aum,
                           fallback_top=args.fallback_top,
+                          defer_until_different=args.defer_until_different,
                           require_drop=not args.no_require_drop,
                           regime_basis=args.regime_basis,
                           no_same_day_rebuy=args.no_same_day_rebuy)
@@ -935,6 +957,7 @@ def main():
                     and args.pick == "bottom" and args.min_vol_ratio == 1.5
                     and args.dd_divisor == 5.0 and args.min_aum == 2.0
                     and args.max_aum is None and not args.fallback_top
+                    and not args.defer_until_different
                     and not args.no_require_drop)
     _params = {
         "window": args.window, "pct": args.pct, "ret_col": _ret_col,
@@ -942,6 +965,7 @@ def main():
         "dd_divisor": args.dd_divisor, "min_aum": args.min_aum,
         "max_aum": args.max_aum,
         "fallback_top": args.fallback_top,
+        "defer_until_different": args.defer_until_different,
         "require_drop": not args.no_require_drop,
         # 择向依据("day"=当天单日涨跌 / "window"=比回看窗口前、截至前一日),
         # 只对 pick="regime" 有意义。页面按它描述规则, 不同跑批各说各的。
