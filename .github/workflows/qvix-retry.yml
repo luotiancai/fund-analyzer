@@ -35,29 +35,30 @@ jobs:
           python-version: "3.12"
       - name: 安装依赖(不装 streamlit)
         run: pip install --quiet requests pandas numpy akshare
-      - name: 取回数据库(Release tag `data`)
+      - name: 取回 QVIX 所在的库(Release tag `data`)
+        # 补跑只写 qvix_self_history 一张表, 它住在 market.db(约 0.8MB)。
+        # 分库前这一步要下整个 400MB 的 fund_cache.db、跑完再传回 80MB 的
+        # gz —— 为了补一个数字搬动几百 MB。现在只碰 market.db。
         # 这里不做"下载不到就从零回填"的兜底:补跑的前提就是已经有一份库,
         # 库都没有的话该由 update-daily.yml 去建,补跑直接失败反而看得见。
         run: |
           mkdir -p "$FUND_ANALYZER_DATA"
-          gh release download data --pattern fund_cache.db.gz \
-            --output db.gz --repo "$GITHUB_REPOSITORY"
-          gunzip -c db.gz > "$FUND_ANALYZER_DATA/fund_cache.db" && rm db.gz
+          gh release download data --pattern market.db.gz \
+            --output market.db.gz --repo "$GITHUB_REPOSITORY"
+          gunzip -c market.db.gz > "$FUND_ANALYZER_DATA/market.db" && rm market.db.gz
       - name: 补算 QVIX
         id: qvix
         run: python update_daily.py --qvix-only
-      - name: 回传数据库(只在真补上了值时)
+      - name: 回传(只在真补上了值时)
         # 大部分早上凌晨那次是好的,这里算出来是同一个数、库没变化,没必要
-        # 白压白传 80MB。changed 由 update_daily.run_qvix_only 写出。
+        # 白压白传。changed 由 update_daily.run_qvix_only 写出。
+        #
+        # 分库前这里还得连 nav 一起重发, 因为 core 和 nav 必须同版本发布,
+        # 否则应用侧两半的数据日期对不上。现在 QVIX 自己一个库, 那个约束
+        # 连同 build_snapshot 那一步一起没了。
         if: steps.qvix.outputs.changed == 'true'
         run: |
           echo "补上了: ${{ steps.qvix.outputs.filled }}"
-          gzip -9 -c "$FUND_ANALYZER_DATA/fund_cache.db" > fund_cache.db.gz
-          # QVIX 只落在 core 那一半(qvix_self_history),重表没动;但 core 与
-          # nav 必须同版本发布,否则应用侧两半的数据日期会对不上。
-          python build_snapshot.py "$FUND_ANALYZER_DATA/fund_cache.db" \
-            fund_cache_core.db fund_cache_nav.db
-          gzip -9 -c fund_cache_core.db > fund_cache_core.db.gz
-          gzip -9 -c fund_cache_nav.db  > fund_cache_nav.db.gz
-          gh release upload data fund_cache.db.gz fund_cache_core.db.gz \
-            fund_cache_nav.db.gz --clobber --repo "$GITHUB_REPOSITORY"
+          gzip -9 -c "$FUND_ANALYZER_DATA/market.db" > market.db.gz
+          ls -lh market.db.gz
+          gh release upload data market.db.gz --clobber --repo "$GITHUB_REPOSITORY"

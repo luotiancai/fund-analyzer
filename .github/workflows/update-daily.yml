@@ -45,15 +45,26 @@ jobs:
           python-version: "3.12"
       - name: 安装依赖(不装 streamlit)
         run: pip install --quiet requests pandas numpy akshare
-      - name: 取回上次的数据库(Release tag `data`)
+      - name: 取回上次的各个库(Release tag `data`)
+        # 数据按 fetcher.DB_LAYOUT 分成若干独立的库, 每个库一个资产。以前是
+        # 一个 400MB 的 fund_cache.db 打包所有表, 发布单元跟更新节奏对不上,
+        # 推一次策略结果能把跑批攒五天的行情盖回去(2026-08-05)。
+        # cache(筛选结果缓存)不取: 跑批不读它, 丢了应用自己重算。
+        # strategy/sim 也不取: 权威写入方分别是本地回测和线上 app, 跑批只读
+        # 不写, 取回来再传回去只会平白增加覆盖它们的机会。
         run: |
           mkdir -p "$FUND_ANALYZER_DATA"
-          if gh release download data --pattern fund_cache.db.gz \
-               --output db.gz --repo "$GITHUB_REPOSITORY"; then
-            gunzip -c db.gz > "$FUND_ANALYZER_DATA/fund_cache.db" && rm db.gz
-          else
-            echo "::warning::release 不存在,将从零全量回填(耗时数小时,建议先用 push_db.sh 上传种子库)"
-          fi
+          for db in fund_rank market fund_nav fund_scale; do
+            if gh release download data --pattern "$db.db.gz" \
+                 --output "$db.db.gz" --repo "$GITHUB_REPOSITORY"; then
+              gunzip -c "$db.db.gz" > "$FUND_ANALYZER_DATA/$db.db"
+              rm "$db.db.gz"
+              echo "取回 $db.db ($(du -h "$FUND_ANALYZER_DATA/$db.db" | cut -f1))"
+            else
+              echo "::warning::$db.db.gz 不存在, 该库将从零开始"
+            fi
+          done
+
       - name: 跑批(增量补净值 + 重算指标 + 刷新上证/QVIX)
         # scales-only 只刷规模,别的一概不碰;定时触发没有 inputs,默认 full。
         run: |
@@ -62,19 +73,17 @@ jobs:
           else
             python update_daily.py
           fi
-      - name: 压缩并回传数据库
-        # 三个资产:整库(下次跑批的底子 + 应用侧回退路径)、core(应用启动时
-        # 同步拉,gz ~2MB)、nav(重表,应用首屏之后后台拉)。拆分口径见
-        # build_snapshot.py。
+      - name: 压缩并回传各个库
+        # 一个库一个资产, 各自独立。只传跑批真正写过的那几个 —— 不碰
+        # strategy(本地回测发)、sim(线上 app 写)、cache(缓存)。
         run: |
-          gzip -9 -c "$FUND_ANALYZER_DATA/fund_cache.db" > fund_cache.db.gz
-          python build_snapshot.py "$FUND_ANALYZER_DATA/fund_cache.db" \
-            fund_cache_core.db fund_cache_nav.db
-          gzip -9 -c fund_cache_core.db > fund_cache_core.db.gz
-          gzip -9 -c fund_cache_nav.db  > fund_cache_nav.db.gz
-          ls -lh fund_cache*.gz
+          cd "$FUND_ANALYZER_DATA"
+          for db in fund_rank market fund_nav fund_scale; do
+            [ -f "$db.db" ] || { echo "::warning::缺 $db.db, 不传"; continue; }
+            gzip -9 -c "$db.db" > "$db.db.gz"
+          done
+          ls -lh ./*.db.gz
           gh release create data --title "数据快照" \
             --notes "每日跑批产物,应用启动时自动拉取,请勿手动改动" \
             --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
-          gh release upload data fund_cache.db.gz fund_cache_core.db.gz \
-            fund_cache_nav.db.gz --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload data ./*.db.gz --clobber --repo "$GITHUB_REPOSITORY"

@@ -65,39 +65,73 @@ CACHE_DB = os.path.join(_DATA_DIR, "fund_cache.db")
 _LEGACY_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "fund_cache.db")
 
-# ── 云端两段式快照 ────────────────────────────────────────────────────────────
-# 净值/持仓/规模这三张表占整库 99%(净值表 250MB + 它的 date 索引 120MB,
-# 其余所有表加起来 9MB),而首屏(上证指数+QVIX+榜单)一行都不读它们——要等
-# 用户点进筛选/详情/模拟盘才用得上。所以云端把库切成两段(见
-# build_snapshot.py):core 启动时同步拉(gz 2MB,拉完首屏立刻能画),重表库
-# 首屏之后后台拉(gz 63MB),落地后 ATTACH 进来接管。
-# 本地是单库,LAZY_NAV 恒为 False,下面这些全部不生效。
-NAV_DB = os.path.join(_DATA_DIR, "fund_cache_nav.db")
-HEAVY_TABLES = ("fund_nav_daily", "fund_holdings", "fund_scale_hist")
-LAZY_NAV = False       # app.py 在云端两段式模式下置 True
-_nav_ready = False     # 重表库是否已落地并接管(仅 LAZY_NAV 下有意义)
+# ── 分库布局 ─────────────────────────────────────────────────────────────────
+# 一个 400MB 的 fund_cache.db 装下所有表, 是这个项目历史上大部分数据事故的
+# 根源: 发布单元(整个文件)跟更新节奏(每张表各不相同)对不上。
+#   · 想更新几 KB 的回测结果, 要整库上传 —— 2026-08-05 就这么把云端攒了
+#     5 天的行情盖回了 07-30;
+#   · 想更新 9MB 的规模表, 同样得连 233MB 净值一起推, 于是干脆不推;
+#   · 本地想同步一点新数据, 最小粒度是 62MB 的重表段;
+#   · 云端那份库是每日跑批"下载→改→传回"一路继承的, 本地 DROP 掉的表在它
+#     里面永远删不掉(线上至今留着 4 张策略拆库前的僵尸表)。
+#
+# 所以按「谁写它 + 多久变一次 + 首屏要不要等」把表分到独立文件里, 每个文件
+# 是一条独立的发布线, 互相盖不到:
+#
+#   库          文件               权威写入方      更新节奏   首屏
+#   rank        fund_rank.db       每日跑批        日          要
+#   market      market.db          跑批+本地QVIX   日          要
+#   strategy    fund_strategy.db   本地回测        手动        要
+#   sim         sim.db             线上 app        随时        要
+#   cache       cache.db           线上 app        随时        丢了自动重建
+#   nav         fund_nav.db        每日跑批        日          不要(233MB)
+#   scale       fund_scale.db      每日跑批        季          不要(13.7MB)
+#
+# lazy=True 的两个是"点进基金详情才用"的大表, 云端首屏之后才后台拉。
+DB_LAYOUT = (
+    # (库名, 文件名, 表, 是否惰性加载)
+    ("rank", "fund_rank.db",
+     ("fund_list", "fund_sharpe", "fund_nav_meta", "app_meta",
+      "fund_index_code", "etf_target_map"), False),
+    ("market", "market.db",
+     ("index_daily_cache", "qvix_self_history"), False),
+    ("strategy", "fund_strategy.db",
+     ("strategy_runs", "backtest_notes"), False),
+    ("sim", "sim.db",
+     ("sim_trades", "sim_meta", "sim_archives"), False),
+    ("cache", "cache.db",
+     ("filter_results",), False),
+    ("nav", "fund_nav.db",
+     ("fund_nav_daily",), True),
+    ("scale", "fund_scale.db",
+     ("fund_scale_hist", "fund_scale_miss", "fund_holdings"), True),
+)
+DB_PATH = {name: os.path.join(_DATA_DIR, fn) for name, fn, _t, _l in DB_LAYOUT}
+DB_OF_TABLE = {t: name for name, _fn, tabs, _l in DB_LAYOUT for t in tabs}
+LAZY_DBS = tuple(name for name, _fn, _t, lazy in DB_LAYOUT if lazy)
 
-# ── 策略库(独立文件, 跟行情数据彻底分开)─────────────────────────────────────
-# 回测结果只有几十 KB, 却曾经跟 400MB 的行情主库存在一起——发布一次策略
-# 结果要整库上传, 2026-08-05 就因此出过事故: 本地库的行情数据停在 07-30,
-# 为了推两张回测表跑了 push_db.sh, 把云端每日跑批攒到 08-04 的行情整个
-# 盖回 07-30。分库之后:
-#   · 发策略 = 传一个 10KB 的 gz(push_strategy.sh), 碰不到行情数据;
-#   · 每日跑批只传 fund_cache*.db.gz 那三个资产, 永远盖不到策略库;
-#   · 两边可以同时发, 互不等待。
-# 不做惰性加载(nav 那套是因为 63MB 值得等), 这个文件太小, _conn() 里
-# 无条件 ATTACH。SQLite 对不存在的路径会在 ATTACH 时建空库, 所以首次跑
-# 不用特殊处理。
-STRATEGY_DB = os.path.join(_DATA_DIR, "fund_strategy.db")
-# 主库里绝不能留同名表:SQLite 解析不带库名的表名是 temp→main→attached,
-# main 里留个空表会把 ATTACH 上来的真表整个遮蔽掉(nav 那边踩过, 见
-# adopt_nav_db)。所以下面所有 SQL 一律写全 strategydb.xxx。
-STRATEGY_TABLES = ("strategy_runs", "backtest_notes")
+# 云端两段式:app.py 置 True 后, 惰性库在下载落地前不 ATTACH 真文件, 而是挂
+# 一个同名的 :memory: 空库(见 _conn)。为什么不直接 ATTACH 那个还不存在的
+# 路径:SQLite 会就地建一个空文件, 之后 os.path.exists 恒为真, "下载好了没"
+# 就再也判断不出来了。也不能在 main 里建空占位表——SQLite 解析不带库名的表
+# 名是 temp→main→attached, main 里留个同名空表会把 ATTACH 上来的真表整个
+# 遮蔽掉(线上那 4 张僵尸表正在这么遮蔽 backtest_notes)。挂内存空库两头都
+# 避开了: 查得到表(返回空结果, 页面不炸), 又不留下任何文件痕迹。
+LAZY_NAV = False       # app.py 在云端两段式模式下置 True
+_ready_dbs = set()     # 已落地并接管的惰性库名(仅 LAZY_NAV 下有意义)
+
+_LEGACY_SINGLE_DB = CACHE_DB   # 分库前的 fund_cache.db, 由 split_dbs.py 迁移
+_IN_MIGRATION = False          # split_dbs.py 置 True, 免得它自己触发迁移提示
 
 
 def nav_ready() -> bool:
-    """重表(净值/持仓/规模)是否已可用。本地单库恒为 True。"""
-    return not LAZY_NAV or _nav_ready
+    """惰性库(净值/规模持仓)是否都已可用。本地恒为 True。"""
+    return not LAZY_NAV or set(LAZY_DBS) <= _ready_dbs
+
+
+def db_ready(name: str) -> bool:
+    """单个库是否可用。非惰性库恒为 True。"""
+    return name not in LAZY_DBS or not LAZY_NAV or name in _ready_dbs
 
 
 def _migrate_db_location():
@@ -137,69 +171,199 @@ HOLDINGS_TTL_PAST = 30 * 86400 # past years' disclosures barely change
 
 # ── DB helpers ───────────────────────────────────────────────────────────────
 
+_schema_ready = False      # 进程内只建一次表(CREATE IF NOT EXISTS 也不是免费的)
+
+
 def _conn():
-    # timeout guards the threaded backfill: concurrent writers wait for the
-    # lock instead of failing with "database is locked".
-    conn = sqlite3.connect(CACHE_DB, check_same_thread=False, timeout=30)
+    """连上全部分库。返回的连接里, 不带库名的表名照常能解析到对应的库,
+    所以那七十来处 "FROM fund_nav_daily" 一个字都不用改。
+
+    main 固定是 :memory: —— 所有真实的表都在 ATTACH 上来的库里, main 永远
+    是空的。这是刻意的: SQLite 解析不带库名的表名是 temp→main→attached,
+    只要 main 里有一张同名表就会把 attached 上来的真表整个遮蔽掉。以前
+    main 是 fund_cache.db, 这个坑踩过两次(nav 的占位表, 以及线上至今留着
+    的 4 张策略拆库前的僵尸表正在遮蔽 backtest_notes)。main 空着, 这类
+    bug 在结构上就不可能发生。
+
+    timeout 给并发跑批留出等锁时间, 而不是直接 "database is locked"。
+    """
+    global _schema_ready
+    conn = sqlite3.connect(":memory:", check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
-    # 重表在另一个库里时挂上来:SQLite 解析不带库名的表名会依次找
-    # temp→main→attached,所以那七十来处 "FROM fund_nav_daily" 一个字都不用
-    # 改。挂载条件用文件是否存在(os.replace 让它原子出现)而不是
-    # _nav_ready:后者要等 main 里的空占位表删掉才置位,提前挂上只是被占位
-    # 表遮蔽、查到空结果,不会报错。
-    if LAZY_NAV and os.path.exists(NAV_DB):
-        conn.execute("ATTACH DATABASE ? AS navdb", (NAV_DB,))
-    # 策略库无条件挂上(见 STRATEGY_DB 说明)。云端只读容器里文件可能还没
-    # 下下来, ATTACH 会就地建个空库, 查出来是空结果而不是报错。
-    conn.execute("ATTACH DATABASE ? AS strategydb", (STRATEGY_DB,))
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS strategydb.strategy_runs ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, run_at REAL, label TEXT,"
-        " params TEXT, trades TEXT, is_standard INTEGER DEFAULT 0,"
-        " n_trades INTEGER, win_rate REAL, cum_return REAL)")
-    conn.execute("CREATE TABLE IF NOT EXISTS strategydb.backtest_notes ("
-                 "buy_date TEXT PRIMARY KEY, note TEXT, saved_at REAL)")
+    placeholders = []
+    for name, _fn, _tables, lazy in DB_LAYOUT:
+        if lazy and LAZY_NAV and name not in _ready_dbs:
+            # 云端首屏: 大库还没下下来。挂一个同名的内存空库并建空表, 查询
+            # 返回空结果而不是 "no such table" 把页面炸掉。不去 ATTACH 那个
+            # 还不存在的路径 —— SQLite 会就地建出空文件, 之后
+            # os.path.exists 恒为真, "下载好了没" 就再也判断不出来了。
+            conn.execute(f"ATTACH DATABASE ':memory:' AS {name}")
+            placeholders.append(name)
+            continue
+        conn.execute(f"ATTACH DATABASE ? AS {name}", (DB_PATH[name],))
+    # 内存占位库每次都是新的, 必须每次建表; 真实文件库只在进程内首次建。
+    for name in placeholders:
+        conn.executescript(_DDL[name])
+    if not _schema_ready:
+        for name, _fn, _tables, lazy in DB_LAYOUT:
+            if name not in placeholders:
+                conn.executescript(_DDL[name])
+        conn.commit()
+        _schema_ready = True
     return conn
 
 
-def adopt_nav_db():
-    """重表库落盘后让它接管:删掉 main 里的空占位表(否则会遮蔽 ATTACH 上来
-    的真表),再把 idx_nav_date 建回去。
+def adopt_db(name: str):
+    """惰性库下载落地后让它接管, 并把该库的派生索引建回去。
 
-    索引不随快照下发(它占 120MB,是整库三成,却是纯派生数据):4.9M 行现建
-    实测 1~2 秒,比多下 17MB(gz)划算。
+    idx_nav_date 不随快照下发(它占 120MB, 是净值库的三成, 却是纯派生数据):
+    4.9M 行现建实测 1~2 秒, 比多下 17MB(gz)划算。
+
+    不再需要"删掉 main 里的占位表"那一步了 —— 占位表现在挂在一个每次连接
+    都重建的内存库里, 换成真文件后自然就没了(见 _conn)。
     """
-    global _nav_ready
-    conn = sqlite3.connect(CACHE_DB, timeout=30)
-    try:
-        for t in HEAVY_TABLES:
-            conn.execute(f"DROP TABLE IF EXISTS {t}")
-        conn.commit()
-    finally:
-        conn.close()
+    _ready_dbs.add(name)
     conn = _conn()
     try:
-        # 必须写成 navdb.idx_nav_date:CREATE INDEX 不带库名一律建在 main,
-        # 而 SQLite 要求索引和表同库,表在 navdb 里的话会直接报 no such
-        # table(读表名的 temp→main→attached 解析顺序在这儿不适用)。
-        conn.execute("CREATE INDEX IF NOT EXISTS navdb.idx_nav_date "
-                     "ON fund_nav_daily(date)")
-        conn.commit()
+        if name == "nav":
+            # 必须写成 nav.idx_nav_date:CREATE INDEX 不带库名一律建在 main,
+            # 而 SQLite 要求索引和表同库,表在 nav 库里的话会直接报 no such
+            # table(读表名的 temp→main→attached 解析顺序在这儿不适用)。
+            conn.execute("CREATE INDEX IF NOT EXISTS nav.idx_nav_date "
+                         "ON fund_nav_daily(date)")
+            conn.commit()
     finally:
         conn.close()
-    # 索引建完才解锁 UI:置位早了的话,刚放行的模拟盘头几秒要全表扫日期。
-    # 这期间查询本身是对的(占位表已删,_conn 已挂上 navdb),只是慢。
-    _nav_ready = True
-    logger.info("nav db adopted: %s", NAV_DB)
+    logger.info("db adopted: %s → %s", name, DB_PATH[name])
 
 
-# 重表的建表语句单独拎出来:云端两段式下它们由 navdb 提供,main 里不能有
-# 同名表,否则会遮蔽 ATTACH 上来的真表(见 _conn / adopt_nav_db)。
-_DDL_HEAVY = """
+def adopt_nav_db():
+    """兼容旧名字(app.py 老版本会调它)。"""
+    adopt_db("nav")
+
+
+# ── 建表语句(按库归位)────────────────────────────────────────────────────────
+# 每个库一段脚本, 表名一律带库名限定。必须带: CREATE TABLE 不写库名一律建在
+# main, 而 main 是 :memory:(见 _conn), 建出来的空表会把 ATTACH 上来的真表
+# 整个遮蔽掉——正是线上那 4 张僵尸表在干的事。
+#
+# 加新表时要同时改 DB_LAYOUT, 否则它不属于任何库、也不会被快照切分带上。
+_DDL = {
+
+"rank": """
+    -- 榜单快照:两万来只基金的全部字段压成一整块 JSON 存在一行里, 每天跑批
+    -- 全量重写。改一个字段要重写 7MB, 但它本来就是整读整写的。
+    CREATE TABLE IF NOT EXISTS rank.fund_list (
+        id       INTEGER PRIMARY KEY,
+        data     TEXT    NOT NULL,
+        saved_at REAL    NOT NULL
+    );
+    -- Per-fund freshness + newest stored date, so gap detection and TTL
+    -- checks never have to scan fund_nav_daily.
+    CREATE TABLE IF NOT EXISTS rank.fund_nav_meta (
+        code      TEXT PRIMARY KEY,
+        saved_at  REAL NOT NULL,
+        last_date TEXT
+    );
+    CREATE TABLE IF NOT EXISTS rank.fund_sharpe (
+        code        TEXT PRIMARY KEY,
+        ann_return  REAL,
+        volatility  REAL,
+        sharpe      REAL,
+        data_points INTEGER,
+        saved_at    REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS rank.app_meta (
+        key      TEXT PRIMARY KEY,
+        value    REAL,
+        saved_at REAL NOT NULL
+    );
+    -- ETF联接基金 → 目标场内ETF 的映射(重仓穿透用)。target_code 为空
+    -- 串表示解析失败,按 TTL 重试;成功的映射视为永久。
+    CREATE TABLE IF NOT EXISTS rank.etf_target_map (
+        code        TEXT PRIMARY KEY,
+        target_code TEXT NOT NULL,
+        target_name TEXT NOT NULL,
+        saved_at    REAL NOT NULL
+    );
+    -- 基金跟踪指数代码缓存(mobapi FundMNBasicInformation.INDEXCODE),
+    -- 供联接基金与候选 ETF 做指数一致性验证。
+    CREATE TABLE IF NOT EXISTS rank.fund_index_code (
+        code       TEXT PRIMARY KEY,
+        index_code TEXT NOT NULL,
+        saved_at   REAL NOT NULL
+    );
+""",
+
+"market": """
+    -- 外部指数/波动率日线缓存, 一个 key 一整块 JSON。key: sse(上证)、
+    -- hsi/vhsi(恒生及其波动率)、ixic/vix、au9999/gvz、qvix(外部源)。
+    -- sse/hsi/vhsi 每日跑批刷新, 其余按 TTL 惰性拉。
+    CREATE TABLE IF NOT EXISTS market.index_daily_cache (
+        key TEXT PRIMARY KEY, data TEXT, saved_at REAL);
+    -- 自算 QVIX 日频历史 + 当日阈值(490交易日90分位)。策略的信号判定读它。
+    CREATE TABLE IF NOT EXISTS market.qvix_self_history (
+        date TEXT PRIMARY KEY, qvix REAL, note TEXT, threshold REAL);
+""",
+
+"strategy": """
+    -- 每跑一次回测追加一条(见 save_strategy_run)。is_standard 标记线上
+    -- 标准策略那次, 主复盘表读最新的标准跑批。
+    CREATE TABLE IF NOT EXISTS strategy.strategy_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, run_at REAL, label TEXT,
+        params TEXT, trades TEXT, is_standard INTEGER DEFAULT 0,
+        n_trades INTEGER, win_rate REAL, cum_return REAL);
+    -- 人工写的复盘点评, 按买入日索引。
+    CREATE TABLE IF NOT EXISTS strategy.backtest_notes (
+        buy_date TEXT PRIMARY KEY, note TEXT, saved_at REAL);
+""",
+
+"sim": """
+    -- 模拟盘。权威写入方是**线上 app**(用户点击), 跟其余全部由跑批写的表
+    -- 不同, 所以必须独立成库: 混在一起的话, 本地推一次库就把线上用户的
+    -- 操作盖掉了。
+    -- 交易流水是唯一真相来源, 持仓和现金都从它推算。
+    CREATE TABLE IF NOT EXISTS sim.sim_meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT
+    );
+    CREATE TABLE IF NOT EXISTS sim.sim_trades (
+        id     INTEGER PRIMARY KEY AUTOINCREMENT,
+        date   TEXT NOT NULL,
+        code   TEXT NOT NULL,
+        action TEXT NOT NULL,      -- 'buy' | 'sell'
+        shares REAL NOT NULL,
+        nav    REAL NOT NULL,      -- execution unit NAV
+        amount REAL NOT NULL       -- buy: cash spent; sell: cash received
+    );
+    CREATE TABLE IF NOT EXISTS sim.sim_archives (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        name         TEXT NOT NULL,
+        saved_at     REAL NOT NULL,
+        current_date TEXT,
+        trades       TEXT NOT NULL,  -- JSON dump of sim_trades rows
+        start_date   TEXT
+    );
+""",
+
+"cache": """
+    -- Top rows (200) of each distinct filter run, keyed by a hash of the
+    -- filter params (+ metrics version in live mode), so repeating a
+    -- filter is a read instead of a recompute — across restarts too.
+    -- 纯缓存: 丢了自动重算, 所以这个库不参与"别覆盖"的那套小心翼翼。
+    CREATE TABLE IF NOT EXISTS cache.filter_results (
+        key      TEXT PRIMARY KEY,
+        params   TEXT NOT NULL,
+        data     TEXT NOT NULL,
+        saved_at REAL NOT NULL
+    );
+""",
+
+"nav": """
     -- One row per fund per day: appends are single-row INSERTs instead of
     -- rewriting a whole per-fund JSON blob (the old fund_nav design, which
     -- churned ~20KB of freelist pages per fund per update).
-    CREATE TABLE IF NOT EXISTS fund_nav_daily (
+    CREATE TABLE IF NOT EXISTS nav.fund_nav_daily (
         code          TEXT NOT NULL,
         date          TEXT NOT NULL,    -- ISO yyyy-mm-dd
         nav           REAL,
@@ -207,20 +371,14 @@ _DDL_HEAVY = """
         acc_nav       REAL,
         PRIMARY KEY (code, date)
     ) WITHOUT ROWID;
-    -- Quarterly top-10 holdings (stocks + bonds) per fund, one year of
-    -- quarters per row, stored as normalized JSON records.
-    CREATE TABLE IF NOT EXISTS fund_holdings (
-        code     TEXT NOT NULL,
-        year     TEXT NOT NULL,
-        data     TEXT NOT NULL,
-        saved_at REAL NOT NULL,
-        PRIMARY KEY (code, year)
-    ) WITHOUT ROWID;
-    -- 基金季度规模(期末净资产)历史,来自 pingzhongdata 的
-    -- Data_fluctuationScale。一支基金一季一行,aum 单位亿元,publish_date
-    -- 是该季报的估算披露日(季末+滞后天数,见 _SCALE_PUB_LAG),供回测/选基
-    -- 按"信号日当时能看到的最新一期"取规模、避免未来函数。
-    CREATE TABLE IF NOT EXISTS fund_scale_hist (
+""",
+
+"scale": """
+    -- 基金季度规模(期末净资产)历史, 来自东财 F10 规模变动(gmbd)。一支基金
+    -- 一季一行, aum 单位亿元, publish_date 是该季报的估算披露日(季末后第15
+    -- 个交易日), 供回测/选基按"信号日当时能看到的最新一期"取规模、避免未来
+    -- 函数。注意规模门槛用的是 A/C 合并口径, 见 fund_aum_asof。
+    CREATE TABLE IF NOT EXISTS scale.fund_scale_hist (
         code         TEXT NOT NULL,
         quarter_end  TEXT NOT NULL,   -- ISO yyyy-mm-dd(季末)
         aum          REAL,            -- 期末净资产,亿元
@@ -228,78 +386,48 @@ _DDL_HEAVY = """
         saved_at     REAL NOT NULL,
         PRIMARY KEY (code, quarter_end)
     ) WITHOUT ROWID;
-"""
+    -- 规模抓取"请求成功但页面里确实没有规模变动表"的记录(场内份额、刚成立、
+    -- 已清盘)。没有这张表的话它们在 fund_scale_hist 里永远留不下痕迹, 每天
+    -- 跑批都要重抓一遍。只在请求确实成功时才记 —— 见 fetch_fund_scale_hist。
+    CREATE TABLE IF NOT EXISTS scale.fund_scale_miss (
+        code     TEXT PRIMARY KEY,
+        tried_at REAL NOT NULL
+    ) WITHOUT ROWID;
+    -- Quarterly top-10 holdings (stocks + bonds) per fund, one year of
+    -- quarters per row, stored as normalized JSON records. 跟规模同为季度
+    -- 数据、同一个更新节奏, 所以同库。
+    CREATE TABLE IF NOT EXISTS scale.fund_holdings (
+        code     TEXT NOT NULL,
+        year     TEXT NOT NULL,
+        data     TEXT NOT NULL,
+        saved_at REAL NOT NULL,
+        PRIMARY KEY (code, year)
+    ) WITHOUT ROWID;
+""",
+}
 
 
 def init_db():
-    _migrate_db_location()
+    """建好全部分库的表结构, 并做历史迁移。
+
+    建表本身已经由 _conn() 按 _DDL 完成(每个进程首次连接时), 这里只剩
+    分库无关的收尾: WAL、列迁移、旧 JSON 净值迁移。
+    """
+    if os.path.exists(_LEGACY_SINGLE_DB) and not _IN_MIGRATION:
+        # 分库前的单库还在: 说明这台机器没跑过 split_dbs.py。不自动迁移——
+        # 401MB 的库拆一次要几分钟, 悄悄在 import 时做会让人以为程序卡死。
+        logger.warning(
+            "检测到分库前的 %s, 新代码不会读它。跑 `python3 split_dbs.py` 迁移。",
+            _LEGACY_SINGLE_DB)
     conn = _conn()
     # WAL lets the app keep reading while the pipeline writes (and vice versa).
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS fund_list (
-            id       INTEGER PRIMARY KEY,
-            data     TEXT    NOT NULL,
-            saved_at REAL    NOT NULL
-        );
-        -- Per-fund freshness + newest stored date, so gap detection and TTL
-        -- checks never have to scan fund_nav_daily.
-        CREATE TABLE IF NOT EXISTS fund_nav_meta (
-            code      TEXT PRIMARY KEY,
-            saved_at  REAL NOT NULL,
-            last_date TEXT
-        );
-        CREATE TABLE IF NOT EXISTS fund_sharpe (
-            code        TEXT PRIMARY KEY,
-            ann_return  REAL,
-            volatility  REAL,
-            sharpe      REAL,
-            data_points INTEGER,
-            saved_at    REAL NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS app_meta (
-            key      TEXT PRIMARY KEY,
-            value    REAL,
-            saved_at REAL NOT NULL
-        );
-        -- Top rows (200) of each distinct filter run, keyed by a hash of the
-        -- filter params (+ metrics version in live mode), so repeating a
-        -- filter is a read instead of a recompute — across restarts too.
-        CREATE TABLE IF NOT EXISTS filter_results (
-            key      TEXT PRIMARY KEY,
-            params   TEXT NOT NULL,
-            data     TEXT NOT NULL,
-            saved_at REAL NOT NULL
-        );
-        -- ETF联接基金 → 目标场内ETF 的映射(重仓穿透用)。target_code 为空
-        -- 串表示解析失败,按 TTL 重试;成功的映射视为永久。
-        CREATE TABLE IF NOT EXISTS etf_target_map (
-            code        TEXT PRIMARY KEY,
-            target_code TEXT NOT NULL,
-            target_name TEXT NOT NULL,
-            saved_at    REAL NOT NULL
-        );
-        -- 基金跟踪指数代码缓存(mobapi FundMNBasicInformation.INDEXCODE),
-        -- 供联接基金与候选 ETF 做指数一致性验证。
-        CREATE TABLE IF NOT EXISTS fund_index_code (
-            code       TEXT PRIMARY KEY,
-            index_code TEXT NOT NULL,
-            saved_at   REAL NOT NULL
-        );
-        -- 规模抓取"抓了但一行都没有"的记录(F10 无规模变动表的基金:刚成立、
-        -- 已清盘、场内份额等)。没有这张表的话它们在 fund_scale_hist 里永远
-        -- 留不下痕迹,每天跑批都要重抓一遍(扩到全榜单后是几千次白请求)。
-        CREATE TABLE IF NOT EXISTS fund_scale_miss (
-            code     TEXT PRIMARY KEY,
-            tried_at REAL NOT NULL
-        ) WITHOUT ROWID;
-    """)
-    # 重表:本地/单库模式照常建。云端两段式下重表库还没落地时先建空占位表,
-    # 让所有查询返回空结果而不是 "no such table" 把页面炸掉;落地后由
-    # adopt_nav_db 删掉占位表、让 ATTACH 上来的真表接管(之后不能再建回去,
-    # 否则又把真表遮蔽了)。
-    if not (LAZY_NAV and _nav_ready):
-        conn.executescript(_DDL_HEAVY)
+    # 每个 attached 库各自设置——journal_mode 是 per-database 的 pragma。
+    for name, _fn, _t, _l in DB_LAYOUT:
+        if db_ready(name):
+            try:
+                conn.execute(f"PRAGMA {name}.journal_mode=WAL")
+            except sqlite3.DatabaseError as e:
+                logger.debug("WAL on %s failed: %s", name, e)
     # Add per-period max-drawdown / Sharpe / return columns (migration for
     # existing DBs). Returns are recomputed locally from stored NAV because the
     # EastMoney rank list's 近X收益率 columns lag its own nav_date in the
@@ -307,9 +435,14 @@ def init_db():
     for col in ("mdd_1m", "mdd_3m", "mdd_6m", "mdd_1y", "sharpe_6m", "sharpe_1y",
                 "ret_1m", "ret_3m", "ret_6m", "ret_1y"):
         try:
-            conn.execute(f"ALTER TABLE fund_sharpe ADD COLUMN {col} REAL")
+            conn.execute(f"ALTER TABLE rank.fund_sharpe ADD COLUMN {col} REAL")
         except sqlite3.OperationalError:
             pass  # column already exists
+    # sim_archives.start_date 同理(simulator 里原来单独 ALTER 的那列)。
+    try:
+        conn.execute("ALTER TABLE sim.sim_archives ADD COLUMN start_date TEXT")
+    except sqlite3.OperationalError:
+        pass
     _migrate_nav_blobs(conn)
     conn.commit()
     conn.close()
@@ -1597,8 +1730,6 @@ def fetch_sse_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     Serves stale cache when the refresh fails; None only with no cache at all.
     """
     conn = _conn()
-    conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
-                 "key TEXT PRIMARY KEY, data TEXT, saved_at REAL)")
     row = conn.execute(
         "SELECT data, saved_at FROM index_daily_cache WHERE key='sse'"
     ).fetchone()
@@ -1647,8 +1778,6 @@ def fetch_qvix_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     used.
     """
     conn = _conn()
-    conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
-                 "key TEXT PRIMARY KEY, data TEXT, saved_at REAL)")
     row = conn.execute(
         "SELECT data, saved_at FROM index_daily_cache WHERE key='qvix'"
     ).fetchone()
@@ -1698,8 +1827,6 @@ def fetch_hsi_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     时刷新)。数据源新浪 stock_hk_index_daily_sina(symbol='HSI'),2013-08
     起逐年完整、无缺口(已核实)。"""
     conn = _conn()
-    conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
-                 "key TEXT PRIMARY KEY, data TEXT, saved_at REAL)")
     row = conn.execute(
         "SELECT data, saved_at FROM index_daily_cache WHERE key='hsi'"
     ).fetchone()
@@ -1742,8 +1869,6 @@ def fetch_vhsi_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     只保留 _VHSI_START(2021-03-18)起的数据(见该常量说明,更早的整段
     缺失砍掉)。"""
     conn = _conn()
-    conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
-                 "key TEXT PRIMARY KEY, data TEXT, saved_at REAL)")
     row = conn.execute(
         "SELECT data, saved_at FROM index_daily_cache WHERE key='vhsi'"
     ).fetchone()
@@ -1784,8 +1909,6 @@ def index_daily_saved_at(key: str) -> Optional[float]:
     or None if never fetched. Used as an st.cache_data cache-busting key so
     the app picks up a fresh 跑批 write immediately rather than on a timer."""
     conn = _conn()
-    conn.execute("CREATE TABLE IF NOT EXISTS index_daily_cache ("
-                 "key TEXT PRIMARY KEY, data TEXT, saved_at REAL)")
     row = conn.execute(
         "SELECT saved_at FROM index_daily_cache WHERE key = ?", (key,)
     ).fetchone()
@@ -1877,8 +2000,6 @@ def save_qvix_self_history(rows: list) -> None:
     可以并排比对,而不是自算结果把optbbs历史顶替掉。rows 是
     [{"date","qvix","note"}, ...]。"""
     conn = _conn()
-    conn.execute("CREATE TABLE IF NOT EXISTS qvix_self_history ("
-                 "date TEXT PRIMARY KEY, qvix REAL, note TEXT)")
     conn.executemany(
         "INSERT OR REPLACE INTO qvix_self_history (date, qvix, note) "
         "VALUES (?, ?, ?)",
@@ -1892,8 +2013,6 @@ def qvix_self_history_last_date() -> Optional[str]:
     st.cache_data 的缓存key用——新一天数据写进来,这个值就变,缓存自然
     失效,不用等TTL。没有数据时返回 None。"""
     conn = _conn()
-    conn.execute("CREATE TABLE IF NOT EXISTS qvix_self_history ("
-                 "date TEXT PRIMARY KEY, qvix REAL, note TEXT)")
     row = conn.execute(
         "SELECT MAX(date) AS d FROM qvix_self_history").fetchone()
     conn.close()
@@ -1903,8 +2022,6 @@ def qvix_self_history_last_date() -> Optional[str]:
 def load_qvix_self_history() -> Optional[pd.DataFrame]:
     """读取自算QVIX历史,按日期排序;没有数据时返回 None。"""
     conn = _conn()
-    conn.execute("CREATE TABLE IF NOT EXISTS qvix_self_history ("
-                 "date TEXT PRIMARY KEY, qvix REAL, note TEXT)")
     df = pd.read_sql("SELECT * FROM qvix_self_history ORDER BY date", conn)
     conn.close()
     return df if not df.empty else None

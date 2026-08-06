@@ -26,42 +26,23 @@ INITIAL_CAPITAL = 1_000_000.0
 
 
 def init_sim_db():
+    """模拟盘的建表已经统一挪到 fetcher._DDL["sim"](分库后 sim_* 三张表住在
+    独立的 sim.db 里, 权威写入方是线上 app 而不是跑批)。这里只剩净值日期
+    索引这一件跟 sim 库无关的事。
+
+    原来那三段 CREATE TABLE 必须删掉: 它们不带库名, 分库后会建进 main
+    (:memory:), 把 ATTACH 上来的 sim 库真表整个遮蔽成空表——模拟盘会表现为
+    "每次刷新持仓都清零"。
+    """
     conn = fetcher._conn()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS sim_meta (
-            key   TEXT PRIMARY KEY,
-            value TEXT
-        );
-        CREATE TABLE IF NOT EXISTS sim_trades (
-            id     INTEGER PRIMARY KEY AUTOINCREMENT,
-            date   TEXT NOT NULL,
-            code   TEXT NOT NULL,
-            action TEXT NOT NULL,      -- 'buy' | 'sell'
-            shares REAL NOT NULL,
-            nav    REAL NOT NULL,      -- execution unit NAV
-            amount REAL NOT NULL       -- buy: cash spent; sell: cash received
-        );
-        CREATE TABLE IF NOT EXISTS sim_archives (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            name         TEXT NOT NULL,
-            saved_at     REAL NOT NULL,
-            current_date TEXT,
-            trades       TEXT NOT NULL  -- JSON dump of sim_trades rows
-        );
-    """)
-    # The trading calendar (MIN/MAX/DISTINCT over date) needs this; one-time build.
-    # 云端两段式下净值表可能还没落地(此刻 main 里是空占位表),建在占位表上
-    # 没意义也没害处;真表到位后由 fetcher.adopt_nav_db 负责建索引。
+    # 交易日历(MIN/MAX/DISTINCT over date)要这个索引; 一次性建好。
+    # 净值库还没落地时 nav 是内存空库, 建在上面无意义也无害; 真库到位后由
+    # fetcher.adopt_db("nav") 负责建。
     try:
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_nav_date ON fund_nav_daily(date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS nav.idx_nav_date "
+                     "ON fund_nav_daily(date)")
     except Exception:
         pass
-    # Archives carry their run's start date (migration for existing DBs).
-    try:
-        conn.execute("ALTER TABLE sim_archives ADD COLUMN start_date TEXT")
-    except Exception:
-        pass  # column already exists
     conn.commit()
     conn.close()
 

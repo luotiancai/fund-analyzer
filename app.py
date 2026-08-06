@@ -71,19 +71,23 @@ def _get_rf() -> float:
 # 本地开发机(库已存在且无 marker 文件)完全跳过,零网络开销。
 # marker 同时充当"云端只读模式"开关:存在则隐藏「更新数据」按钮。
 #
-# 快照是两段式的(见 build_snapshot.py):core 只有 gz 2MB,首屏(上证+QVIX+
-# 榜单)要的表全在里面,同步拉;净值/持仓/规模三张重表 gz 63MB,首屏一行都
-# 不读,启动后台拉、落地后 ATTACH 接管。整库快照 fund_cache.db.gz 仍在
-# Release 里(跑批要拿它当底子),两段式资产缺失时自动退回去拉它。
+# 数据按 fetcher.DB_LAYOUT 分成若干个独立的库, 每个库一个 Release 资产
+# (<文件名>.gz)。每条发布线互不覆盖 —— 以前所有表挤在一个 400MB 的
+# fund_cache.db 里, 发布单元跟更新节奏对不上, 推一次策略结果就能把跑批攒
+# 了五天的行情盖回去(2026-08-05)。
+#
+# 首屏同步拉 rank/market/strategy/sim, 合计 gz 约 2MB, 拉完立刻能画;
+# nav(净值 233MB)和 scale(季度数据 13.7MB)首屏一行都不读, 起线程后台拉,
+# 落地后 adopt_db 接管。cache 库压根不拉: 它是筛选结果缓存, 丢了自动重算,
+# 下一份别人的缓存过来毫无价值。
 _DB_BASE = os.environ.get("FUND_ANALYZER_RELEASE_BASE") or (
     "https://github.com/luotiancai/fund-analyzer/releases/download/data/")
-_CORE_ASSET = _DB_BASE + "fund_cache_core.db.gz"
-_NAV_ASSET = _DB_BASE + "fund_cache_nav.db.gz"
-_FULL_ASSET = _DB_BASE + "fund_cache.db.gz"
-_STRATEGY_ASSET = _DB_BASE + "fund_strategy.db.gz"
-_DB_MARKER = fetcher.CACHE_DB + ".from-release"
-_NAV_MARKER = fetcher.NAV_DB + ".from-release"
-_STRATEGY_MARKER = fetcher.STRATEGY_DB + ".from-release"
+_ASSET = {name: _DB_BASE + fn + ".gz"
+          for name, fn, _t, _l in fetcher.DB_LAYOUT}
+_MARKER = {name: fetcher.DB_PATH[name] + ".from-release"
+           for name, _fn, _t, _l in fetcher.DB_LAYOUT}
+_EAGER_DBS = ("rank", "market", "strategy", "sim")
+_LAZY_DBS = fetcher.LAZY_DBS          # ("nav", "scale")
 
 
 def _download_gz(url: str, dest: str, marker: str) -> bool:
@@ -121,45 +125,54 @@ def _download_gz(url: str, dest: str, marker: str) -> bool:
 
 @st.cache_resource(ttl=3600, show_spinner="正在同步云端数据库…")
 def _sync_db_from_release() -> bool:
-    """确保数据库就位;返回是否运行在 Release 快照上(云端只读模式)。"""
+    """确保各库就位;返回是否运行在 Release 快照上(云端只读模式)。"""
     # 空壳库(引导失败后 _init_db_once 建的,仅几十KB)不算"本地自有",
     # 照常走同步——否则一次引导失败就把应用永久卡在空库本地模式,
     # 页面表现为基金列表空、QVIX 不可用、「更新数据」按钮在云端露出。
-    have_db = (os.path.exists(fetcher.CACHE_DB)
-               and os.path.getsize(fetcher.CACHE_DB) > 1024 * 1024)
-    if have_db and not os.path.exists(_DB_MARKER):
+    rank_db = fetcher.DB_PATH["rank"]
+    have_db = (os.path.exists(rank_db)
+               and os.path.getsize(rank_db) > 1024 * 1024)
+    if have_db and not os.path.exists(_MARKER["rank"]):
         return False                     # 本地自有数据库,不碰
-    # 策略库(回测结果, gz 才十几KB)跟行情数据是两条独立的发布线:行情由
-    # 每日跑批发, 策略由 push_strategy.sh 发, 互不覆盖(见 fetcher.STRATEGY_DB)。
-    # 同步拉——它小到不值得起线程, 而且复盘区首屏就要用。拉不到不影响
-    # 主流程: _conn() 会 ATTACH 出一个空库, 复盘区自己显示"暂无回测明细"。
-    _download_gz(_STRATEGY_ASSET, fetcher.STRATEGY_DB, _STRATEGY_MARKER)
-    if _download_gz(_CORE_ASSET, fetcher.CACHE_DB, _DB_MARKER):
-        fetcher.LAZY_NAV = True          # 重表另库,由 _start_nav_download 接
-        return True
-    return _download_gz(_FULL_ASSET, fetcher.CACHE_DB, _DB_MARKER) or have_db
+    ok = False
+    for name in _EAGER_DBS:
+        got = _download_gz(_ASSET[name], fetcher.DB_PATH[name], _MARKER[name])
+        if name == "rank":
+            ok = got                     # 榜单拉不到就等于没数据
+        elif not got:
+            # 其余几个拉不到不影响主流程: _conn() 会 ATTACH 出空库, 对应的
+            # 区块自己显示"暂无数据"(如复盘区的"暂无回测明细")。
+            fetcher.logger.warning("资产 %s 没拉到, 该库按空处理", name)
+    if ok:
+        fetcher.LAZY_NAV = True          # 大库另发, 由 _start_lazy_downloads 接
+    return ok or have_db
 
 
 @st.cache_resource(ttl=3600, show_spinner=False)
-def _start_nav_download():
-    """后台线程拉重表库,拉完让它接管。首屏不等这个线程。
+def _start_lazy_downloads():
+    """后台线程拉大库(净值/季度数据),拉完让它接管。首屏不等这些线程。
 
-    起线程而不是同步拉:63MB 挡在首屏前面就白拆了。期间需要净值的三处
+    起线程而不是同步拉:233MB 挡在首屏前面就白拆了。期间需要净值的三处
     (筛选/详情/模拟盘)由 fetcher.nav_ready() 挡住,显示"加载中"而不是
     拿空表算出一堆看着合理的错数。
 
-    TTL 与 _sync_db_from_release 一致(1h):跑批发新快照后 core 会换成当天
-    的,重表这半也得跟着换,否则两半的数据日期能差出一天。ETag 没变时
-    _download_gz 直接返回、不重下,adopt_nav_db 本身幂等,空跑代价接近零。
+    TTL 与 _sync_db_from_release 一致(1h):跑批发新快照后 rank 会换成当天
+    的,大库也得跟着换,否则各库的数据日期能差出一天。ETag 没变时
+    _download_gz 直接返回、不重下,adopt_db 本身幂等,空跑代价接近零。
+
+    先拉 scale(13.7MB)再拉 nav(233MB):规模数据是基金列表的门槛要用的,
+    早几十秒到位就早几十秒不再"查不到规模一律放行"。
     """
     def _work():
-        try:
-            if _download_gz(_NAV_ASSET, fetcher.NAV_DB, _NAV_MARKER):
-                fetcher.adopt_nav_db()
-        except Exception:
-            fetcher.logger.exception("nav db 后台下载失败")
+        for name in sorted(_LAZY_DBS, key=lambda n: n != "scale"):
+            try:
+                if _download_gz(_ASSET[name], fetcher.DB_PATH[name],
+                                _MARKER[name]):
+                    fetcher.adopt_db(name)
+            except Exception:
+                fetcher.logger.exception("%s 库后台下载失败", name)
 
-    t = threading.Thread(target=_work, name="nav-db-download", daemon=True)
+    t = threading.Thread(target=_work, name="lazy-db-download", daemon=True)
     t.start()
     return t
 
@@ -167,7 +180,7 @@ def _start_nav_download():
 _IS_CLOUD = _sync_db_from_release()
 _init_db_once()
 if fetcher.LAZY_NAV:
-    _start_nav_download()
+    _start_lazy_downloads()
 
 
 def _nav_notice(what: str):
@@ -1715,7 +1728,7 @@ with tab_sse:
             # 的数也随时可能对不上(实测就对不上过)。现在回测落库、页面读库,
             # 跑批推一次库页面自动跟着变, 不用改代码。
             _bt_df, _bt_params, _bt_at = load_backtest_trades(
-                os.path.getmtime(fetcher.CACHE_DB))
+                os.path.getmtime(fetcher.DB_PATH["rank"]))
             if _bt_df is None or _bt_df.empty:
                 st.info("暂无回测明细——跑一次 `python3 backtest_qvix.py` "
                         "会往策略库追加一条标准跑批, 页面随即显示。")
@@ -1824,11 +1837,11 @@ with tab_sse:
         # 以前是"一个方案一张固定表、同名整表覆盖",换个参数重跑就把上一次
         # 冲掉了;现在每跑必留痕,回头想比哪两版都翻得到。
         # 策略库是独立文件(fund_strategy.db),跟 400MB 的行情主库彻底分开,
-        # 见 fetcher.STRATEGY_DB 说明。
+        # 见 fetcher.DB_LAYOUT 说明。
         # 「备注」不给这些跑批挂:那份人工点评(backtest_notes)是对着标准策略
         # 选出的基金写的,对照实验同一个买入日往往选的是另一只,挂过去
         # 就是张冠李戴。
-        _runs = [r for r in load_strategy_runs(os.path.getmtime(fetcher.STRATEGY_DB))
+        _runs = [r for r in load_strategy_runs(os.path.getmtime(fetcher.DB_PATH["strategy"]))
                  if not r["is_standard"]]
         if _runs:
             with st.expander(f"🧪 历次对照回测({len(_runs)} 次,非线上规则)",
@@ -1845,7 +1858,7 @@ with tab_sse:
                         next(r for r in _runs if r["id"] == i)),
                     key="strategy_run_pick")
                 _x_df, _x_params, _x_at = load_strategy_run_detail(
-                    os.path.getmtime(fetcher.STRATEGY_DB), _sel)
+                    os.path.getmtime(fetcher.DB_PATH["strategy"]), _sel)
                 if _x_df is None or _x_df.empty:
                     st.info("这次跑批没有明细。")
                 else:

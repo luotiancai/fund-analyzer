@@ -20,9 +20,11 @@ from datetime import timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fetcher
 
-DB = os.path.expanduser("~/.local/share/fund-analyzer/fund_cache.db")
+# 数据分成若干独立的库(见 fetcher.DB_LAYOUT), 连接统一走 fetcher._conn():
+# 它把各库 ATTACH 到一个连接上, 不带库名的表名照常解析, 所以下面的 SQL
+# 一个字都不用改。
 
-# 基金规模(AUM)过滤:规模数据(季度期末净资产,亿元)存在 fund_cache.db 的
+# 基金规模(AUM)过滤:规模数据(季度期末净资产,亿元)存在 fund_scale.db 的
 # fund_scale_hist 表, 取数/按信号日取值的逻辑都在 fetcher(见
 # fetcher.fund_aum_asof, 无未来函数——只用已披露的季报)。这里直接调它。
 # 2026-08-06 起口径改为 **A/C 份额合并**: 数据源按基金代码给净资产, 而 A/C 是
@@ -174,7 +176,7 @@ def _apply_nav_anomaly(code, date, nav):
 
 
 def get_conn():
-    return sqlite3.connect(DB, check_same_thread=False, timeout=30)
+    return fetcher._conn()
 
 
 def load_cached_json(conn, key):
