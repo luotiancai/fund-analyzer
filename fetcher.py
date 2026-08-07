@@ -161,8 +161,6 @@ FUND_LIST_TTL = 26 * 3600
 NAV_TTL = 86400         # 24 hours
 NAV_START = "2018-01-01"  # NAV history is kept from this date onward
 MAX_WORKERS = 8
-RISK_FREE_RATE = 0.0113  # fallback 1-year China gov bond yield (see get_risk_free_rate)
-RF_TTL = 30 * 86400      # auto-refresh the risk-free rate ~monthly
 HOLDINGS_START_YEAR = 2020     # first year fetched for quarterly holdings
 HOLDINGS_START_Q = "2020Q4"    # earliest quarter kept ("YYYYQn" strings compare fine)
 HOLDINGS_TTL = 7 * 86400       # current year re-checked weekly for new quarterly reports
@@ -265,11 +263,14 @@ _DDL = {
         saved_at  REAL NOT NULL,
         last_date TEXT
     );
+    -- 表名是历史遗留: 建表时它只存夏普, 后来长出了 mdd/ret 各四列, 2026-08-07
+    -- 夏普三列(sharpe/sharpe_6m/sharpe_1y)又被整个拿掉。现在装的是年化收益、
+    -- 年化波动率、分区间最大回撤和分区间收益率。没改名是为了不动云端 release
+    -- 里那份 fund_rank.db。
     CREATE TABLE IF NOT EXISTS rank.fund_sharpe (
         code        TEXT PRIMARY KEY,
         ann_return  REAL,
         volatility  REAL,
-        sharpe      REAL,
         data_points INTEGER,
         saved_at    REAL NOT NULL
     );
@@ -428,16 +429,25 @@ def init_db():
                 conn.execute(f"PRAGMA {name}.journal_mode=WAL")
             except sqlite3.DatabaseError as e:
                 logger.debug("WAL on %s failed: %s", name, e)
-    # Add per-period max-drawdown / Sharpe / return columns (migration for
-    # existing DBs). Returns are recomputed locally from stored NAV because the
-    # EastMoney rank list's 近X收益率 columns lag its own nav_date in the
-    # morning (nav/日增长率 updated, period returns still the prior window's).
-    for col in ("mdd_1m", "mdd_3m", "mdd_6m", "mdd_1y", "sharpe_6m", "sharpe_1y",
+    # Add per-period max-drawdown / return columns (migration for existing DBs).
+    # Returns are recomputed locally from stored NAV because the EastMoney rank
+    # list's 近X收益率 columns lag its own nav_date in the morning (nav/日增长率
+    # updated, period returns still the prior window's).
+    for col in ("mdd_1m", "mdd_3m", "mdd_6m", "mdd_1y",
                 "ret_1m", "ret_3m", "ret_6m", "ret_1y"):
         try:
             conn.execute(f"ALTER TABLE rank.fund_sharpe ADD COLUMN {col} REAL")
         except sqlite3.OperationalError:
             pass  # column already exists
+    # 反向迁移(2026-08-07): 夏普不再看, 把存量库里的三列丢掉。新建的库压根
+    # 没有这些列, 所以 OperationalError 是正常路径而非异常。DROP COLUMN 需要
+    # SQLite 3.35+(Python 3.12 自带的远高于此); 真跑在老 SQLite 上就跳过,
+    # 残留列没人读也没人写, 留着只占地方不出错。
+    for col in ("sharpe", "sharpe_6m", "sharpe_1y"):
+        try:
+            conn.execute(f"ALTER TABLE rank.fund_sharpe DROP COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass  # 列不存在(新库)或 SQLite 太老
     # sim_archives.start_date 同理(simulator 里原来单独 ALTER 的那列)。
     try:
         conn.execute("ALTER TABLE sim.sim_archives ADD COLUMN start_date TEXT")
@@ -483,40 +493,12 @@ def _set_meta(key: str, value: float):
     conn.close()
 
 
-def _fetch_treasury_1y() -> Optional[float]:
-    """Latest 1-year China government bond yield as a decimal (e.g. 0.0113)."""
-    end = datetime.now().strftime("%Y%m%d")
-    start = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
-    df = ak.bond_china_yield(start_date=start, end_date=end)
-    df = df[df["曲线名称"] == "中债国债收益率曲线"].sort_values("日期")
-    val = pd.to_numeric(df["1年"], errors="coerce").dropna()
-    return float(val.iloc[-1]) / 100.0 if not val.empty else None
-
-
-def get_risk_free_rate(force_refresh: bool = False) -> float:
-    """1-year China treasury yield as the risk-free rate, cached ~monthly.
-
-    Falls back to the last cached value, then RISK_FREE_RATE, if the fetch fails.
-    """
-    value, saved_at = _get_meta("rf_rate")
-    if not force_refresh and value is not None and (time.time() - saved_at) < RF_TTL:
-        return value
-    try:
-        rf = _fetch_treasury_1y()
-        if rf is not None and 0 < rf < 0.2:   # sanity bound
-            _set_meta("rf_rate", rf)
-            return rf
-    except Exception as e:
-        logger.debug("risk-free rate fetch failed: %s", e)
-    return value if value is not None else RISK_FREE_RATE
-
-
 def clear_all_caches():
-    """Wipe every cache table: fund list, NAV history, computed Sharpe/drawdown.
+    """Wipe every cache table: fund list, NAV history, computed 指标.
 
     Used by the sidebar "清空所有缓存" button so a code/口径 change can be picked
-    up cleanly — afterwards the list re-fetches and Sharpe/drawdown recompute on
-    the next ⚡ run rather than being served stale from cache.
+    up cleanly — afterwards the list re-fetches and 指标 recompute on the next
+    ⚡ run rather than being served stale from cache.
     """
     conn = _conn()
     conn.execute("DELETE FROM fund_list")
@@ -529,12 +511,9 @@ def clear_all_caches():
 
 
 # Look-back windows in CALENDAR days, matching how EastMoney defines 近1月/3月/
-# 6月/1年 (date-to-date from the latest NAV date), so the computed drawdown and
-# Sharpe cover the same period as the 近X 收益率 columns shown alongside them.
+# 6月/1年 (date-to-date from the latest NAV date), so the computed drawdown
+# covers the same period as the 近X 收益率 columns shown alongside it.
 DRAWDOWN_DAYS = {"mdd_1m": 30, "mdd_3m": 91, "mdd_6m": 182, "mdd_1y": 365}
-
-# Sharpe is only computed for longer windows (short windows are too noisy).
-SHARPE_DAYS = {"sharpe_6m": 182, "sharpe_1y": 365}
 
 # Period returns (%), matching the rank list's 近1月/3月/6月/1年 columns; used
 # when metrics are recomputed as of a past date and the list values don't apply.
@@ -612,8 +591,8 @@ def _max_drawdown(nav: pd.Series) -> Optional[float]:
     return float(-dd.min())
 
 
-def _annualized(r: pd.Series, span_days: int, rf: float):
-    """(annual_return, annual_vol, sharpe) from a daily-return series.
+def _annualized(r: pd.Series, span_days: int):
+    """(annual_return, annual_vol) from a daily-return series.
 
     Everything is derived from the window itself — no fixed trading-day constant
     — so it adapts to A-shares, QDII/US funds, HK, etc. automatically:
@@ -636,28 +615,7 @@ def _annualized(r: pd.Series, span_days: int, rf: float):
     ann_return = total_growth ** (365.0 / span) - 1.0
     obs_per_year = n * 365.0 / span                  # measured, not the 252 convention
     ann_vol = std_daily * np.sqrt(obs_per_year)
-    return ann_return, ann_vol, (ann_return - rf) / ann_vol
-
-
-def _period_sharpe(df: pd.DataFrame, days_back: int, rf: float) -> Optional[float]:
-    """Annualized Sharpe over the trailing `days_back` calendar-day window —
-    the textbook convention: daily returns, geometric-annualized excess return
-    over annualized daily volatility (see _annualized). rf is the real 1y
-    China treasury yield. (支付宝 shows ~0.3 higher: it samples weekly and
-    uses rf≈定存基准 — deliberately not replicated here.)
-
-    Returns None when the fund lacks enough history to cover the window.
-    """
-    window = _window_by_date(df, days_back)
-    if window is None:
-        return None
-    # Drop the anchor's own return: it happened the day before the window opens.
-    r = window["r"].iloc[1:].dropna()
-    if len(r) < int(days_back / 365 * 200):
-        return None
-    span = (window["date"].iloc[-1] - window["date"].iloc[0]).days
-    res = _annualized(r, span, rf)
-    return float(res[2]) if res else None
+    return ann_return, ann_vol
 
 
 def _period_return(df: pd.DataFrame, days_back: int) -> Optional[float]:
@@ -1252,20 +1210,19 @@ def fetch_nav(code: str) -> Optional[pd.DataFrame]:
     return df
 
 
-# ── Sharpe calculation ────────────────────────────────────────────────────────
+# ── 指标计算 ──────────────────────────────────────────────────────────────────
 
-def _save_sharpe(code: str, ann_return: float, volatility: float, sharpe: float,
-                 n: int, mdd: dict, psharpe: dict, rets: dict):
+def _save_metrics_row(code: str, ann_return: float, volatility: float,
+                 n: int, mdd: dict, rets: dict):
     conn = _conn()
     conn.execute(
         "INSERT OR REPLACE INTO fund_sharpe "
-        "(code, ann_return, volatility, sharpe, data_points, "
-        " mdd_1m, mdd_3m, mdd_6m, mdd_1y, sharpe_6m, sharpe_1y, "
+        "(code, ann_return, volatility, data_points, "
+        " mdd_1m, mdd_3m, mdd_6m, mdd_1y, "
         " ret_1m, ret_3m, ret_6m, ret_1y, saved_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (code, ann_return, volatility, sharpe, n,
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (code, ann_return, volatility, n,
          mdd.get("mdd_1m"), mdd.get("mdd_3m"), mdd.get("mdd_6m"), mdd.get("mdd_1y"),
-         psharpe.get("sharpe_6m"), psharpe.get("sharpe_1y"),
          rets.get("ret_1m"), rets.get("ret_3m"), rets.get("ret_6m"), rets.get("ret_1y"),
          time.time()),
     )
@@ -1273,14 +1230,14 @@ def _save_sharpe(code: str, ann_return: float, volatility: float, sharpe: float,
     conn.close()
 
 
-def _metrics_from_nav(nav_df: pd.DataFrame, rf: float,
+def _metrics_from_nav(nav_df: pd.DataFrame,
                       cols: Optional[set] = None) -> Optional[dict]:
-    """Compute annualized return / volatility / Sharpe + per-period Sharpe and
-    max-drawdown from an already-fetched NAV DataFrame. Pure (no I/O).
+    """Compute annualized return / volatility + per-period max-drawdown and
+    return from an already-fetched NAV DataFrame. Pure (no I/O).
 
-    `cols` 给出时只算这些区间列(如 {"ret_1y","mdd_1y","sharpe_1y"}),
-    并跳过全期年化三件套——快照筛选只用所选区间,砍掉无关窗口能省近半
-    耗时;None 保持全量(recompute_all 落库用)。"""
+    `cols` 给出时只算这些区间列(如 {"ret_1y","mdd_1y"}),并跳过全期年化——
+    快照筛选只用所选区间,砍掉无关窗口能省近半耗时;None 保持全量
+    (recompute_all 落库用)。"""
     df = nav_df.copy()
     df["date"] = pd.to_datetime(df["date"])
     df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
@@ -1297,13 +1254,10 @@ def _metrics_from_nav(nav_df: pd.DataFrame, rf: float,
     if len(returns) < 20:
         return None
 
-    # Per-period Sharpe and max drawdown over trailing calendar-day windows,
-    # date-aligned with EastMoney's 近X 收益率. A fund younger than a window
-    # gets None for it (no anchor) rather than a misleadingly short reading.
+    # Per-period max drawdown over trailing calendar-day windows, date-aligned
+    # with EastMoney's 近X 收益率. A fund younger than a window gets None for it
+    # (no anchor) rather than a misleadingly short reading.
     # Drawdown runs on accumulated NAV so dividends aren't mistaken for drops.
-    psharpe = {key: _period_sharpe(df, days, rf)
-               for key, days in SHARPE_DAYS.items()
-               if cols is None or key in cols}
     mdd = {key: _period_mdd(df, days)
            for key, days in DRAWDOWN_DAYS.items()
            if cols is None or key in cols}
@@ -1312,36 +1266,35 @@ def _metrics_from_nav(nav_df: pd.DataFrame, rf: float,
             if cols is None or key in cols}
 
     if cols is not None:
-        return {**mdd, **psharpe, **rets}
+        return {**mdd, **rets}
 
     n = len(returns)
     span = (df["date"].iloc[-1] - df["date"].iloc[0]).days
-    res = _annualized(returns, span, rf)
+    res = _annualized(returns, span)
     if res is None:
         return None
-    ann_return, ann_vol, sharpe = res
+    ann_return, ann_vol = res
 
     return {
-        "ann_return": ann_return, "volatility": ann_vol, "sharpe": sharpe,
-        "data_points": n, **mdd, **psharpe, **rets,
+        "ann_return": ann_return, "volatility": ann_vol,
+        "data_points": n, **mdd, **rets,
     }
 
 
 def _save_metrics(code: str, m: dict):
-    _save_sharpe(
-        code, m["ann_return"], m["volatility"], m["sharpe"], m["data_points"],
+    _save_metrics_row(
+        code, m["ann_return"], m["volatility"], m["data_points"],
         {k: m[k] for k in ("mdd_1m", "mdd_3m", "mdd_6m", "mdd_1y")},
-        {k: m[k] for k in ("sharpe_6m", "sharpe_1y")},
         {k: m[k] for k in ("ret_1m", "ret_3m", "ret_6m", "ret_1y")},
     )
 
 
-def compute_sharpe_for_fund(code: str, rf: float = RISK_FREE_RATE) -> Optional[dict]:
+def compute_metrics_for_fund(code: str) -> Optional[dict]:
     """Fetch NAV (network/cache), compute metrics, persist, and return them."""
     nav_df = fetch_nav(code)
     if nav_df is None:
         return None
-    m = _metrics_from_nav(nav_df, rf)
+    m = _metrics_from_nav(nav_df)
     if m is not None:
         _save_metrics(code, m)
     return m
@@ -2282,7 +2235,7 @@ def update_qvix_self_daily() -> tuple:
 
 # ── Daily-batch pipeline ──────────────────────────────────────────────────────
 # Used by update_daily.py: backfill once, then each day append the latest NAV
-# point (from the bulk fund-list call) and recompute Sharpe/drawdown for all.
+# point (from the bulk fund-list call) and recompute 年化/回撤/收益率 for all.
 
 
 def list_nav_codes() -> set:
@@ -2527,16 +2480,12 @@ def append_incremental(list_df: pd.DataFrame,
             "gap_codes": len(gapped), "failed": len(gapped) - patched}
 
 
-def recompute_all(rf: Optional[float] = None,
-                  progress_callback: Optional[Callable] = None) -> int:
-    """Recompute Sharpe + drawdown for every stored fund from its stored NAV.
+def recompute_all(progress_callback: Optional[Callable] = None) -> int:
+    """Recompute 年化/回撤/区间收益 for every stored fund from its stored NAV.
 
-    No network for NAV — pure CPU over cached NAV. `rf` defaults to the
-    auto-fetched (monthly-cached) risk-free rate. All reads/writes share one
+    No network for NAV — pure CPU over cached NAV. All reads/writes share one
     connection and a single commit, so 20k funds finish in seconds.
     """
-    if rf is None:
-        rf = get_risk_free_rate()
     conn = _conn()
     codes = [r["code"] for r in conn.execute("SELECT code FROM fund_nav_meta").fetchall()]
     total, done, saved = len(codes), 0, 0
@@ -2544,20 +2493,19 @@ def recompute_all(rf: Optional[float] = None,
         done += 1
         try:
             nav_df = _load_nav_df(code, conn)
-            m = _metrics_from_nav(nav_df, rf) if not nav_df.empty else None
+            m = _metrics_from_nav(nav_df) if not nav_df.empty else None
         except Exception as e:
             logger.debug("recompute parse error %s: %s", code, e)
             m = None
         if m is not None:
             conn.execute(
                 "INSERT OR REPLACE INTO fund_sharpe "
-                "(code, ann_return, volatility, sharpe, data_points, "
-                " mdd_1m, mdd_3m, mdd_6m, mdd_1y, sharpe_6m, sharpe_1y, "
+                "(code, ann_return, volatility, data_points, "
+                " mdd_1m, mdd_3m, mdd_6m, mdd_1y, "
                 " ret_1m, ret_3m, ret_6m, ret_1y, saved_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (code, m["ann_return"], m["volatility"], m["sharpe"], m["data_points"],
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (code, m["ann_return"], m["volatility"], m["data_points"],
                  m["mdd_1m"], m["mdd_3m"], m["mdd_6m"], m["mdd_1y"],
-                 m["sharpe_6m"], m["sharpe_1y"],
                  m["ret_1m"], m["ret_3m"], m["ret_6m"], m["ret_1y"], time.time()),
             )
             saved += 1
@@ -2569,7 +2517,7 @@ def recompute_all(rf: Optional[float] = None,
     # data versions, not wall-clock timestamps ("今天的数据算今天的,明天的
     # 数据来了才失效"). The timestamp marker is kept separately for display.
     # Deliberately NOT derived from MAX(fund_sharpe.saved_at): the detail tab
-    # persists single rows via compute_sharpe_for_fund, which would make the
+    # persists single rows via compute_metrics_for_fund, which would make the
     # whole table look fresh after viewing one fund.
     date_num, at_date = _nav_data_version(conn)
     conn.close()
@@ -2580,7 +2528,7 @@ def recompute_all(rf: Optional[float] = None,
     return saved
 
 
-def compute_metrics_asof(asof: str, rf: Optional[float] = None,
+def compute_metrics_asof(asof: str,
                          progress_callback: Optional[Callable] = None,
                          cols: Optional[set] = None) -> dict:
     """Every fund's metrics as an observer ON `asof` could have seen them.
@@ -2588,14 +2536,12 @@ def compute_metrics_asof(asof: str, rf: Optional[float] = None,
     Truncates each fund's history to rows STRICTLY BEFORE `asof` (ISO
     yyyy-mm-dd): on day D the day's own NAV is published only after close, so
     a screen run on D can only be based on data through D-1. Recomputes
-    period returns, Sharpe and drawdown over the same trailing windows — no
-    network, nothing persisted. Funds with under 20 NAV points by that date
-    are omitted. Returns {code: metrics-dict}.
+    period returns and drawdown over the same trailing windows — no network,
+    nothing persisted. Funds with under 20 NAV points by that date are
+    omitted. Returns {code: metrics-dict}.
 
     `cols` 只算指定区间列(见 _metrics_from_nav),筛选快照用。
     """
-    if rf is None:
-        rf = get_risk_free_rate()
     conn = _conn()
     codes = [r["code"] for r in conn.execute("SELECT code FROM fund_nav_meta")]
     out, total = {}, len(codes)
@@ -2607,7 +2553,7 @@ def compute_metrics_asof(asof: str, rf: Optional[float] = None,
         if len(df) >= 20:
             df["date"] = pd.to_datetime(df["date"])
             try:
-                m = _metrics_from_nav(df, rf, cols=cols)
+                m = _metrics_from_nav(df, cols=cols)
             except Exception as e:
                 logger.debug("asof metrics failed %s: %s", code, e)
                 m = None
@@ -2620,15 +2566,15 @@ def compute_metrics_asof(asof: str, rf: Optional[float] = None,
 
 
 def load_all_precomputed() -> dict:
-    """Every precomputed Sharpe/drawdown row, keyed by code, ignoring TTL.
+    """Every precomputed 年化/回撤/区间收益 row, keyed by code, ignoring TTL.
 
     Lets the app show metrics instantly on load; freshness is the daily
     pipeline's responsibility (surfaced via last_update_time()).
     """
     conn = _conn()
     rows = conn.execute(
-        "SELECT code, ann_return, volatility, sharpe, data_points, "
-        "mdd_1m, mdd_3m, mdd_6m, mdd_1y, sharpe_6m, sharpe_1y, "
+        "SELECT code, ann_return, volatility, data_points, "
+        "mdd_1m, mdd_3m, mdd_6m, mdd_1y, "
         "ret_1m, ret_3m, ret_6m, ret_1y FROM fund_sharpe"
     ).fetchall()
     conn.close()
@@ -2672,8 +2618,8 @@ def _nav_data_version(conn) -> tuple:
 def metrics_stale() -> bool:
     """True when the stored NAV holds data the last full metrics recompute
     hasn't seen — a newer trading date, or more funds reporting the same
-    newest date — i.e. filtering on the precomputed Sharpe/drawdown/returns
-    would use the previous day's values.
+    newest date — i.e. filtering on the precomputed 回撤/收益率 would use the
+    previous day's values.
 
     A missing marker (pre-marker DBs) counts as stale, so the first filter
     after upgrading recomputes once and plants the markers.
@@ -2695,7 +2641,7 @@ def fund_list_saved_at() -> Optional[float]:
     The in-app update button refreshes the fund list every run but skips
     recompute_all() (do_recompute=False), so last_update_time() alone doesn't
     move — callers needing a cache key that reflects *any* data refresh
-    (not just a Sharpe recompute) should combine this with last_update_time().
+    (not just a metrics recompute) should combine this with last_update_time().
     """
     conn = _conn()
     row = conn.execute("SELECT saved_at FROM fund_list WHERE id = 1").fetchone()
@@ -2724,21 +2670,17 @@ def _backfill_codes(codes: list, workers: int = MAX_WORKERS,
 
 
 def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
-                 rf: Optional[float] = None, workers: int = MAX_WORKERS,
+                 workers: int = MAX_WORKERS,
                  do_recompute: bool = True) -> dict:
     """Full daily pipeline shared by the CLI script and the in-app button:
     ① refresh fund list → ② backfill funds missing history → ③ append the
     list's latest NAV point / range-fetch bigger gaps → ④ recompute
-    Sharpe/drawdown for all (skippable via do_recompute=False when metrics
+    年化/回撤/区间收益 for all (skippable via do_recompute=False when metrics
     are computed lazily at filter time instead).
 
-    `rf` defaults to the auto-fetched (monthly-cached) risk-free rate.
     `progress(phase, done, total)` is invoked throughout for a UI bar / logging.
     Returns a summary dict.
     """
-    if rf is None:
-        rf = get_risk_free_rate()
-
     def _p(phase, done, total):
         if progress:
             progress(phase, done, total)
@@ -2774,7 +2716,7 @@ def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
 
     saved = 0
     if do_recompute:
-        saved = recompute_all(rf=rf, progress_callback=lambda d, t: _p("重算指标", d, t))
+        saved = recompute_all(progress_callback=lambda d, t: _p("重算指标", d, t))
 
     return {
         "funds": len(all_codes),
@@ -2783,5 +2725,4 @@ def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
         "patched": res["patched"],
         "failed": res["failed"],
         "recomputed": saved,
-        "rf": rf,
     }

@@ -41,7 +41,7 @@ CHECKS = [
     ("fund_scale_hist", "基金季度规模", "SELECT MAX(quarter_end) FROM fund_scale_hist"),
     ("fund_scale_miss", "标记为「无规模数据」", None),
     ("fund_holdings", "基金季度持仓", None),
-    ("fund_sharpe", "夏普等指标", None),
+    ("fund_sharpe", "年化/回撤/区间收益", None),
     ("qvix_self_history", "QVIX 自算历史", "SELECT MAX(date) FROM qvix_self_history"),
     ("index_daily_cache", "指数日线缓存", None),
     ("fund_list", "榜单快照(整块1行)", None),

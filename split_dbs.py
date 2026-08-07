@@ -15,9 +15,9 @@
     堆表, 净值表会白白多占几十 MB)。这里让 fetcher 按 _DDL 建好正确的
     表结构, 再逐表 INSERT ... SELECT。
 
-  · **按列名交集灌**。fund_sharpe 那十列 mdd/sharpe/ret 是历史上一路
-    ALTER 加的, 源库和新库的列顺序不一定一致, 所以显式列名而不是
-    SELECT *。源库没有的列留 NULL。
+  · **按列名交集灌**。fund_sharpe 那八列 mdd/ret 是历史上一路 ALTER 加的
+    (夏普三列 2026-08-07 又 ALTER 掉了), 源库和新库的列顺序不一定一致,
+    所以显式列名而不是 SELECT *。源库没有的列留 NULL。
 
   · **僵尸表自然消失**。不在 DB_LAYOUT 里的表(backtest_notes 在 core 里
     那份、backtest_trades、backtest_regime_1m/3m)不会被复制——这正是要的

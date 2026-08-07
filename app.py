@@ -44,24 +44,18 @@ def _fmt_cst(ts: float, fmt: str) -> str:
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="基金夏普比率分析仪",
+    page_title="基金分析仪",
     page_icon="📈",
     layout="wide",
 )
 
-# init_db / risk-free rate run once per server (resp. hourly), not on every
-# rerun — both hit SQLite on /mnt/c (slow Windows-disk I/O under WSL), which
-# used to tax every single click.
+# init_db runs once per server, not on every rerun — it hits SQLite on /mnt/c
+# (slow Windows-disk I/O under WSL), which used to tax every single click.
 @st.cache_resource
 def _init_db_once():
     fetcher.init_db()
     simulator.init_sim_db()
     return True
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _get_rf() -> float:
-    return fetcher.get_risk_free_rate()
 
 
 # ── 云端数据引导 ──────────────────────────────────────────────────────────────
@@ -190,7 +184,7 @@ def _nav_notice(what: str):
 
 # ── 更新数据(仅本地)────────────────────────────────────────────────────────
 # 侧边栏已整体移除:云端数据由每日跑批自动更新,无需任何入口;
-# 本地入口缩成页面右上角一个小按钮,无风险利率(进夏普计算)折进悬浮提示。
+# 本地入口缩成页面右上角一个小按钮。
 @st.dialog("确认更新数据")
 def _confirm_update():
     st.write("将增量拉取最新净值（不重算指标，筛选时按需计算），确定继续？")
@@ -202,14 +196,10 @@ def _confirm_update():
         st.rerun()
 
 
-rf_rate = _get_rf()
-
 if not _IS_CLOUD:
     _, _upd_col = st.columns([6, 1])
     if _upd_col.button("🔄 更新数据", use_container_width=True,
-                       help="增量拉取最新净值；指标在筛选时按需计算。"
-                            f"无风险利率 {rf_rate*100:.2f}%"
-                            "（1年期国债收益率，自动取、进夏普计算）"):
+                       help="增量拉取最新净值；指标在筛选时按需计算。"):
         _confirm_update()
 
 update_btn = st.session_state.pop("_run_update", False)
@@ -226,7 +216,7 @@ def load_fund_list(cache_key):
 # Per-fund detail data. fetcher caches in SQLite, but these wrappers matter on
 # reruns: every click anywhere (e.g. 「开始筛选」) re-executes the detail tab,
 # and without them each rerun re-read NAV, re-fetched holdings and — worst —
-# recomputed + re-WROTE the fund's Sharpe row on the slow /mnt/c disk.
+# recomputed + re-WROTE the fund's metrics row on the slow /mnt/c disk.
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_holdings(code: str):
     """(持仓df, 穿透来源) — ETF联接基金的持仓来自同指数场内ETF,
@@ -248,8 +238,8 @@ def load_nav(code: str):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_fund_metrics(code: str, rf: float):
-    return fetcher.compute_sharpe_for_fund(code, rf=rf)
+def load_fund_metrics(code: str):
+    return fetcher.compute_metrics_for_fund(code)
 
 
 @st.cache_data(show_spinner="正在加载上证指数数据…")
@@ -348,7 +338,7 @@ def _add_sse_drop_bands(fig, sse, dmin, dmax):
             font=dict(size=10, color="#e0454b"))
 
 
-# Precomputed Sharpe/drawdown as a merge-ready DataFrame, built once and shared
+# Precomputed 回撤/收益率 as a merge-ready DataFrame, built once and shared
 # across sessions/reruns (reading ~20k SQLite rows + dict→DataFrame on every
 # filter click is what made 筛选 feel slow). `cache_key` is last_update_time(),
 # so a pipeline run naturally invalidates it; the buttons also clear it.
@@ -379,8 +369,7 @@ if update_btn:
         _bar.progress(frac, text=f"{phase}… {done}/{total}")
 
     with st.spinner("正在更新数据（增量补净值）…"):
-        summary = fetcher.run_pipeline(progress=_on_progress, rf=rf_rate,
-                                       do_recompute=False)
+        summary = fetcher.run_pipeline(progress=_on_progress, do_recompute=False)
     load_fund_list.clear()
     load_metrics_df.clear()
     load_first_dates.clear()
@@ -402,13 +391,12 @@ if fund_df is None or fund_df.empty:
 # ── Filters ───────────────────────────────────────────────────────────────────
 # Each time-period maps to its return column (locally recomputed from stored
 # NAV where available, rank-list value otherwise — see the merge in the filter
-# path), its computed max-drawdown column, and its computed Sharpe column (only
-# 6m/1y have Sharpe; shorter windows are too noisy, so None means "no Sharpe").
+# path) and its computed max-drawdown column.
 PERIODS = {
-    "近1月": ("ret_1m", "mdd_1m", None),
-    "近3月": ("ret_3m", "mdd_3m", None),
-    "近6月": ("ret_6m", "mdd_6m", "sharpe_6m"),
-    "近1年": ("ret_1y", "mdd_1y", "sharpe_1y"),
+    "近1月": ("ret_1m", "mdd_1m"),
+    "近3月": ("ret_3m", "mdd_3m"),
+    "近6月": ("ret_6m", "mdd_6m"),
+    "近1年": ("ret_1y", "mdd_1y"),
 }
 
 # Ensure period return columns are numeric (cache may store them as strings).
@@ -472,7 +460,7 @@ with tab_table:
                 max_value=dt.date.today(),
                 help="还原你在该日进行筛选时能看到的结果：只用该日之前"
                      "（不含当日，当日净值当时尚未公布）的净值历史重算"
-                     "收益/回撤/夏普。本地净值（仅C类）从 2018-01-01 起，"
+                     "收益/回撤。本地净值（仅C类）从 2018-01-01 起，"
                      "因此最早可选 2021-01-01，保证近1年窗口有完整数据。",
             )
         submitted = st.form_submit_button("🔍 开始筛选", type="primary")
@@ -534,12 +522,12 @@ with tab_table:
         _nav_notice("筛选")
         filter_ready = False
 
-    ret_col, mdd_col, sharpe_col = PERIODS[period_label]
+    ret_col, mdd_col = PERIODS[period_label]
 
     # ── As-of snapshot mode ───────────────────────────────────────────────────────
     # A past 截至日期 swaps the live rank-list returns and precomputed metrics for
     # ones recomputed from stored NAV truncated to that date, so the filters below
-    # reproduce what the screen would have shown back then. Cached per (date, rf).
+    # reproduce what the screen would have shown back then. Cached per (date, cols).
     asof_mode = asof_date is not None and asof_date < dt.date.today()
 
 
@@ -555,14 +543,13 @@ with tab_table:
 
     # Lazy metrics recompute — the piece the 「🔄 更新数据」 button's
     # do_recompute=False has always been promising ("筛选时按需计算"): if NAV
-    # data changed since the last full recompute, the stored Sharpe/drawdown
+    # data changed since the last full recompute, the stored 回撤/收益率
     # are yesterday's and would let funds past today's thresholds (e.g. a fund
     # whose latest drop pushed 近1年回撤 over the cutoff). Recompute the whole
     # table once, here, before any filtering or cache lookup.
     if filter_ready and not asof_mode and fetcher.metrics_stale():
         _bar = st.progress(0.0, text="🧮 净值已更新，正在重算全市场指标…")
         fetcher.recompute_all(
-            rf=rf_rate,
             progress_callback=lambda d, t: _bar.progress(
                 (d / t) if t else 1.0,
                 text=f"🧮 净值已更新，正在重算全市场指标… {d:,}/{t:,}",
@@ -606,7 +593,7 @@ with tab_table:
             # v9: 结果不再截断前 200 条,旧条目只有前 200 行、不能再复用),
             # so stale cached results never get served.
             "rule_ver": 9,
-            # Combines the Sharpe/drawdown recompute timestamp with the fund
+            # Combines the metrics recompute timestamp with the fund
             # list's own saved_at: the in-app update button refreshes the list
             # (fresh returns) but skips recompute_all, so last_update_time()
             # alone wouldn't invalidate this cache on its own.
@@ -626,14 +613,14 @@ with tab_table:
     if filter_ready and _hit is None:
         if asof_mode:
             _cache = _asof_cache()
-            # 只算所选区间的收益/回撤/夏普三列(其余窗口筛选和展示都用不到,
+            # 只算所选区间的收益/回撤两列(其余窗口筛选和展示都用不到,
             # 全算耗时翻倍),缓存键因此带上区间。
-            _cols = {ret_col, mdd_col} | ({sharpe_col} if sharpe_col else set())
-            _key = (_asof_iso, round(rf_rate, 6), tuple(sorted(_cols)))
+            _cols = {ret_col, mdd_col}
+            _key = (_asof_iso, tuple(sorted(_cols)))
             if _key not in _cache:
                 _bar = st.progress(0.0, text=f"📅 正在按 {_asof_iso} 重算全市场指标（约半分钟）…")
                 _cache[_key] = fetcher.compute_metrics_asof(
-                    _asof_iso, rf_rate, cols=_cols,
+                    _asof_iso, cols=_cols,
                     progress_callback=lambda d, t: _bar.progress(
                         (d / t) if t else 1.0,
                         text=f"📅 正在按 {_asof_iso} 重算全市场指标… {d:,}/{t:,}",
@@ -648,7 +635,7 @@ with tab_table:
             work_df = fund_df[["code", "name", "type"]].merge(_mdf, on="code", how="inner")
             st.caption(
                 f"📅 快照模式：按 {_asof_iso} 之前（不含当日）的净值计算"
-                f"收益/夏普/回撤，即当天筛选时实际可见的数据"
+                f"收益/回撤，即当天筛选时实际可见的数据"
                 f"（覆盖 {len(work_df):,} 只基金）"
             )
         else:
@@ -662,16 +649,16 @@ with tab_table:
             if selected_types:
                 filtered = filtered[filtered["type"].isin(selected_types)]
 
-            # ── Merge Sharpe/drawdown/period returns BEFORE the return filter ────
+            # ── Merge 回撤/区间收益 BEFORE the return filter ─────────────────────
             # (In as-of mode work_df already carries the snapshot metrics columns.)
             # 区间收益优先用本地净值重算的值:榜单接口早间常出现净值/日增长率已
             # 更新到最新交易日、而近X收益率列仍是前一窗口旧值的情况(实测 018359
             # 榜单近1年 226.03 = 截至7-15,实际截至7-16 应为 211.39)。无本地净值
-            # 历史的基金(非C类)回退榜单值——它们本来也没有夏普/回撤。
+            # 历史的基金(非C类)回退榜单值——它们本来也没有回撤。
             if not asof_mode:
-                sharpe_df = load_metrics_df(fetcher.last_update_time())
-                if sharpe_df is not None:
-                    filtered = filtered.merge(sharpe_df, on="code", how="left",
+                metrics_df = load_metrics_df(fetcher.last_update_time())
+                if metrics_df is not None:
+                    filtered = filtered.merge(metrics_df, on="code", how="left",
                                               suffixes=("_list", ""))
                     for _rc in ("ret_1m", "ret_3m", "ret_6m", "ret_1y"):
                         if _rc in filtered.columns and f"{_rc}_list" in filtered.columns:
@@ -732,7 +719,6 @@ with tab_table:
             # animation covers everything between the click and the rendered rows.
             ret_label = f"{period_label}收益率(%)"
             dd_label = f"{period_label}最大回撤(%)"
-            sharpe_label = f"{period_label}夏普比率"
             table = pd.DataFrame()
             table["基金代码"] = display.get("code")
             table["基金名称"] = display.get("name")
@@ -740,15 +726,11 @@ with tab_table:
             table["规模(亿)"] = pd.to_numeric(display.get("_aum"), errors="coerce").round(2)
             if ret_col in display.columns:
                 table[ret_label] = pd.to_numeric(display[ret_col], errors="coerce").round(2)
-            if sharpe_col and sharpe_col in display.columns:
-                table[sharpe_label] = pd.to_numeric(display[sharpe_col], errors="coerce").round(4)
             if mdd_col in display.columns:
                 table[dd_label] = (pd.to_numeric(display[mdd_col], errors="coerce") * 100).round(2)
 
             # Default order (highest first); click any column header to re-sort.
-            default_sort = next(
-                (c for c in [sharpe_label, ret_label] if c in table.columns), None
-            )
+            default_sort = ret_label if ret_label in table.columns else None
             if default_sort:
                 table = table.sort_values(default_sort, ascending=False, na_position="last")
             table = table.reset_index(drop=True)
@@ -931,7 +913,7 @@ with tab_table:
         st.download_button(
             label="⬇️ 下载 CSV",
             data=csv,
-            file_name="fund_sharpe.csv",
+            file_name="fund_screen.csv",
             mime="text/csv",
         )
 
@@ -991,14 +973,13 @@ with tab_detail:
                     spikedash="dot", spikethickness=1)
                 st.plotly_chart(fig_nav, use_container_width=True)
 
-            # Compute Sharpe on the spot
-            result = load_fund_metrics(code_input.strip().zfill(6), rf_rate)
+            # Compute the fund's metrics on the spot
+            result = load_fund_metrics(code_input.strip().zfill(6))
             if result:
-                s1, s2, s3, s4 = st.columns(4)
+                s1, s2, s3 = st.columns(3)
                 s1.metric("年化收益", f"{result['ann_return']*100:.2f}%")
                 s2.metric("年化波动率", f"{result['volatility']*100:.2f}%")
-                s3.metric("夏普比率", f"{result['sharpe']:.4f}")
-                s4.metric("交易日数据点", result["data_points"])
+                s3.metric("交易日数据点", result["data_points"])
 
             # Quarterly top-10 holdings, HOLDINGS_START_Q → latest disclosed quarter.
             st.markdown("---")

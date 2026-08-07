@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Daily batch: keep NAV history fresh and recompute Sharpe/drawdown for all funds.
+"""Daily batch: keep NAV history fresh and recompute 年化/回撤/收益率 for all funds.
 
 The Streamlit app only *reads* the precomputed metrics, so all the slow network
 work lives here and runs out of band. The same pipeline is also exposed as the
@@ -11,7 +11,7 @@ Pipeline (fetcher.run_pipeline):
      的序列(基本一次性;非 C 类不存净值,见 fetcher.is_c_class)
   ③ 增量补净值:只差一个交易日的基金直接追加基金列表带回的当日净值点(零请求);
      缺口更大的用天天基金历史净值接口按日期段拉取(每只一次几 KB 的请求)
-  ④ 重算:用存好的净值对全部基金重算夏普 + 最大回撤(纯 CPU,几秒)
+  ④ 重算:用存好的净值对全部基金重算年化 + 最大回撤 + 区间收益(纯 CPU,几秒)
 
 用法
   手动:     python3 update_daily.py
@@ -103,7 +103,7 @@ def run_qvix_only() -> None:
 def main():
     parser = argparse.ArgumentParser(description="基金净值每日跑批")
     parser.add_argument("--recompute-only", action="store_true",
-                        help="跳过下载,只用已存净值重算夏普/回撤")
+                        help="跳过下载,只用已存净值重算年化/回撤/收益率")
     parser.add_argument("--qvix-only", action="store_true",
                         help="只补自算QVIX,不跑基金净值/指数(早间补跑用)")
     parser.add_argument("--scales-only", action="store_true",
@@ -131,7 +131,7 @@ def main():
         return
 
     if args.recompute_only:
-        log.info("仅重算:用已存净值重算夏普 + 回撤…")
+        log.info("仅重算:用已存净值重算年化 + 回撤 + 区间收益…")
         saved = fetcher.recompute_all(progress_callback=lambda d, t: _log_progress("重算", d, t))
         log.info("   写入 %d 只指标", saved)
     else:
