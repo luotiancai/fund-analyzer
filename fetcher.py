@@ -161,6 +161,12 @@ FUND_LIST_TTL = 26 * 3600
 NAV_TTL = 86400         # 24 hours
 NAV_START = "2018-01-01"  # NAV history is kept from this date onward
 MAX_WORKERS = 8
+# 无风险利率。夏普 2026-08-07 移除后, 唯一的消费者是自算 QVIX: qvix_core 用
+# Black-Scholes 反推期权理论价, 优先按 SHIBOR 期限结构插值, 取不到 SHIBOR 时
+# 才退到这里的 1 年期国债收益率(见 qvix_calc.compute_qvix 的 fallback_rate)。
+# 别再当成夏普的残留删掉。
+RISK_FREE_RATE = 0.0113  # fallback 1-year China gov bond yield (see get_risk_free_rate)
+RF_TTL = 30 * 86400      # auto-refresh the risk-free rate ~monthly
 HOLDINGS_START_YEAR = 2020     # first year fetched for quarterly holdings
 HOLDINGS_START_Q = "2020Q4"    # earliest quarter kept ("YYYYQn" strings compare fine)
 HOLDINGS_TTL = 7 * 86400       # current year re-checked weekly for new quarterly reports
@@ -491,6 +497,36 @@ def _set_meta(key: str, value: float):
     )
     conn.commit()
     conn.close()
+
+
+def _fetch_treasury_1y() -> Optional[float]:
+    """Latest 1-year China government bond yield as a decimal (e.g. 0.0113)."""
+    end = datetime.now().strftime("%Y%m%d")
+    start = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+    df = ak.bond_china_yield(start_date=start, end_date=end)
+    df = df[df["曲线名称"] == "中债国债收益率曲线"].sort_values("日期")
+    val = pd.to_numeric(df["1年"], errors="coerce").dropna()
+    return float(val.iloc[-1]) / 100.0 if not val.empty else None
+
+
+def get_risk_free_rate(force_refresh: bool = False) -> float:
+    """1-year China treasury yield as the risk-free rate, cached ~monthly.
+
+    Falls back to the last cached value, then RISK_FREE_RATE, if the fetch fails.
+    自算 QVIX 的 Black-Scholes 兜底利率(SHIBOR 取不到时)——见 RISK_FREE_RATE
+    上面那段注释。
+    """
+    value, saved_at = _get_meta("rf_rate")
+    if not force_refresh and value is not None and (time.time() - saved_at) < RF_TTL:
+        return value
+    try:
+        rf = _fetch_treasury_1y()
+        if rf is not None and 0 < rf < 0.2:   # sanity bound
+            _set_meta("rf_rate", rf)
+            return rf
+    except Exception as e:
+        logger.debug("risk-free rate fetch failed: %s", e)
+    return value if value is not None else RISK_FREE_RATE
 
 
 def clear_all_caches():
