@@ -24,7 +24,10 @@
 到期时间精确到秒(到期日15:00收盘 - 当前时刻,数学上等价于 CBOE 白皮书
 按分钟分段累加的写法);无风险利率按 SHIBOR 期限结构对近月/次近月各自
 的剩余天数线性插值(而不是不分期限统一用一个1年期利率),取不到 SHIBOR
-时退回 fetcher.get_risk_free_rate()(1年期国债收益率)。
+时:实时路径退回 fetcher.get_risk_free_rate()(1年期国债收益率),历史路径
+退回常数 0.02——2018年至今 SHIBOR 每个交易日都有,这条兜底从没走到过。
+到期日按上交所规则取"到期月第四个星期三,遇休市顺延至下一交易日"
+(_expiry_for_yymm);实时路径不用自己算,直接取新浪接口给的真实到期日。
 
 到期换月:按现行版白皮书口径,只要求"取夹住30天的两个到期日",近月一直
 用到它到期为止,不做"剩余不足N天就整体跳到后两个月"的换月。这里踩过坑,
@@ -54,6 +57,10 @@
     是原来的近50连发——单请求容错高、不会因"瞬时几十并发"被反爬当爬虫
     掐掉,境外主机(GitHub Actions/Streamlit云)上尤其稳。返回不全时
     _fetch_chain 会在日志留下"只拿到 X/Y 个合约"的记录,可顺着排查。
+  - 近月方差算出负数时整项丢掉、只用次月(qvix_core.interpolate_30d)。
+    白皮书没有这一条,因为它有周合约、近月永远不会薄到这个地步;50ETF
+    近月剩1~2天时 (1/T)·(F/K0−1)² 会把方差减成负的,而负方差是数学上
+    不存在的东西,只能判定为公式在这里失灵。2018年至今42天踩到。
 算出来的数量级和走势应该跟官方 QVIX 一致,但不保证分毫不差——报价取中
 还是取最新成交、零买价的裁剪时机等实现细节,不同实现之间本来就会有出入。
 """
@@ -164,6 +171,29 @@ def shibor_curve_for_date(target_date: dt.date) -> Optional[list]:
     return pts if len(pts) >= 2 else None
 
 
+def _expiry_for_yymm(yymm: str) -> dt.date:
+    """'2301' → 该月合约的**真实**到期日(第四个星期三,遇休市顺延至下一交易日)。
+
+    qvix_core.expiry_date_for_yymm 只算第四个周三就停了:那份文件要保持零
+    依赖(整个粘进云函数就得能跑),拿不到交易日历,所以"顺延"这一步只能在
+    这里补。实时路径不需要补——它的到期日是从新浪接口取的真实值。
+    2018年至今只撞上一次:2023-01-25 是春节休市,1月合约实际到期日是
+    2023-01-30。漏掉顺延会让 2022-12-28~2023-01-20 共17个交易日的近月剩余
+    天数少算5天,插值权重跟着偏,值整体偏高 0.03~0.23。
+    拿不到日历、或日历还没覆盖到那个月份时,退回第四个周三(即旧行为)——
+    不能因为一次网络抖动就整段算不出来。"""
+    base = expiry_date_for_yymm(yymm)
+    days = fetcher._trading_days()
+    if not days or base > max(days):
+        return base
+    d = base
+    for _ in range(10):     # 最长的连续休市(春节/国庆)也就9天
+        if d in days:
+            return d
+        d += dt.timedelta(days=1)
+    return base
+
+
 def _listed_expiries(df, target_date: dt.date):
     """当天数据里实际出现过的到期月代码 → (到期日期, 剩余自然天数),
     按剩余天数升序;只看普通(非分红调整)合约。"""
@@ -176,7 +206,7 @@ def _listed_expiries(df, target_date: dt.date):
         if yymm in out:
             continue
         try:
-            expiry = expiry_date_for_yymm(yymm)
+            expiry = _expiry_for_yymm(yymm)
         except Exception:
             continue
         days = (expiry - target_date).days
@@ -244,6 +274,18 @@ def compute_qvix_for_date(target_date: dt.date, spot: Optional[float] = None,
 
     last_err = "方差算不出来(合约或IV数据不足)"
     for (near_ms, (_, near_days)), (next_ms, (_, next_days)) in pairs:
+        # 近月都已经比30天远出这么多,说明本该用的那个月被跳过了,此时的
+        # "插值"其实是大幅外推,会给出一个像模像样、实际完全不对的数。这条
+        # 护栏 qvix_core.compute_qvix 里早就有(见那边的注释),当初抽公共代码
+        # 时它写在那边的循环里、没跟着搬过来,补上。
+        # 实测 2022-03-15:4月链的远期价 F=2.6459 掉到最低行权价 2.65 以下,
+        # K0 选不出来,前两对候选全被跳过,最后拿 6月(99天)/9月(197天)外推回
+        # 30天(w1=1.70)算出 29.37 入库——那不是30天口径的数。
+        # 50ETF 合约月间隔约30天,到期后新近月最远也就35天左右,所以正常情况
+        # 下 near_days 不会超过40。
+        if near_days > 40:
+            last_err = f"最近的可用近月已剩{near_days}天,30天目标落在它之前,拒绝外推"
+            continue
         T1, T2 = near_days / 365.0, next_days / 365.0
         r1 = _rate_for_days(shibor_curve, near_days, 0.02)
         r2 = _rate_for_days(shibor_curve, next_days, 0.02)
@@ -257,11 +299,12 @@ def compute_qvix_for_date(target_date: dt.date, spot: Optional[float] = None,
         sigma1, _, _ = near
         sigma2, _, _ = nxt
 
-        n30 = 30.0
-        w1 = (next_days - n30) / (next_days - near_days)
-        w2 = (n30 - near_days) / (next_days - near_days)
-        sigma2_30 = (T1 * sigma1 * w1 + T2 * sigma2 * w2) * (365.0 / n30)
-        if sigma2_30 <= 0:
+        # 走 qvix_core.interpolate_30d 而不是在这里再写一遍同一个公式:两条
+        # 路径共用一份插值实现,近月方差为负的处理才不会两边不一样(那段的
+        # 来龙去脉见 interpolate_30d 的 docstring)。
+        sigma2_30 = qvix_core.interpolate_30d(sigma1, T1, near_days,
+                                              sigma2, T2, next_days)
+        if sigma2_30 is None:
             last_err = "插值方差非正"
             continue
         vix = 100.0 * (sigma2_30 ** 0.5)

@@ -107,6 +107,7 @@ DB_LAYOUT = (
      ("fund_scale_hist", "fund_scale_miss", "fund_holdings"), True),
 )
 DB_PATH = {name: os.path.join(_DATA_DIR, fn) for name, fn, _t, _l in DB_LAYOUT}
+LAZY_DBS = tuple(name for name, _fn, _t, lazy in DB_LAYOUT if lazy)
 
 # 云端两段式:app.py 置 True 后, 惰性库在下载落地前不 ATTACH 真文件, 而是挂
 # 一个同名的 :memory: 空库(见 _conn)。为什么不直接 ATTACH 那个还不存在的
