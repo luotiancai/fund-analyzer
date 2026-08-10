@@ -108,21 +108,6 @@ DB_LAYOUT = (
 )
 DB_PATH = {name: os.path.join(_DATA_DIR, fn) for name, fn, _t, _l in DB_LAYOUT}
 
-# ── 场内 ETF 库 ─────────────────────────────────────────────────────────────
-# ETF 本质也是基金, fetch_nav / fetch_fund_scale_hist 对 ETF 代码直接可用, 所以
-# 最初图省事把 1500 多只 ETF 的净值和规模抓进了跟场外同一张 fund_nav_daily /
-# fund_scale_hist。两天就出了两个问题:
-#   · 回测的信号日下限按"全表净值起点的1%分位"算, ETF 带进来 1500 只 2018 年
-#     就有数据的标的, 把场外的起始日从 2020-04 拖到了 2018-04;
-#   · nav/scale 是云端权威的库, 下次 sync_down 会把 ETF 数据整个冲掉。
-# 所以物理隔离到独立文件。**表名故意跟场外一模一样** —— 跑场内时用它顶替
-# nav/scale 两个库挂上来, 那七十来处 "FROM fund_nav_daily" 一个字都不用改。
-ETF_DB = os.path.join(_DATA_DIR, "fund_etf.db")
-ETF_MODE = False       # 置 True 后 _conn() 用 ETF 库顶替 nav/scale(见 _conn)
-_ETF_REPLACES = ("nav", "scale")
-DB_OF_TABLE = {t: name for name, _fn, tabs, _l in DB_LAYOUT for t in tabs}
-LAZY_DBS = tuple(name for name, _fn, _t, lazy in DB_LAYOUT if lazy)
-
 # 云端两段式:app.py 置 True 后, 惰性库在下载落地前不 ATTACH 真文件, 而是挂
 # 一个同名的 :memory: 空库(见 _conn)。为什么不直接 ATTACH 那个还不存在的
 # 路径:SQLite 会就地建一个空文件, 之后 os.path.exists 恒为真, "下载好了没"
@@ -209,8 +194,6 @@ def _conn():
     conn.row_factory = sqlite3.Row
     placeholders = []
     for name, _fn, _tables, lazy in DB_LAYOUT:
-        if ETF_MODE and name in _ETF_REPLACES:
-            continue          # 这两个库由 ETF 库顶替, 见下面
         if lazy and LAZY_NAV and name not in _ready_dbs:
             # 云端首屏: 大库还没下下来。挂一个同名的内存空库并建空表, 查询
             # 返回空结果而不是 "no such table" 把页面炸掉。不去 ATTACH 那个
@@ -220,19 +203,13 @@ def _conn():
             placeholders.append(name)
             continue
         conn.execute(f"ATTACH DATABASE ? AS {name}", (DB_PATH[name],))
-    if ETF_MODE:
-        # 顶替 nav/scale: 表名相同, 所以不带库名的 SQL 全部解析到这里。
-        conn.execute("ATTACH DATABASE ? AS etfdata", (ETF_DB,))
-        conn.executescript(_DDL["nav"].replace("nav.", "etfdata.")
-                           + _DDL["scale"].replace("scale.", "etfdata."))
     # 内存占位库每次都是新的, 必须每次建表; 真实文件库只在进程内首次建。
     for name in placeholders:
         conn.executescript(_DDL[name])
     if not _schema_ready:
         for name, _fn, _tables, lazy in DB_LAYOUT:
-            if name in placeholders or (ETF_MODE and name in _ETF_REPLACES):
-                continue
-            conn.executescript(_DDL[name])
+            if name not in placeholders:
+                conn.executescript(_DDL[name])
         conn.commit()
         _schema_ready = True
     return conn
