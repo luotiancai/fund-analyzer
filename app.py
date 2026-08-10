@@ -1887,6 +1887,13 @@ with tab_sse:
                     # 「A/C 合并」, 同一个 min_aum 数值在两种口径下松紧差很多,
                     # 所以旧口径的跑批必须标出来, 否则会跟标准策略误比。
                     _basis = _x_params.get("aum_basis", "single")
+                    # 候选池/费率口径: 场内 ETF 版跟场外是两个市场, 页面上
+                    # 必须一眼看出来, 否则跟场外跑批并排列着会被当成同类比较。
+                    _uni = _x_params.get("universe", "all")
+                    _fee = _x_params.get("fee_model", "otc")
+                    _mkt = ("**场内 ETF**(费率口径:"
+                            + ("场内佣金双边" if _fee == "exchange" else "场外赎回费")
+                            + ")" if _uni == "etf" else "")
                     st.caption(
                         f"规则:{_rule}"
                         f"候选须满足波动率比值≥{_mark(_vr, 1.5)}、"
@@ -1895,6 +1902,7 @@ with tab_sse:
                            f"规模≥{_mark(_aum, 2.0)}亿")
                         + ("(**旧口径:只算该代码的份额类别,未合并 A/C**)"
                            if _basis != "merged" else "")
+                        + (f"。候选池:{_mkt}" if _mkt else "")
                         + f",双止损口径同标准策略"
                         f"(粗体=与标准策略不同的参数)。"
                         f"　{_x_n} 笔已完成:胜率 {_x_wins / _x_n * 100:.1f}%"

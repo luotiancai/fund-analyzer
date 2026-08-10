@@ -265,11 +265,31 @@ def _metrics_asof_cached(asof_date, ret_col):
     return fetcher.compute_metrics_asof(asof_date, cols={ret_col})
 
 
+def _has_full_window(conn, code, asof_date, need_days):
+    """这只标的在 asof_date 之前有没有**完整**的回看窗口。
+
+    compute_metrics_asof 只要求 20 行(约1个月)就出 ret_3m, 所以一只刚上市
+    两个多月的标的也能挂着"近3月涨跌幅"参与排名 —— 那个数是在残缺窗口上
+    算的, 跟别人的 91 天口径不可比, 极端值还特别容易排到榜首/榜尾。
+
+    2026-08-10 加。起因是场内 ETF 版回测里 2020-03-18 选中的证券ETF鹏华
+    上市才 83 天(36个交易日)。这跟文件头记的 2020-03-24 那次假信号是同一
+    类问题, 当时只修了全表级下限护栏(_signal_floor), 没管单只标的。
+    场外同样会中招——一只上市两个月的新基金照样能进"近3月跌幅最大"。
+    """
+    row = conn.execute(
+        "SELECT MIN(date) FROM fund_nav_daily WHERE code=? AND date<?",
+        (code, asof_date)).fetchone()
+    if not row or not row[0]:
+        return False
+    return (pd.Timestamp(asof_date) - pd.Timestamp(row[0])).days >= need_days
+
+
 def find_champion_on_date(conn, asof_date, exclude_codes=None,
                           sse_df=None, min_corr=None,
                           ret_col="ret_3m", pick="top", min_vol_ratio=None,
                           min_aum=None, require_drop=True, max_aum=None,
-                          aum_basis="merged"):
+                          aum_basis="merged", universe=None):
     """找 asof_date 当天视角下排名第一的标的(排除 exclude_codes). 返回 (code, ret).
 
     复用 fetcher.compute_metrics_asof——按日收益率连乘计算区间收益(正确
@@ -320,6 +340,10 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
         c: m[ret_col] for c, m in metrics.items()
         if m.get(ret_col) is not None
         and (not exclude_codes or c not in exclude_codes)
+        # universe 给了就只在这批代码里选(场内 ETF 版用, 见 --universe)。
+        # 净值库里场外和场内是混在一张 fund_nav_daily 里的, 不限定的话
+        # 两边会串台。
+        and (universe is None or c in universe)
     }
     if not candidates:
         return None, 0
@@ -337,6 +361,9 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
             # "涨幅倒数第一", 意义不一样)。require_drop=False 时关掉这条,
             # 照买跌幅最大(涨幅最小)那个, 用于回测「去掉不操作规则」的效果。
             break
+        if not _has_full_window(conn, code, asof_date,
+                                fetcher.RETURN_DAYS[ret_col]):
+            continue      # 回看窗口不完整, 排名数不可比(见 _has_full_window)
         if _has_stale_catchup(conn, code, window_start, window_end):
             continue
         if min_corr is not None:
@@ -468,7 +495,10 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  regime_basis: str = "day", no_same_day_rebuy: bool = False,
                  max_aum: float = None, fallback_top: bool = True,
                  defer_until_different: bool = True,
-                 aum_basis: str = "merged"):
+                 aum_basis: str = "merged",
+                 universe: set = None, extra_names: dict = None,
+                 fee_model: str = "otc", commission_bps: float = 3.0,
+                 min_signal_date: str = None):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
     的 475/490 那套道理)。默认 490/0.90 是当前线上在用的参数
@@ -584,6 +614,11 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
             # 是 None 不是 "",下面 "QDII" in t 直接 TypeError 整个回测挂掉。
             fund_names[c] = item.get("name") or c
             fund_types[c] = item.get("type") or ""
+    # 场内 ETF 不在场外榜单里, 名称/类型另外喂进来(见 --universe etf)。
+    if extra_names:
+        for c, n in extra_names.items():
+            fund_names[c] = n
+            fund_types.setdefault(c, "ETF")
 
     # QDII/海外指数型跟踪境外市场, 与 QVIX/大盘恐慌-反弹逻辑脱钩, 排除出
     # 冠军候选池(如"指数型-海外股票"的广发道琼斯石油指数C, 之前只过滤
@@ -632,12 +667,29 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     # 失效, 上面那段注释里点名要剔除的 2020-03-24 一直照常混在回测里,
     # 用的是近3月窗口只有81天的假排名。分位数对这种离群点免疫(0.05%~2%
     # 分位算出来都是 2020-01-02), 取1%留足余量。
+    # 分位数只在**候选池内部**算。场内 ETF 的净值跟场外基金存在同一张
+    # fund_nav_daily 里, 而 ETF 有 1500 多只带 2018 年数据, 不限定候选池的话
+    # 1% 分位会被从 2020-01-02 拖到 2018-01-02 —— 场外回测的起始日凭空提前
+    # 两年, 跟历史跑批再也没法比。(这是这条护栏第二次因为"别的数据进库"
+    # 而失效, 上一次是 005696 那只定开基金, 见下面注释。)
     _firsts = pd.to_datetime(pd.read_sql(
-        "SELECT MIN(date) AS f FROM fund_nav_daily GROUP BY code", conn)["f"])
+        "SELECT MIN(date) AS f FROM fund_nav_daily GROUP BY code", conn,
+    )["f"]) if universe is None else pd.to_datetime(pd.read_sql(
+        "SELECT MIN(date) AS f FROM fund_nav_daily WHERE code IN (%s) GROUP BY code"
+        % ",".join("?" * len(universe)), conn, params=tuple(universe))["f"])
     _nav_floor = _firsts.quantile(0.01)
     _signal_floor = _nav_floor + pd.Timedelta(days=91)
-    print(f"净值库起点 {_nav_floor.date()}(1%分位; 全表最早 {_firsts.min().date()}, "
-          f"离群不采信), 近3月冠军窗口最早可信信号日 {_signal_floor.date()}")
+    # 显式下限优先: 场内和场外要横向比较时必须锁到同一个起点, 否则两边
+    # 各按自己的数据起点算, 比的是不同的时间段。
+    if min_signal_date:
+        _forced = pd.Timestamp(min_signal_date)
+        print(f"净值库起点 {_nav_floor.date()}(1%分位), 自动下限 "
+              f"{_signal_floor.date()}; **显式锁定到 {_forced.date()}**")
+        _signal_floor = max(_signal_floor, _forced)
+    else:
+        print(f"净值库起点 {_nav_floor.date()}(1%分位; 全表最早 "
+              f"{_firsts.min().date()}, 离群不采信), "
+              f"近3月冠军窗口最早可信信号日 {_signal_floor.date()}")
 
     # Signal days: QVIX > threshold
     signals = qvix[(qvix["close"] > qvix["thr"]) & (qvix["thr"].notna())]
@@ -761,7 +813,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                                                  min_aum=min_aum,
                                                  require_drop=_req_drop,
                                                  max_aum=max_aum,
-                                                 aum_basis=aum_basis)
+                                                 aum_basis=aum_basis,
+                                                 universe=universe)
             # 兜底: 当天找不到"真正跌过"的合格候选时(跌幅耗尽, 或者跌的那些
             # 都过不了波动率/规模门槛), 标准策略是直接放弃这一天; 打开
             # fallback_top 则改买涨幅最大的那只。注意这跟 require_drop=False
@@ -772,7 +825,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                     conn, day_str, _excl, sse_df=sse, min_corr=min_corr,
                     ret_col=ret_col, pick="top",
                     min_vol_ratio=min_vol_ratio, min_aum=min_aum,
-                    require_drop=False, max_aum=max_aum, aum_basis=aum_basis)
+                    require_drop=False, max_aum=max_aum, aum_basis=aum_basis,
+                    universe=universe)
                 if code is not None:
                     _pick = "top"      # 供「选向」列区分这笔走的是兜底分支
             if code is None:
@@ -882,15 +936,25 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                 "_ret_pct": ret_pct,
             })
 
-    _apply_chain_fees(trades)
+    _apply_chain_fees(trades, fee_model, commission_bps)
     conn.close()
     return trades
 
 
-def _apply_chain_fees(trades):
+def _apply_chain_fees(trades, fee_model="otc", commission_bps=3.0):
     """连续接力同一只基金(上一笔卖出日=下一笔买入日且代码相同)不算真实
     离场, 中间腿不收手续费; 只有链条最后一腿按"链条首次买入→该腿卖出"的
-    累计持有天数收一次手续费(按实际持有时长计, 而非单腿天数)。"""
+    累计持有天数收一次手续费(按实际持有时长计, 而非单腿天数)。
+
+    fee_model:
+      "otc"(默认, 场外 C 类)——惩罚性赎回费: 持有<7天 1.5%, <30天 0.5%,
+        满30天免。这是场外基金的规则, 跟持有时长强相关。
+      "exchange"(场内 ETF)——券商佣金双边, 按 commission_bps 计(默认万3=
+        3bps/边, 往返 0.06%), **跟持有时长无关**。ETF 免印花税(那是股票
+        卖出千分之一), 场内基金也没有过户费。所以场内的交易成本比场外低
+        一到两个数量级 —— 场外那 1.5% 的短线惩罚在场内根本不存在, 拿场外
+        费率去评场内策略会把高频出入的方案冤枉掉。
+    """
     n = len(trades)
     chain_start = None
     for i, t in enumerate(trades):
@@ -905,8 +969,11 @@ def _apply_chain_fees(trades):
                                 nxt["_buy_date"] == t["_sell_date"])
 
         if is_last_of_chain:
-            total_days = (t["_sell_date"] - chain_start).days
-            fee = 1.5 if total_days < 7 else (0.5 if total_days < 30 else 0)
+            if fee_model == "exchange":
+                fee = commission_bps / 100 * 2      # 买卖各一次
+            else:
+                total_days = (t["_sell_date"] - chain_start).days
+                fee = 1.5 if total_days < 7 else (0.5 if total_days < 30 else 0)
         else:
             fee = 0.0
 
@@ -921,6 +988,38 @@ def _apply_chain_fees(trades):
     for t in trades:
         for k in ("_code", "_buy_date", "_sell_date", "_ret_pct"):
             del t[k]
+
+
+# 跟踪境外市场的场内 ETF: 收益跟 QVIX/上证的恐慌-反弹逻辑脱钩, 跟场外那边
+# 排除 QDII/海外 是同一个道理。场内没有 type 字段可用(它们不在场外榜单里),
+# 只能从名称匹配。另外这类还是折溢价的重灾区(2026-08-10 实测纳指科技ETF
+# 溢价 22.9%), 用净值选、用净值算收益会系统性高估实际能拿到的钱。
+_OVERSEAS_ETF_RE = re.compile(
+    r"纳指|纳斯达克|标普|道琼斯|罗素|美国|美元|日经|日本|德国|法国|英国|欧洲|"
+    r"东南亚|印度|越南|沙特|中韩|亚太|全球|海外|QDII|原油|石油|黄金股|"
+    r"MSCI美|标普500")
+
+
+def _load_etf_universe(path=None):
+    """读场内 ETF 名单, 返回 (代码集合, {代码: 名称})。
+
+    名单由 fetch_etf 脚本从 akshare fund_etf_spot_em 落盘。ETF 的净值和规模
+    抓在跟场外同一张 fund_nav_daily / fund_scale_hist 里(ETF 本质也是基金,
+    fetcher 那套取数直接可用), 所以回测只需要限定候选池。
+    """
+    import json as _json
+    path = path or os.path.join(
+        os.environ.get("FUND_ANALYZER_DATA") or os.path.join(
+            os.path.expanduser("~"), ".local", "share", "fund-analyzer"),
+        "etf_universe.json")
+    if not os.path.exists(path):
+        raise SystemExit(f"找不到 ETF 名单: {path}\n"
+                         "先跑一次 ETF 抓取脚本生成它。")
+    with open(path, encoding="utf-8") as f:
+        items = _json.load(f)
+    names = {i["code"]: i["name"] for i in items
+             if not _OVERSEAS_ETF_RE.search(i["name"])}
+    return set(names), names
 
 
 def _sync_before_run():
@@ -1018,12 +1117,41 @@ def main():
     parser.add_argument("--label", default=None,
                         help="给这次跑批起个名字(页面上显示)。不给就按参数"
                              "自动拼一个, 见 fetcher.describe_run")
+    parser.add_argument("--min-signal-date", default=None,
+                        help="显式锁定最早信号日(如 2020-04-01)。默认按候选池"
+                             "净值起点的1%%分位自动算; 场内/场外横向比较时必须"
+                             "锁到同一天, 否则两边比的是不同时间段。")
+    parser.add_argument("--fee-model", choices=["otc", "exchange"], default="otc",
+                        help="手续费口径: otc(默认)=场外C类惩罚性赎回费"
+                             "(<7天1.5%%, <30天0.5%%, 满30天免); exchange="
+                             "场内ETF券商佣金双边(见 --commission-bps), 跟持有"
+                             "时长无关, ETF 免印花税。跑 --universe etf 时该用"
+                             "这个, 否则会拿场外费率冤枉场内策略。")
+    parser.add_argument("--commission-bps", type=float, default=3.0,
+                        help="--fee-model exchange 时的单边佣金(bps), 默认3"
+                             "(万3)。往返扣 2 倍。")
+    parser.add_argument("--universe", choices=["all", "etf"], default="all",
+                        help="候选池: all(默认)=场外基金榜单; etf=全市场场内"
+                             "ETF(需先跑 fetch_etf 把 ETF 净值/规模抓进库,"
+                             "且要配合 --no-sync, 否则同步会把 ETF 数据冲掉)")
+    parser.add_argument("--etf-list", default=None,
+                        help="ETF 名单 JSON 路径, 默认 $FUND_ANALYZER_DATA/"
+                             "etf_universe.json")
     parser.add_argument("--no-sync", action="store_true",
                         help="跳过启动时的云端数据同步(离线跑时用)")
     args = parser.parse_args()
 
     if not args.no_sync:
         _sync_before_run()
+
+    _universe = _extra_names = None
+    if args.universe == "etf":
+        # 让 _conn() 用独立的 ETF 库顶替 nav/scale(表名相同, SQL 不用改)。
+        # 必须在任何 _conn() 之前置位。
+        fetcher.ETF_MODE = True
+        _universe, _extra_names = _load_etf_universe(args.etf_list)
+        print(f"候选池: 场内 ETF {len(_universe)} 只"
+              f"(已排除跟踪境外市场的)")
 
     _ret_col = "ret_1m" if args.lookback == "1m" else "ret_3m"
     t0 = time.time()
@@ -1038,7 +1166,11 @@ def main():
                           require_drop=not args.no_require_drop,
                           regime_basis=args.regime_basis,
                           no_same_day_rebuy=args.no_same_day_rebuy,
-                          aum_basis=args.aum_basis)
+                          aum_basis=args.aum_basis,
+                          universe=_universe, extra_names=_extra_names,
+                          fee_model=args.fee_model,
+                          commission_bps=args.commission_bps,
+                          min_signal_date=args.min_signal_date)
     elapsed = time.time() - t0
 
     if not trades:
@@ -1055,6 +1187,10 @@ def main():
                     and args.dd_divisor == 5.0 and args.min_aum == 2.0
                     and args.max_aum is None and args.fallback_top
                     and args.aum_basis == "merged"
+                    # 候选池也得是标准的那个 —— 场内 ETF 版参数可以全默认,
+                    # 但它是另一个市场的对照实验, 绝不能顶掉主复盘表。
+                    and args.universe == "all" and args.fee_model == "otc"
+                    and args.min_signal_date is None
                     and args.defer_until_different
                     and not args.no_require_drop)
     _params = {
@@ -1073,6 +1209,10 @@ def main():
         # 份额类别), 之后是 "merged"(A/C 等份额合并)。同一个 min_aum 数值
         # 在两种口径下松紧完全不同, 历史跑批之间比较时必须先看这一项。
         "aum_basis": args.aum_basis,
+        # 候选池: "all"=场外基金榜单, "etf"=场内 ETF。页面区分两个市场的跑批。
+        "universe": args.universe,
+        "fee_model": args.fee_model,
+        "min_signal_date": args.min_signal_date,
     }
     if args.no_save:
         print("--no-save: 这次不落库")
