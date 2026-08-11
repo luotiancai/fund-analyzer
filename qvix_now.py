@@ -43,6 +43,7 @@ import logging
 import os
 import subprocess
 import sys
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fetcher      # noqa: E402  (要先 insert path)
@@ -159,6 +160,44 @@ def _notify_fail(msg: str) -> None:
          'buttons {"知道了"} default button 1 with icon caution', timeout=None)
 
 
+_PHASE_CN = {"live": "实时", "noon": "上午收盘", "close": "今日收盘",
+             "prev": "上一交易日收盘"}
+
+
+def _latest(col: str):
+    """qvix_self_history 里 col 最后一个非空值 → (值, 那行的日期)。
+    取不到给 (None, None)——调用方据此决定少打一行, 而不是崩掉。"""
+    try:
+        hist = fetcher.load_qvix_self_history()
+        if hist is None:
+            return None, None
+        row = hist.dropna(subset=[col])
+        if row.empty:
+            return None, None
+        return float(row[col].iloc[-1]), str(row["date"].iloc[-1])
+    except Exception:
+        return None, None
+
+
+def _print_box(value: float, when: str) -> Optional[float]:
+    """把"值 + 恐慌阈值 + 距触发多少"摆成一个框打出来, 返回阈值(供通知复用)。
+
+    实时档和 prev 档共用: 两边要显示的东西是同一套, 分开写迟早会长歪。"""
+    thr, thr_date = _latest("threshold")
+    print()
+    print("  " + "─" * 42)
+    print(f"    QVIX      {value:>6.2f}   ({when})")
+    if thr is not None:
+        gap = value - thr
+        state = "🔔 已破阈值" if gap >= 0 else f"距触发还差 {-gap:.2f}"
+        print(f"    恐慌阈值  {thr:>6.2f}   {state}")
+        print(f"              (2年90分位, 截至 {thr_date})")
+    print("  " + "─" * 42)
+    print("    (本机结果, 不上传; 线上页面只有日度历史和阈值)")
+    print()
+    return thr
+
+
 def main() -> int:
     # --notify: 定时任务用, 把结果推成 macOS 通知。手动跑时不加——终端里
     # 本来就看得见, 再弹一次是噪音。
@@ -186,8 +225,26 @@ def main() -> int:
     date_str = now.strftime("%Y-%m-%d")
 
     if phase == "prev":
-        # 周末/节假日/开盘前:本来就没有实时值可算, 静默退出, 不打扰。
-        log.info("非交易时段(档位=prev), 跳过")
+        # 周末/节假日/开盘前:没有实时值可算,但**该把上一个已收盘交易日的
+        # 值摆出来**——fetcher.qvix_phase 的契约就是这一档显示"昨天的收盘
+        # 值"(见那边的档位表)。这条原来只有 app.py 实现,线上砍掉全部实时
+        # QVIX 之后 qvix_phase 只剩本脚本一个消费者,而它把这一档当成了
+        # "没事可做"直接退出,规则就此悬空。
+        # 定时任务(--notify)仍然静默:它工作日 14:40 跑,走到 prev 只可能是
+        # 节假日,那时候不该弹窗打扰。手动双击 qvix.command 是人主动来看的,
+        # 回一句"跳过"会让人以为脚本坏了(实际就发生过)。
+        if notify:
+            log.info("非交易时段(档位=prev), 跳过")
+            return 0
+        val, day = _latest("qvix")
+        if val is None:
+            log.error("非交易时段, 且库里没有可显示的历史值")
+            return 1
+        log.info("非交易时段(档位=prev), 显示库里最后一个收盘值")
+        # 注意口径: 这里比的是**同一天**的收盘值和阈值, 而阈值存的是"截至
+        # 该日收盘"的分位(含当天自己), 跟盘中"实时值 vs 昨日阈值"差一天。
+        # 收盘后回看用这个口径才跟页面一致, 别改成 shift。
+        _print_box(val, f"{_PHASE_CN['prev']} {day}")
         return 0
     try:
         r = qvix_core.compute_qvix(as_of=as_of,
@@ -213,28 +270,7 @@ def main() -> int:
     log.info("自算 QVIX = %.2f (档位=%s, 时刻=%s)", r[0], phase, r[1])
 
     # 给人看的摘要:点一次就把该知道的都摆出来, 省得再去翻页面
-    _PHASE_CN = {"live": "实时", "noon": "上午收盘", "close": "今日收盘"}
-    thr = thr_date = None
-    try:
-        hist = fetcher.load_qvix_self_history()
-        if hist is not None:
-            row = hist.dropna(subset=["threshold"])
-            if not row.empty:
-                thr = float(row["threshold"].iloc[-1])
-                thr_date = str(row["date"].iloc[-1])
-    except Exception:
-        pass
-    print()
-    print("  " + "─" * 42)
-    print(f"    QVIX      {r[0]:>6.2f}   ({_PHASE_CN.get(phase, phase)} {r[1]})")
-    if thr is not None:
-        gap = r[0] - thr
-        state = "🔔 已破阈值" if gap >= 0 else f"距触发还差 {-gap:.2f}"
-        print(f"    恐慌阈值  {thr:>6.2f}   {state}")
-        print(f"              (2年90分位, 截至 {thr_date})")
-    print("  " + "─" * 42)
-    print("    (本机结果, 不上传; 线上页面只有日度历史和阈值)")
-    print()
+    thr = _print_box(r[0], f"{_PHASE_CN.get(phase, phase)} {r[1]}")
 
     if notify:
         gap_txt = ""
