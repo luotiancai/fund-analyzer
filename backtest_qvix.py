@@ -44,11 +44,13 @@ NAV_ANOMALIES = {
     "014939": [(pd.Timestamp("2025-03-31"), 1.6249 / 0.9630)],
 }
 
-# ── 标准策略回测参考快照(2026-08-10, 数据/规则变了要重跑, 别当成结论)──
+# ── 标准策略回测参考快照(2026-08-11, 数据/规则变了要重跑, 别当成结论)──
 # 上面这段窗口×分位对比、以及后面出现过的"涨幅冠军+相关系数过滤"都是
 # 中途淘汰的旧方案, 历史版本见 git 历史, 不再列在这里。当前标准策略是
 # QVIX 2年90分位信号(window=490,pct=0.90) + 近3月跌幅最大(ret_col=
-# "ret_3m",pick="bottom") + 候选波动率比值≥1.5(min_vol_ratio=1.5) +
+# "ret_3m",pick="bottom") + **跌幅分支**候选波动率比值≥2.5
+# (min_vol_ratio=2.5, 2026-08-11 从1.5提高)、**涨幅分支不设波动门槛**
+# (top_min_vol_ratio=None, 同日加, 见该参数说明) +
 # 候选规模≥2亿(min_aum=2.0, 2026-08-06 从0.5亿提高, 见 min_aum 说明;
 # 规模按 A/C 份额合并计算, aum_basis="merged", 同日改) +
 # 跌幅耗尽时改买涨幅最大(fallback_top, 2026-08-06 加; 候选按跌幅从深到浅
@@ -62,10 +64,32 @@ NAV_ANOMALIES = {
 # 默认值随之从 720/0.95 改过来; min_aum=0.5 于 2026-07-28 加入)
 #
 #   笔数  胜率        累计收益(费后复利)  平均持有  平均收益(费后)
-#   10   8/10=80.0%  +897.57%           67天      +30.50%
-#   (剔除单笔运气021528财通成长优选+140.47%后, 剩9笔仍有+314.84%; 单笔
-#   几何均值+25.86%; 亏损只有2笔, -3.20%和-0.06%)
+#   10   8/10=80.0%  +1326.59%          66天      +35.35%
+#   (亏损只有2笔, -3.20%和-0.06%; 最佳仍是021528财通成长优选+140.47%)
 #   样本只有10笔、跨6年, 统计上很薄, 别当成可靠预期。
+#
+#   2026-08-11 波动率门槛拆成两个分支后重跑(跑批#30, 上一版标准是#26:
+#   10笔/80.0%/+897.57%, 已降级为对照)。改动只有一处: 跌幅分支门槛
+#   1.5→2.5, 涨幅分支不再设门槛。三项指标同时改善(收益 +897.57%→
+#   +1326.59%, 胜率维持 80%, 最差单笔维持 -3.20%), 是这一轮参数实验里
+#   唯一没有 trade-off 的改动。
+#   逐笔差异: 跌幅四笔换了更高弹性的标的 —— 2022-04-25 诺安创新驱动
+#   (+14.19%)→广发小盘成长(+38.07%)、2022-10-24 富国港股通互联网联接
+#   (+49.70%)→西部利得策略优选(+19.66%)、2024-02-05 汇丰晋信时代先锋
+#   (+15.18%)→海富通科技创新(+25.49%)、2024-09-26 华富健康文娱(+17.55%)
+#   →东方阿尔法优势产业(+23.20%)、2026-03-23 国融融盛(+30.83%)→鹏华
+#   创新未来(+69.53%); 涨幅三笔与#26完全一致(广发医疗保健+3.55%、汇丰
+#   晋信智造先锋-3.20%、广发北证50+36.76%)。
+#   ⚠️ 怎么来的、以及它为什么可能是过拟合, 见 top_min_vol_ratio 说明:
+#   全局2.5那版(10笔/70%/+1127.42%/最差-13.15%)的亏损**全部**落在涨幅
+#   兜底那两笔上, 这个参数正是照着那个失败案例设计的 —— 同一份数据里
+#   提出假设又验证假设, 样本内必然好看; 涨幅分支总共只有3笔, "涨幅兜底
+#   不该要求高波动"这个结论建立在2笔的差异上; 相对#26多出的429个点也仍
+#   在换标的的噪声量级内(改A/C口径那次就动了165点)。
+#   不依赖回测数字的那部分理由是: 两个分支买的东西性质本就不同 —— 跌幅
+#   分支要"超跌+高弹性"才有反弹空间, 涨幅兜底买的是当下最强的动量标的,
+#   对它再要求高振幅只是把候选池砍小、逼着往更投机的标的走(2.5全局档下
+#   2020-07-16 就从汇丰晋信换成海富通科技创新, -3.20% 变 -13.15%)。
 #
 #   2026-08-10 自算QVIX修了三个计算bug后重跑(跑批#26)。相对上一版
 #   (#19: 11笔/81.8%/+1022.26%)的全部差异就是**少了 2022-03-15 那一笔**
@@ -515,13 +539,14 @@ def get_fund_nav_after(conn, code, from_date):
 
 def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  min_corr: float = None, ret_col: str = "ret_3m", pick: str = "bottom",
-                 min_vol_ratio: float = 1.5, dd_divisor: float = 5.0,
+                 min_vol_ratio: float = 2.5, dd_divisor: float = 5.0,
                  min_aum: float = 2.0, require_drop: bool = True,
                  regime_basis: str = "day", no_same_day_rebuy: bool = False,
                  max_aum: float = None, fallback_top: bool = True,
                  defer_until_different: bool = True,
                  aum_basis: str = "merged",
-                 min_signal_date: str = None):
+                 min_signal_date: str = None,
+                 top_min_vol_ratio=None):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
     的 475/490 那套道理)。默认 490/0.90 是当前线上在用的参数
@@ -549,6 +574,17 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     -4.81%/平均亏损-1.72%, 亏损明显更可控, 不依赖某一笔运气好的极端
     案例(该案例是021528财通成长优选混合C+140.23%, 剔除它后累计收益
     仍不差, 亏损可控这个结论不受影响)。
+
+    top_min_vol_ratio(2026-08-11 加): **涨幅分支专用**的波动率比值下限,
+    默认 "same"=跟 min_vol_ratio 用同一个数(即原行为), 传 None 表示涨幅
+    分支不做波动过滤。起因是 min_vol_ratio=2.5 那次对照(10笔/70%/+1127%):
+    相对标准策略(1.5档)多出来的 230 个点全部来自跌幅分支的四笔换标的,
+    而**代价全部落在 2020 年那两笔涨幅兜底上**——2.5 的门槛把涨幅分支
+    从 +3.55%/-3.20% 换成了 -0.70%/-13.15%, 最差单笔和胜率的恶化就是
+    这两笔造成的。两个分支买的东西性质本就不同: 跌幅分支要的是"超跌+
+    高弹性"才有反弹空间, 涨幅兜底买的是当下最强的动量标的, 对它再要求
+    高振幅只是把候选池砍小、逼着往更投机的标的上走。这个参数就是把两
+    条分支的门槛拆开。
 
     min_vol_ratio: 候选波动率比值(compute_beta)下限, 见
     find_champion_on_date 同名参数说明。2026-07-24 定为标准参数=1.5
@@ -805,6 +841,10 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
             # 跌幅最大; require_drop 照常传下去(走"跌幅最大"分支时要不要求
             # 候选真的是负收益, 由参数定, 不在这里硬写)。
             _pick, _req_drop = pick, require_drop
+            # 波动率门槛按分支取: 涨幅分支用 top_min_vol_ratio("same"=沿用
+            # 同一个数, 即原行为), 跌幅分支用 min_vol_ratio。见 docstring。
+            _top_vr = (min_vol_ratio if top_min_vol_ratio == "same"
+                       else top_min_vol_ratio)
             if regime_basis == "window":
                 sse_chg = sse_change_asof(sse, day_str,
                                           fetcher.RETURN_DAYS[ret_col])
@@ -823,7 +863,9 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
             code, ret_3m = find_champion_on_date(conn, day_str, _excl,
                                                  sse_df=sse, min_corr=min_corr,
                                                  ret_col=ret_col, pick=_pick,
-                                                 min_vol_ratio=min_vol_ratio,
+                                                 min_vol_ratio=(
+                                                     _top_vr if _pick == "top"
+                                                     else min_vol_ratio),
                                                  min_aum=min_aum,
                                                  require_drop=_req_drop,
                                                  max_aum=max_aum,
@@ -837,7 +879,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                 code, ret_3m = find_champion_on_date(
                     conn, day_str, _excl, sse_df=sse, min_corr=min_corr,
                     ret_col=ret_col, pick="top",
-                    min_vol_ratio=min_vol_ratio, min_aum=min_aum,
+                    min_vol_ratio=_top_vr, min_aum=min_aum,
                     require_drop=False, max_aum=max_aum, aum_basis=aum_basis)
                 if code is not None:
                     _pick = "top"      # 供「选向」列区分这笔走的是兜底分支
@@ -1036,9 +1078,19 @@ def main():
                              "最大、跌则选跌幅最大, 自动关掉「必须下跌」规则)")
     parser.add_argument("--min-vol-ratio",
                         type=lambda s: None if s.lower() == "none" else float(s),
-                        default=1.5,
-                        help="候选波动率比值下限,默认1.5(2026-07-24定档,"
-                             "见 run_backtest 说明);传 none 关掉过滤")
+                        default=2.5,
+                        help="**跌幅分支**候选的波动率比值下限,默认2.5"
+                             "(2026-08-11 从1.5提高, 见 run_backtest 说明);"
+                             "传 none 关掉过滤。涨幅分支另看 --top-min-vol-ratio")
+    parser.add_argument("--top-min-vol-ratio",
+                        type=lambda s: (None if s.lower() == "none"
+                                        else ("same" if s.lower() == "same"
+                                              else float(s))),
+                        default=None,
+                        help="涨幅分支(含跌幅耗尽时的兜底)专用的波动率比值下限。"
+                             "默认 none=涨幅分支**不过滤**波动率(2026-08-11 起的"
+                             "标准); same=跟 --min-vol-ratio 用同一个数(旧行为)。"
+                             "见 run_backtest 同名参数说明")
     parser.add_argument("--dd-divisor", type=float, default=5.0,
                         help="回撤线除数,默认5.0(线上口径:基金线=阈值/除数×"
                              "波动率比值,大盘线=阈值/除数);传4=更宽止损带,"
@@ -1111,7 +1163,8 @@ def main():
                           regime_basis=args.regime_basis,
                           no_same_day_rebuy=args.no_same_day_rebuy,
                           aum_basis=args.aum_basis,
-                          min_signal_date=args.min_signal_date)
+                          min_signal_date=args.min_signal_date,
+                          top_min_vol_ratio=args.top_min_vol_ratio)
     elapsed = time.time() - t0
 
     if not trades:
@@ -1124,13 +1177,14 @@ def main():
     # 策略库是独立文件(fund_strategy.db), 跟行情主库分开发布。
     _is_standard = (args.window == 490 and args.pct == 0.90
                     and args.min_corr is None and args.lookback == "3m"
-                    and args.pick == "bottom" and args.min_vol_ratio == 1.5
+                    and args.pick == "bottom" and args.min_vol_ratio == 2.5
                     and args.dd_divisor == 5.0 and args.min_aum == 2.0
                     and args.max_aum is None and args.fallback_top
                     and args.aum_basis == "merged"
                     # 候选池也得是标准的那个 —— 场内 ETF 版参数可以全默认,
                     # 但它是另一个市场的对照实验, 绝不能顶掉主复盘表。
                     and args.min_signal_date is None
+                    and args.top_min_vol_ratio is None
                     and args.defer_until_different
                     and not args.no_require_drop)
     _params = {
@@ -1150,6 +1204,8 @@ def main():
         # 在两种口径下松紧完全不同, 历史跑批之间比较时必须先看这一项。
         "aum_basis": args.aum_basis,
         "min_signal_date": args.min_signal_date,
+        # 涨幅分支专用的波动率门槛; "same"=与 min_vol_ratio 同值(原行为)
+        "top_min_vol_ratio": args.top_min_vol_ratio,
     }
     if args.no_save:
         print("--no-save: 这次不落库")
