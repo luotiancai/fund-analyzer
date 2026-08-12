@@ -1,8 +1,9 @@
 """
 回测: QVIX恐慌信号买入 + 双止损(基金回撤控制线 / 大盘回撤线)
 - 买入: QVIX > 2年90分位阈值, 且资金可用(空仓或当天恰好卖出)
-  · 找不到"真正跌过"的合格候选时改买涨幅最大的(fallback_top)
-  · 止损平仓后若又选中同一只, 一路顺延信号日直到标的换掉(defer_until_different)
+  · 找不到"真正跌过"的合格候选就放弃当天, 顺延到下一个信号日
+    (2026-08-12 之前这里有"改买涨幅最大"的兜底和配套的"顺延至标的换掉",
+     两条都已删除, 理由见 run_backtest 里买入那段注释)
 - 标的: 前一交易日近3月冠军(C类全市场, 规模≥2亿), 冠军排名复用 fetcher.compute_
   metrics_asof——与 app.py「基金列表」页"截至日期"筛选完全同口径(按日
   收益率连乘, 正确处理分红除权, 自带单日|收益率|>30%异常值过滤), 而非
@@ -48,25 +49,29 @@ NAV_ANOMALIES = {
 # 上面这段窗口×分位对比、以及后面出现过的"涨幅冠军+相关系数过滤"都是
 # 中途淘汰的旧方案, 历史版本见 git 历史, 不再列在这里。当前标准策略是
 # QVIX 2年90分位信号(window=490,pct=0.90) + 近3月跌幅最大(ret_col=
-# "ret_3m",pick="bottom") + **跌幅分支**候选波动率比值≥2.5
-# (min_vol_ratio=2.5, 2026-08-11 从1.5提高)、**涨幅分支不设波动门槛**
-# (top_min_vol_ratio=None, 同日加, 见该参数说明) +
+# "ret_3m",pick="bottom") + 候选波动率比值≥2.5(min_vol_ratio=2.5,
+# 2026-08-11 从1.5提高) +
 # 候选规模≥2亿(min_aum=2.0, 2026-08-06 从0.5亿提高, 见 min_aum 说明;
 # 规模按 A/C 份额合并计算, aum_basis="merged", 同日改) +
-# 跌幅耗尽时改买涨幅最大(fallback_top, 2026-08-06 加; 候选按跌幅从深到浅
-# 排, 找到第一个非负值说明没有真跌的了, 这时掉头去拿涨幅冠军, 而不是退而
-# 求其次买涨幅最小的) + 止损平仓后若又选中同一只则顺延信号日直到标的换掉
-# (defer_until_different, 2026-08-06 加) + 排除QDII/海外/持有期锁定基金
+# 跌幅耗尽(没有真正跌过的合格候选)就放弃当天、顺延到下一个信号日 +
+# 排除QDII/海外/持有期锁定基金
 # (港股通/沪港深/恒生系列不再排除, 见 _HK_RE 定义处说明), 命令:
 #   python3 backtest_qvix.py
 # (以上全部是当前 run_backtest 的默认值, 不用额外传参——含 window=490/
 # pct=0.90, 2026-07-27 起生产阈值列/通知邮件也已对齐这个口径,
 # 默认值随之从 720/0.95 改过来; min_aum=0.5 于 2026-07-28 加入)
 #
-#   笔数  胜率        累计收益(费后复利)  平均持有  平均收益(费后)
-#   10   8/10=80.0%  +1326.59%          66天      +35.35%
-#   (亏损只有2笔, -3.20%和-0.06%; 最佳仍是021528财通成长优选+140.47%)
-#   样本只有10笔、跨6年, 统计上很薄, 别当成可靠预期。
+#   笔数  胜率       累计收益(费后复利)  平均持有  平均收益(费后)
+#   7    6/7=85.7%  +940.67%          80天      +45.19%
+#   (唯一亏损是012847诺安积极回报-0.06%, 基本打平; 最佳仍是021528财通
+#   成长优选+140.47%)
+#   样本只有7笔、跨6年, 统计上很薄, 别当成可靠预期。
+#
+#   2026-08-12 删掉涨幅兜底和配套的顺延规则后重跑。上一版(带兜底)是
+#   10笔/80.0%/+1326.59%/最差-3.20%。少掉的 386 个点来自丢掉北证50
+#   那笔 +36.76% 以及它垫高的复利基数, 但单笔质量全面改善: 平均单笔
+#   +35.35%→+45.19%, 最差 -3.20%→-0.06%, 胜率 80%→85.7%。删除理由
+#   见 run_backtest 里买入那段注释。
 #
 #   2026-08-11 波动率门槛拆成两个分支后重跑(跑批#30, 上一版标准是#26:
 #   10笔/80.0%/+897.57%, 已降级为对照)。改动只有一处: 跌幅分支门槛
@@ -305,9 +310,10 @@ def _corr_with_market(conn, sse_df, code, window_start, window_end):
 # + 逐只 _metrics_from_nav 6.3s, 后者是 4000+ 次函数调用的固定开销, 跟数据
 # 量关系不大), 一次标准回测要调 ~35 次, 占总耗时九成以上。
 #
-# 而 fallback_top / defer_until_different 这两条规则会让同一个信号日**调两次**
-# ——跌幅分支一次, 涨幅兜底再一次, 两次的 (asof, ret_col) 完全相同, 结果必然
-# 一样。缓存掉重复的那次即可, 实测 #18 那版 15 个信号日属于这种情况。
+# 缓存最初是为 fallback_top(涨幅兜底)加的: 那条规则会让同一个信号日调两次
+# ——跌幅分支一次, 涨幅兜底再一次, 两次的 (asof, ret_col) 完全相同。规则已于
+# 2026-08-12 删除, 现在标准跑批里不再有重复调用, 但 --pick regime 那类对照
+# 实验仍可能连着两天问同一个 asof, 缓存留着不亏。
 #
 # 缓存放在回测这层而不是 fetcher 里: fetcher 那个函数 app 也在用(「基金列表」
 # 页的"截至日期"筛选), 进程级缓存会在数据库刷新后继续返回陈旧结果; 而回测
@@ -542,11 +548,12 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  min_vol_ratio: float = 2.5, dd_divisor: float = 5.0,
                  min_aum: float = 2.0, require_drop: bool = True,
                  regime_basis: str = "day", no_same_day_rebuy: bool = False,
-                 max_aum: float = None, fallback_top: bool = True,
-                 defer_until_different: bool = True,
+                 max_aum: float = None,
                  aum_basis: str = "merged",
                  min_signal_date: str = None,
-                 top_min_vol_ratio=None):
+                 top_min_vol_ratio=None,
+                 signal_mode: str = "threshold",
+                 jump_days: int = 3, jump_pct: float = 0.20):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
     的 475/490 那套道理)。默认 490/0.90 是当前线上在用的参数
@@ -574,6 +581,20 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     -4.81%/平均亏损-1.72%, 亏损明显更可控, 不依赖某一笔运气好的极端
     案例(该案例是021528财通成长优选混合C+140.23%, 剔除它后累计收益
     仍不差, 亏损可控这个结论不受影响)。
+
+    signal_mode / jump_days / jump_pct(2026-08-12 加): 买入信号从哪来。
+    "threshold"(默认, 线上口径)=QVIX 高过 window/pct 那条滚动分位线;
+    "jump"=QVIX 比 jump_days 个交易日前涨了 jump_pct 以上(相对跳升,
+    不看绝对水平)。起因是绝对阈值有个结构性盲区: 熊市里波动率整体下移、
+    分位阈值跟着降得慢, 于是真跌的时候反而够不到线 —— 2021-07 双减、
+    2022-03 俄乌、2022-08、2023-10 破3000、2024-01 小微盘、2024-08 日元
+    套息平仓这些真事件, 阈值口径一个都没抓到, 跳升口径能抓到。
+    ⚠️ 跳升口径本身有两个已知毛病: ①不分方向, 暴涨也会推高波动率(2024-10-08
+    上证 +4.59% 那天 QVIX 翻倍); ②低波动区噪声大(20%档里有一批 QVIX 只有
+    16~18 的假信号, 从 13~15 跳上来的, 绝对水平谈不上恐慌)。
+    **止损线仍然按当天的分位阈值定宽度**(基金线=阈值/dd_divisor×波动率比值,
+    大盘线=阈值/dd_divisor), 不随信号来源改 —— 这样两种口径的差异只隔离在
+    "哪天是信号日"上, 别的完全可比。
 
     top_min_vol_ratio(2026-08-11 加): **涨幅分支专用**的波动率比值下限,
     默认 "same"=跟 min_vol_ratio 用同一个数(即原行为), 传 None 表示涨幅
@@ -741,15 +762,20 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
               f"{_firsts.min().date()}, 离群不采信), "
               f"近3月冠军窗口最早可信信号日 {_signal_floor.date()}")
 
-    # Signal days: QVIX > threshold
-    signals = qvix[(qvix["close"] > qvix["thr"]) & (qvix["thr"].notna())]
+    # Signal days: 两种来源(见 signal_mode 说明)。两种都要求 thr 有值 ——
+    # 不是因为 thr 决定信号(jump 模式下不决定), 而是止损线的宽度要用它。
+    if signal_mode == "jump":
+        _jump = qvix["close"] / qvix["close"].shift(jump_days) - 1
+        signals = qvix[(_jump >= jump_pct) & (qvix["thr"].notna())]
+        print(f"信号口径: QVIX 比 {jump_days} 个交易日前涨 ≥{jump_pct:.0%}")
+    else:
+        signals = qvix[(qvix["close"] > qvix["thr"]) & (qvix["thr"].notna())]
     signals = signals[signals["date"] >= _signal_floor]
     print(f"信号日(QVIX > 阈值): {len(signals)} 天")
     signal_map = {row["date"]: row["thr"] for _, row in signals.iterrows()}
 
     trades = []
     position = None
-    last_closed_code = None    # 上一笔平仓的标的, 见 defer_until_different
 
     # 逐交易日走: 持仓时每天检查双止损线, 空仓(或当天刚卖出)遇信号日则买入
     all_days = sse[sse["date"] >= _signal_floor]
@@ -760,9 +786,6 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
         sse_close = float(day_row["close"])
 
         sold_today = None      # 今天止损卖出的代码(供 no_same_day_rebuy 用)
-        # last_closed_code 在循环外维护(见下面赋值处): 上一笔平仓的标的,
-        # defer_until_different 用它把"又选中同一只"的信号日一路跳过去,
-        # 直到某个信号日选出不同标的为止。
 
         # ── Step 1: 持仓时逐日检查双止损 ──
         if position is not None:
@@ -829,7 +852,6 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                     "_ret_pct": ret_pct,
                 })
                 sold_today = code
-                last_closed_code = code
                 position = None
 
         # ── Step 2: 空仓(含当天刚卖出)且为信号日时买入 ──
@@ -870,29 +892,20 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                                                  require_drop=_req_drop,
                                                  max_aum=max_aum,
                                                  aum_basis=aum_basis)
-            # 兜底: 当天找不到"真正跌过"的合格候选时(跌幅耗尽, 或者跌的那些
-            # 都过不了波动率/规模门槛), 标准策略是直接放弃这一天; 打开
-            # fallback_top 则改买涨幅最大的那只。注意这跟 require_drop=False
-            # 不是一回事——那个是退而求其次买"跌幅最小(往往是微涨)"的, 还在
-            # 榜单尾部捞; 这里是掉头去榜单另一头拿涨幅冠军。
-            if code is None and fallback_top and _pick == "bottom":
-                code, ret_3m = find_champion_on_date(
-                    conn, day_str, _excl, sse_df=sse, min_corr=min_corr,
-                    ret_col=ret_col, pick="top",
-                    min_vol_ratio=_top_vr, min_aum=min_aum,
-                    require_drop=False, max_aum=max_aum, aum_basis=aum_basis)
-                if code is not None:
-                    _pick = "top"      # 供「选向」列区分这笔走的是兜底分支
+            # 跌幅耗尽(没有真正跌过的合格候选)就放弃这一天, 顺延到下一个
+            # 信号日。2026-08-12 之前这里有一条 fallback_top 兜底: 改买涨幅
+            # 最大的那只。删掉的理由是它跟入场信号自相矛盾——阈值信号的前提
+            # 是"恐慌到位→超跌反弹", 唯一指向"买跌得最惨的"; 而"跌幅耗尽"
+            # 本身就说明这次恐慌没制造出超跌标的、前提不成立, 这时正确的动作
+            # 是不操作, 而不是掉头用动量逻辑硬买一只。实测三笔兜底交易是
+            # +3.55%/-3.20%/+36.76%, 除了北证50那笔全部接近零, 而那笔的
+            # +36.76% 恰恰能证明是运气: 同一只基金在 2024-11-18 止损后连续
+            # 12 个信号日都是涨幅冠军(近3月+99.7%→+114.7%), 照规则买回去是
+            # -10.47%(当时靠另一条 defer_until_different 才躲掉)。删掉后
+            # 10笔→7笔, 累计 +1326.59%→+940.67%, 但胜率 80%→85.7%、最差单笔
+            # -3.20%→-0.06%、平均单笔 +35.35%→+45.19% —— 少掉的收益来自
+            # 丢掉一次运气和它垫高的复利基数, 不是丢掉一个 edge。
             if code is None:
-                continue
-            # 又选中上一笔刚平仓的那只 → 这个信号日整个跳过, 一路顺延到
-            # 某个信号日选出**不同**标的为止(不是只延一天: 信号日常常是
-            # 连续的, 只延一天的话第二天大概率还是同一只, 实测 2024-11-18
-            # 延到 11-19 选出来的还是 017513, 白延一天还多付0.5%手续费)。
-            # 跟 no_same_day_rebuy 的区别: 那个是当天换一只别的买(实测只
-            # 会换成同指数的另一只壳, 敞口没变), 这个是空仓等到标的真正
-            # 换掉——止损既然喊了撤退, 就真的从这个标的上退出来。
-            if defer_until_different and code == last_closed_code:
                 continue
 
             # 获取当天买入净值
@@ -922,7 +935,6 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
             # 预载基金净值序列, 供逐日止损检查
             nav_map = dict(get_fund_nav_after(conn, code, actual_buy_date))
 
-            last_closed_code = None    # 已经换到别的标的, 顺延约束解除
             position = {
                 "code": code,
                 "buy_date": actual_buy_date,
@@ -1082,6 +1094,15 @@ def main():
                         help="**跌幅分支**候选的波动率比值下限,默认2.5"
                              "(2026-08-11 从1.5提高, 见 run_backtest 说明);"
                              "传 none 关掉过滤。涨幅分支另看 --top-min-vol-ratio")
+    parser.add_argument("--signal-mode", choices=["threshold", "jump"],
+                        default="threshold",
+                        help="买入信号来源: threshold(默认,线上口径)=QVIX高过"
+                             "滚动分位阈值; jump=QVIX比N个交易日前涨了X%%以上"
+                             "(相对跳升)。见 run_backtest 同名参数说明")
+    parser.add_argument("--jump-days", type=int, default=3,
+                        help="--signal-mode jump 时的回看交易日数, 默认3")
+    parser.add_argument("--jump-pct", type=float, default=0.20,
+                        help="--signal-mode jump 时的跳升幅度门槛(小数), 默认0.20")
     parser.add_argument("--top-min-vol-ratio",
                         type=lambda s: (None if s.lower() == "none"
                                         else ("same" if s.lower() == "same"
@@ -1117,14 +1138,6 @@ def main():
                         help="基金规模上限(亿元, 同 --min-aum 的季报口径),"
                              "默认不设上限。配合 --min-aum 可以只取某个规模"
                              "区间, 如 --min-aum 0.5 --max-aum 10")
-    parser.add_argument("--no-fallback-top", dest="fallback_top",
-                        action="store_false",
-                        help="关掉「找不到真跌的就改买涨幅最大」这条(2026-08-06"
-                             "起是标准规则)。关掉后当天直接放弃不操作")
-    parser.add_argument("--no-defer-until-different", dest="defer_until_different",
-                        action="store_false",
-                        help="关掉「止损后顺延到标的真正换掉」这条(2026-08-06"
-                             "起是标准规则)。关掉后止损当天照买回同一只")
     parser.add_argument("--regime-basis", choices=["day", "window"], default="day",
                         help="pick=regime 时的择向依据: day(默认)=信号日当天"
                              "单日涨跌; window=比一个回看窗口前(截至前一交易日,"
@@ -1157,14 +1170,14 @@ def main():
                           dd_divisor=args.dd_divisor,
                           min_aum=args.min_aum,
                           max_aum=args.max_aum,
-                          fallback_top=args.fallback_top,
-                          defer_until_different=args.defer_until_different,
                           require_drop=not args.no_require_drop,
                           regime_basis=args.regime_basis,
                           no_same_day_rebuy=args.no_same_day_rebuy,
                           aum_basis=args.aum_basis,
                           min_signal_date=args.min_signal_date,
-                          top_min_vol_ratio=args.top_min_vol_ratio)
+                          top_min_vol_ratio=args.top_min_vol_ratio,
+                          signal_mode=args.signal_mode,
+                          jump_days=args.jump_days, jump_pct=args.jump_pct)
     elapsed = time.time() - t0
 
     if not trades:
@@ -1179,21 +1192,19 @@ def main():
                     and args.min_corr is None and args.lookback == "3m"
                     and args.pick == "bottom" and args.min_vol_ratio == 2.5
                     and args.dd_divisor == 5.0 and args.min_aum == 2.0
-                    and args.max_aum is None and args.fallback_top
+                    and args.max_aum is None
                     and args.aum_basis == "merged"
                     # 候选池也得是标准的那个 —— 场内 ETF 版参数可以全默认,
                     # 但它是另一个市场的对照实验, 绝不能顶掉主复盘表。
                     and args.min_signal_date is None
                     and args.top_min_vol_ratio is None
-                    and args.defer_until_different
+                    and args.signal_mode == "threshold"
                     and not args.no_require_drop)
     _params = {
         "window": args.window, "pct": args.pct, "ret_col": _ret_col,
         "pick": args.pick, "min_vol_ratio": args.min_vol_ratio,
         "dd_divisor": args.dd_divisor, "min_aum": args.min_aum,
         "max_aum": args.max_aum,
-        "fallback_top": args.fallback_top,
-        "defer_until_different": args.defer_until_different,
         "require_drop": not args.no_require_drop,
         # 择向依据("day"=当天单日涨跌 / "window"=比回看窗口前、截至前一日),
         # 只对 pick="regime" 有意义。页面按它描述规则, 不同跑批各说各的。
@@ -1206,6 +1217,10 @@ def main():
         "min_signal_date": args.min_signal_date,
         # 涨幅分支专用的波动率门槛; "same"=与 min_vol_ratio 同值(原行为)
         "top_min_vol_ratio": args.top_min_vol_ratio,
+        # 信号来源; jump 时才看 jump_days/jump_pct
+        "signal_mode": args.signal_mode,
+        "jump_days": args.jump_days if args.signal_mode == "jump" else None,
+        "jump_pct": args.jump_pct if args.signal_mode == "jump" else None,
     }
     if args.no_save:
         print("--no-save: 这次不落库")

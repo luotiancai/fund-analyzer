@@ -2063,10 +2063,9 @@ def describe_run(params: dict) -> str:
         bits.append("跌向须真跌")
     if p.get("min_vol_ratio"):
         bits.append(f"波动≥{p['min_vol_ratio']}")
-    if p.get("fallback_top"):
-        bits.append("无真跌改买涨幅最大")
-    if p.get("defer_until_different"):
-        bits.append("接力同一只则顺延")
+    # 2026-08-12 前的跑批还带着 fallback_top / defer_until_different 两项,
+    # 那两条规则已删除。历史跑批的 label 是存库时就定死的字符串, 不会因为
+    # 这里不再拼这两段而改变, 所以直接不认这两个键。
     if p.get("no_same_day_rebuy"):
         bits.append("止损当天禁买回")
     if p.get("min_aum") and p.get("max_aum"):
