@@ -2063,6 +2063,9 @@ def describe_run(params: dict) -> str:
         bits.append("跌向须真跌")
     if p.get("min_vol_ratio"):
         bits.append(f"波动≥{p['min_vol_ratio']}")
+    # 跌幅深度上限: 只在跌向分支有意义
+    if p.get("max_drop") and pick != "top":
+        bits.append(f"跌幅≤{p['max_drop']}%")
     # 2026-08-12 前的跑批还带着 fallback_top / defer_until_different 两项,
     # 那两条规则已删除。历史跑批的 label 是存库时就定死的字符串, 不会因为
     # 这里不再拼这两段而改变, 所以直接不认这两个键。

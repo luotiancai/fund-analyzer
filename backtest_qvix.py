@@ -54,6 +54,7 @@ NAV_ANOMALIES = {
 # 候选规模 2~10亿(min_aum=2.0 于2026-08-06 从0.5亿提高; max_aum=10.0
 # 于2026-08-12 加, 见下面实测; 规模按 A/C 份额合并计算,
 # aum_basis="merged") +
+# 近3月跌幅不超过30%(max_drop=30.0, 2026-08-12 加, 见该参数说明) +
 # 跌幅耗尽(没有真正跌过的合格候选)就放弃当天、顺延到下一个信号日 +
 # 排除QDII/海外/持有期锁定基金
 # (港股通/沪港深/恒生系列不再排除, 见 _HK_RE 定义处说明), 命令:
@@ -63,7 +64,7 @@ NAV_ANOMALIES = {
 # 默认值随之从 720/0.95 改过来; min_aum=0.5 于 2026-07-28 加入)
 #
 #   笔数  胜率       累计收益(费后复利)  平均持有  平均收益(费后)
-#   7    7/7=100%   +606.58%          82天      +35.17%
+#   7    7/7=100%   +643.58%          79天      +36.01%
 #   (7笔全部盈利, 最差 +3.51%; 最佳是009063财通智慧成长+101.79%)
 #   样本只有7笔、跨6年, 100%胜率是"一笔小亏变成小赚"的结果, 统计上毫无
 #   意义, 别当成可靠预期。
@@ -101,6 +102,14 @@ NAV_ANOMALIES = {
 #   前面"的噪声标的 —— 真跌得深的都被规模区间刷掉之后, 榜首就剩这些跟着
 #   大盘小幅回调的低波动品种了。1.5档(配2~10亿)是8笔/100%/+555.44%, 比
 #   2.0档多的那笔是近3月才跌2.42%的擦边货。
+#
+#   2026-08-12(再续) 加近3月跌幅上限 30%(max_drop=30.0), 见该参数说明。
+#   只改动 7 笔里的 1 笔: 2024-02-05 汇丰晋信时代先锋(-34.29%, 港股仓位
+#   30.6%, 只落到候选池 17 百分位)换成信澳领先增长(-29.31%),
+#   +12.09%→+17.96%, 累计 +606.58%→+643.58%。
+#   ⚠️ 用户拍板加的; 我的保留意见记在 max_drop 说明里 —— 只影响一笔、
+#   相邻档位剧烈翻转(25%档只有+498.71%, 因为会误杀 2022-10-24 那只
+#   -26.93% 的全池最优), 在当前样本上近乎不可证伪。
 #
 #   2026-08-12 删掉涨幅兜底和配套的顺延规则后重跑。上一版(带兜底)是
 #   10笔/80.0%/+1326.59%/最差-3.20%。少掉的 386 个点来自丢掉北证50
@@ -392,7 +401,7 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
                           sse_df=None, min_corr=None,
                           ret_col="ret_3m", pick="top", min_vol_ratio=None,
                           min_aum=None, require_drop=True, max_aum=None,
-                          aum_basis="merged"):
+                          aum_basis="merged", max_drop=None):
     """找 asof_date 当天视角下排名第一的标的(排除 exclude_codes). 返回 (code, ret).
 
     复用 fetcher.compute_metrics_asof——按日收益率连乘计算区间收益(正确
@@ -460,6 +469,11 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
             # "涨幅倒数第一", 意义不一样)。require_drop=False 时关掉这条,
             # 照买跌幅最大(涨幅最小)那个, 用于回测「去掉不操作规则」的效果。
             break
+        if (max_drop is not None and pick == "bottom"
+                and candidates[code] < -max_drop):
+            # 跌幅深度上限: 跌得比它还狠的直接跳过(只对跌幅分支生效)。
+            # 放在贵检查之前 —— 排序从最深开始, 这一段全是要跳的。
+            continue
         if not _has_full_window(conn, code, asof_date,
                                 fetcher.RETURN_DAYS[ret_col]):
             continue      # 回看窗口不完整, 排名数不可比(见 _has_full_window)
@@ -634,7 +648,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  min_signal_date: str = None,
                  top_min_vol_ratio=None,
                  signal_mode: str = "threshold",
-                 jump_days: int = 3, jump_pct: float = 0.20):
+                 jump_days: int = 3, jump_pct: float = 0.20,
+                 max_drop: float = 30.0):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
     的 475/490 那套道理)。默认 490/0.90 是当前线上在用的参数
@@ -662,6 +677,25 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     -4.81%/平均亏损-1.72%, 亏损明显更可控, 不依赖某一笔运气好的极端
     案例(该案例是021528财通成长优选混合C+140.23%, 剔除它后累计收益
     仍不差, 亏损可控这个结论不受影响)。
+
+    max_drop(2026-08-12 定为标准=30, 只对 pick="bottom" 生效): 跌幅深度上限,
+    传正数百分比, 近3月跌得比它还狠的候选直接跳过 —— 选中的是"跌幅落在
+    [-max_drop, 0) 这条带子里最深的那只", 而不是全市场跌得最惨的那只。
+    依据: 逐笔复盘里事后最优解的近3月跌幅**没有一只超过 -27%**(-22.85/
+    -26.93/-14.26/-12.68/-11.59/-9.44/-8.56), 最优区间从来不在深跌尾部;
+    而 2024-02-05 那笔跌了 -34.29% 的汇丰晋信时代先锋只落到候选池 17 百分位
+    (随机抽5只均值 +25.20%, 它只有 +12.09%) —— 它重仓 30.6% 港股, 跌得深是
+    因为港股+新能源被杀估值, 而那波反弹发生在 A 股小微盘, **跌的市场和反弹
+    的市场不是同一个**。
+    实测(其余参数同标准): 无上限 +606.58%, 30% 上限 +643.58%, 25% 上限
+    +498.71%。30% 只改动 7 笔里的 1 笔(2024-02-05 换成信澳领先增长,
+    +12.09%→+17.96%), 其余 6 笔一字不动。
+    ⚠️ 这条规则在当前样本上**近乎不可证伪**: 只影响一笔, 而那一笔正是被
+    单独诊断过的失败案例; 相邻档位剧烈翻转(30%→+643.58%, 25%→+498.71%,
+    差145个点), 因为 25% 会把 2022-10-24 富国港股通互联网(-26.93%, 全池
+    100百分位、随机抽5只全亏的那次)一起误杀。也就是说它现在的表现取决于
+    "-26.93% 和 -34.29% 之间恰好有条缝"。真正想抓的机制其实是"跌幅来源与
+    这次恐慌是否同源", 在跌幅数值上划线只是它的粗糙代理。
 
     signal_mode / jump_days / jump_pct(2026-08-12 加): 买入信号从哪来。
     "threshold"(默认, 线上口径)=QVIX 高过 window/pct 那条滚动分位线;
@@ -972,7 +1006,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                                                  min_aum=min_aum,
                                                  require_drop=_req_drop,
                                                  max_aum=max_aum,
-                                                 aum_basis=aum_basis)
+                                                 aum_basis=aum_basis,
+                                                 max_drop=max_drop)
             # 跌幅耗尽(没有真正跌过的合格候选)就放弃这一天, 顺延到下一个
             # 信号日。2026-08-12 之前这里有一条 fallback_top 兜底: 改买涨幅
             # 最大的那只。删掉的理由是它跟入场信号自相矛盾——阈值信号的前提
@@ -1175,6 +1210,12 @@ def main():
                         help="**跌幅分支**候选的波动率比值下限,默认2.0"
                              "(2026-08-12 定档, 见 run_backtest 说明);"
                              "传 none 关掉过滤。涨幅分支另看 --top-min-vol-ratio")
+    parser.add_argument("--max-drop",
+                        type=lambda s: None if s.lower() == "none" else float(s),
+                        default=30.0,
+                        help="跌幅深度上限(正数百分比), 只对跌幅分支生效。"
+                             "默认30(2026-08-12 定档, 见 run_backtest 说明);"
+                             "传 none 取消上限")
     parser.add_argument("--signal-mode", choices=["threshold", "jump"],
                         default="threshold",
                         help="买入信号来源: threshold(默认,线上口径)=QVIX高过"
@@ -1257,6 +1298,7 @@ def main():
                           aum_basis=args.aum_basis,
                           min_signal_date=args.min_signal_date,
                           top_min_vol_ratio=args.top_min_vol_ratio,
+                          max_drop=args.max_drop,
                           signal_mode=args.signal_mode,
                           jump_days=args.jump_days, jump_pct=args.jump_pct)
     elapsed = time.time() - t0
@@ -1280,6 +1322,7 @@ def main():
                     and args.min_signal_date is None
                     and args.top_min_vol_ratio is None
                     and args.signal_mode == "threshold"
+                    and args.max_drop == 30.0
                     and not args.no_require_drop)
     _params = {
         "window": args.window, "pct": args.pct, "ret_col": _ret_col,
@@ -1299,6 +1342,7 @@ def main():
         # 涨幅分支专用的波动率门槛; "same"=与 min_vol_ratio 同值(原行为)
         "top_min_vol_ratio": args.top_min_vol_ratio,
         # 信号来源; jump 时才看 jump_days/jump_pct
+        "max_drop": args.max_drop,
         "signal_mode": args.signal_mode,
         "jump_days": args.jump_days if args.signal_mode == "jump" else None,
         "jump_pct": args.jump_pct if args.signal_mode == "jump" else None,
