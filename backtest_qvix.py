@@ -49,8 +49,8 @@ NAV_ANOMALIES = {
 # 上面这段窗口×分位对比、以及后面出现过的"涨幅冠军+相关系数过滤"都是
 # 中途淘汰的旧方案, 历史版本见 git 历史, 不再列在这里。当前标准策略是
 # QVIX 2年90分位信号(window=490,pct=0.90) + 近3月跌幅最大(ret_col=
-# "ret_3m",pick="bottom") + 候选波动率比值≥2.5(min_vol_ratio=2.5,
-# 2026-08-11 从1.5提高) +
+# "ret_3m",pick="bottom") + 候选波动率比值≥2.0(min_vol_ratio=2.0,
+# 2026-08-12 定档, 见下面的三档实测) +
 # 候选规模≥2亿(min_aum=2.0, 2026-08-06 从0.5亿提高, 见 min_aum 说明;
 # 规模按 A/C 份额合并计算, aum_basis="merged", 同日改) +
 # 跌幅耗尽(没有真正跌过的合格候选)就放弃当天、顺延到下一个信号日 +
@@ -62,10 +62,22 @@ NAV_ANOMALIES = {
 # 默认值随之从 720/0.95 改过来; min_aum=0.5 于 2026-07-28 加入)
 #
 #   笔数  胜率       累计收益(费后复利)  平均持有  平均收益(费后)
-#   7    6/7=85.7%  +940.67%          80天      +45.19%
-#   (唯一亏损是012847诺安积极回报-0.06%, 基本打平; 最佳仍是021528财通
-#   成长优选+140.47%)
+#   7    6/7=85.7%  +695.17%          81天      +39.79%
+#   (唯一亏损是012847诺安积极回报-0.10%, 基本打平; 最佳是021528财通成长
+#   优选+140.43%)
 #   样本只有7笔、跨6年, 统计上很薄, 别当成可靠预期。
+#
+#   2026-08-12 修完单位净值除权 bug(见 compute_beta 说明)后, 在干净数据上
+#   重验波动率门槛三档, 结论跟带 bug 时**完全相反**:
+#     门槛   笔数  胜率     费后复利     平均单笔
+#     1.5    8    87.5%   +654.73%    +33.91%
+#     2.0    7    85.7%   +695.17%    +39.79%   ← 定档
+#     2.5    6    83.3%   +481.11%    +39.91%
+#   2.5 原本是 2026-08-11 定的标准, 靠的正是那笔被除权污染的 +38.07%
+#   (009132 广发小盘成长, 波动率比值虚高成 2.87、真实 1.28); bug 一修它就
+#   成了三档里最差的一档。1.5 和 2.0 之间只差两笔换标的(2022-04-25、
+#   2024-09-26), 40 个点落在换标的的噪声量级内, 取 2.0 是因为平均单笔
+#   明显更好(+39.79% vs +33.91%)且笔数居中, 不是因为 +40 个点。
 #
 #   2026-08-12 删掉涨幅兜底和配套的顺延规则后重跑。上一版(带兜底)是
 #   10笔/80.0%/+1326.59%/最差-3.20%。少掉的 386 个点来自丢掉北证50
@@ -263,14 +275,20 @@ STALE_JUMP_THRESH = 0.08
 
 
 def _has_stale_catchup(conn, code, window_start, window_end):
-    """排名窗口 [window_start, window_end] 内是否出现净值僵化-补涨模式."""
+    """排名窗口 [window_start, window_end] 内是否出现净值僵化-补涨模式.
+
+    用 daily_ret_pct 而不是单位净值 pct_change: 分红除权日单位净值会跳水,
+    正好长得像这里要抓的"跳变", 前面若碰巧有几天净值几乎不动就会误判成
+    僵化-补涨、把一只正常基金整个剔出候选池(见 compute_beta 的说明)。
+    """
     df = pd.read_sql_query(
-        "SELECT date, nav FROM fund_nav_daily WHERE code=? AND date>=? AND date<=? ORDER BY date",
+        "SELECT date, daily_ret_pct FROM fund_nav_daily "
+        "WHERE code=? AND date>=? AND date<=? ORDER BY date",
         conn, params=(code, window_start.strftime("%Y-%m-%d"), window_end.strftime("%Y-%m-%d")))
     if len(df) < STALE_MIN_RUN + 1:
         return False
-    df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
-    ret = df["nav"].pct_change().dropna().values
+    ret = (pd.to_numeric(df["daily_ret_pct"], errors="coerce")
+           .dropna().values / 100.0)
     run = 0
     for r in ret:
         if abs(r) < STALE_FLAT_EPS:
@@ -288,15 +306,18 @@ def _corr_with_market(conn, sse_df, code, window_start, window_end):
     数据不够(<20个共同交易日)返回 None, 由调用方决定怎么处理(通常当
     "过不了筛选"处理, 而不是当0分——0是"完全不相关", 数据不够是"不
     知道", 两者含义不同)。
+
+    同样用 daily_ret_pct: 除权日的净值跳水会被当成一次剧烈的独立波动,
+    把相关系数压低(见 compute_beta 的说明)。
     """
     df = pd.read_sql_query(
-        "SELECT date, nav FROM fund_nav_daily WHERE code=? AND date>=? AND date<=? ORDER BY date",
+        "SELECT date, daily_ret_pct FROM fund_nav_daily "
+        "WHERE code=? AND date>=? AND date<=? ORDER BY date",
         conn, params=(code, window_start.strftime("%Y-%m-%d"), window_end.strftime("%Y-%m-%d")))
     if len(df) < 20:
         return None
     df["date"] = pd.to_datetime(df["date"])
-    df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
-    df["ret"] = df["nav"].pct_change()
+    df["ret"] = pd.to_numeric(df["daily_ret_pct"], errors="coerce") / 100.0
     sse_w = sse_df[(sse_df["date"] >= window_start) & (sse_df["date"] <= window_end)].copy()
     sse_w["ret"] = pd.to_numeric(sse_w["close"], errors="coerce").pct_change()
     m = df.merge(sse_w[["date", "ret"]], on="date", suffixes=("_f", "_m")).dropna()
@@ -504,22 +525,36 @@ def compute_beta(conn, sse_df, code, buy_date):
 
     纯波动对比,不按相关系数加权——目的是衡量基金相对大盘的振幅倍数,
     而非系统性风险敞口(标准 Beta 会被低相关性拉低,弱化真实波动)。
+
+    用 daily_ret_pct(数据源直接给的当日涨跌幅)而不是自己拿单位净值算
+    pct_change —— **单位净值在分红除权日会跳水, 那不是波动**。2026-08-12
+    修: 009132 广发小盘成长(LOF)C 2022-03-29 大额分红, 单位净值 2.8254→
+    2.0427(-27.70%), 而当日真实涨跌只有 -0.10%(累计净值 3.0538→3.0509)。
+    下面那道 35% 的技术性跳变过滤是为净值重置/份额折算设的, -27.7% 从它
+    底下钻了过去, 于是这只基金 2022-04-25 的波动率比值被算成 2.87(真实
+    1.28), 既让它混过了 min_vol_ratio=2.5 的门槛(不该进候选池), 又把基金
+    回撤控制线从 6.70% 撑到 15.02%(该止损的没止损)。整条标准策略里
+    2022-04-25 那笔 +38.07% 就是这么来的。
+    排名那边(fetcher.compute_metrics_asof)一直是按日收益率连乘的, 不受
+    除权影响, 所以只有这一个函数踩了坑。daily_ret_pct 全表缺失率 0%。
     """
     end = pd.Timestamp(buy_date)
     start = end - timedelta(days=91)
 
     nav_df = pd.read_sql_query(
-        "SELECT date, nav FROM fund_nav_daily WHERE code=? AND date>=? AND date<? ORDER BY date",
+        "SELECT date, daily_ret_pct FROM fund_nav_daily "
+        "WHERE code=? AND date>=? AND date<? ORDER BY date",
         conn, params=(code, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")))
     if len(nav_df) < 20:
         return 1.0
-    nav_df["nav"] = pd.to_numeric(nav_df["nav"], errors="coerce")
-    f_ret = nav_df["nav"].pct_change().dropna().values
+    f_ret = (pd.to_numeric(nav_df["daily_ret_pct"], errors="coerce")
+             .dropna().values / 100.0)
     # 剔除净值重置/份额折算等技术性跳变(单日|收益率|>35%非真实市场波动)。
     # 阈值定在35%: 北交所个股涨跌幅上限±30%, 021299 2024-09-30/10-08 曾真实
     # 单日+21.9%/+25.2%(924行情后北证50补涨, 广发017513同日+22.5%/+25.6%
     # 交叉验证非脏数据), 20%阈值曾把这两天真实波动误判成技术性跳变, 把该
     # 笔波动率比值从~2.6压到1.19。35%仍能拦住014939那种+68.7%的净值断层。
+    # 换用 daily_ret_pct 后除权已经不会跳了, 这道过滤留着兜脏数据。
     f_ret = f_ret[np.abs(f_ret) <= 0.35]
 
     sse_w = sse_df[(sse_df["date"] >= start) & (sse_df["date"] < end)]
@@ -535,17 +570,40 @@ def compute_beta(conn, sse_df, code, buy_date):
 
 
 def get_fund_nav_after(conn, code, from_date):
-    """获取基金从 from_date 起的净值序列 [(date, nav), ...] (已按 NAV_ANOMALIES 修正)"""
+    """从 from_date 起的**复权**净值序列 [(date, nav), ...], 供逐日止损和
+    持仓损益使用(已按 NAV_ANOMALIES 修正)。
+
+    以 from_date 当天的单位净值为起点, 之后每天按 daily_ret_pct 连乘推出来,
+    而不是直接取单位净值那一列。原因是持仓期内一旦分红除权, 单位净值会
+    凭空跳水一截: 逐日止损会把它当成真实回撤、当场触发基金回撤控制线把仓位
+    砍掉, 收益也跟着虚记一笔亏损。用复权序列后, 除权日在序列上是平的
+    (真实涨跌是多少就是多少), 卖出时的收益等于持有期日收益连乘。
+    实测这两种口径在没有分红的持有期上只差舍入量级(021528 那笔 150 个交易日
+    差 0.04 个点), 所以换过来不会动到已有结论, 只是把这颗雷拆掉。
+    起点仍取单位净值本身: 它只当"买入价"这个水平值用, 比值才是收益。
+    """
     rows = conn.execute(
-        "SELECT date, nav FROM fund_nav_daily WHERE code=? AND date>=? ORDER BY date",
+        "SELECT date, nav, daily_ret_pct FROM fund_nav_daily "
+        "WHERE code=? AND date>=? ORDER BY date",
         (code, from_date.strftime("%Y-%m-%d"))).fetchall()
-    return [(pd.Timestamp(r[0]), _apply_nav_anomaly(code, r[0], float(r[1])))
-            for r in rows if r[1]]
+    out, cur = [], None
+    for r in rows:
+        d, nav, ret = r[0], r[1], r[2]
+        if cur is None:
+            if not nav:
+                continue                      # 还没拿到起点, 跳过空值
+            cur = _apply_nav_anomaly(code, d, float(nav))
+        else:
+            if ret is None:
+                continue                      # 当天没有涨跌幅, 沿用上一天
+            cur = cur * (1 + float(ret) / 100.0)
+        out.append((pd.Timestamp(d), cur))
+    return out
 
 
 def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  min_corr: float = None, ret_col: str = "ret_3m", pick: str = "bottom",
-                 min_vol_ratio: float = 2.5, dd_divisor: float = 5.0,
+                 min_vol_ratio: float = 2.0, dd_divisor: float = 5.0,
                  min_aum: float = 2.0, require_drop: bool = True,
                  regime_basis: str = "day", no_same_day_rebuy: bool = False,
                  max_aum: float = None,
@@ -1090,9 +1148,9 @@ def main():
                              "最大、跌则选跌幅最大, 自动关掉「必须下跌」规则)")
     parser.add_argument("--min-vol-ratio",
                         type=lambda s: None if s.lower() == "none" else float(s),
-                        default=2.5,
-                        help="**跌幅分支**候选的波动率比值下限,默认2.5"
-                             "(2026-08-11 从1.5提高, 见 run_backtest 说明);"
+                        default=2.0,
+                        help="**跌幅分支**候选的波动率比值下限,默认2.0"
+                             "(2026-08-12 定档, 见 run_backtest 说明);"
                              "传 none 关掉过滤。涨幅分支另看 --top-min-vol-ratio")
     parser.add_argument("--signal-mode", choices=["threshold", "jump"],
                         default="threshold",
@@ -1190,7 +1248,7 @@ def main():
     # 策略库是独立文件(fund_strategy.db), 跟行情主库分开发布。
     _is_standard = (args.window == 490 and args.pct == 0.90
                     and args.min_corr is None and args.lookback == "3m"
-                    and args.pick == "bottom" and args.min_vol_ratio == 2.5
+                    and args.pick == "bottom" and args.min_vol_ratio == 2.0
                     and args.dd_divisor == 5.0 and args.min_aum == 2.0
                     and args.max_aum is None
                     and args.aum_basis == "merged"
