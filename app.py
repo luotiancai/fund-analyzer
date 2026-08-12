@@ -1837,11 +1837,15 @@ with tab_sse:
                     _c = f"{r['cum_return']:+.0f}%" if r["cum_return"] is not None else "—"
                     return f"{_t} · {r['label']} · {r['n_trades']}笔 胜率{_w} 复利{_c}"
 
-                _sel = st.radio(
+                # 用下拉框而不是 radio: 跑批已经攒到二十几条, radio 会把每条
+                # 铺成一行、光选择器就占掉近 30 行, 把明细表推到离上面那张
+                # 标准策略表很远的地方, 想两张表对着看就得来回滚。下拉框收成
+                # 一行, 明细表紧跟在标准策略那张下面, 一屏内能对比。
+                _sel = st.selectbox(
                     "选一次跑批看明细", [r["id"] for r in _runs],
                     format_func=lambda i: _run_caption(
                         next(r for r in _runs if r["id"] == i)),
-                    key="strategy_run_pick")
+                    key="strategy_run_pick_sel")
                 _x_df, _x_params, _x_at = load_strategy_run_detail(
                     os.path.getmtime(fetcher.DB_PATH["strategy"]), _sel)
                 if _x_df is None or _x_df.empty:
