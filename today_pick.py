@@ -90,12 +90,37 @@ def data_freshness(conn):
     return nav_max, sse_max, behind
 
 
+def _ret3m_window(conn, code: str, asof_s: str):
+    """这只基金「近3月」实际用的窗口 (起点, 终点)。
+
+    口径照抄 fetcher._window_by_date: 终点 = 该基金**早于 asof** 的最后一个
+    净值日(当日净值当晚才公布, 决策时看不到); 起点 = 终点往回 91 个自然日、
+    取该日或之前最近的一个净值日。所以窗口是**逐只**算的 —— 哪只基金净值
+    更新慢, 它的窗口就整体往前挪, 跟别人不完全对齐。
+    ⚠️ 这跟支付宝/东财的"近3月"不是一回事: 它们按**整3个自然月**取起点。
+    实测 025778 同一个终点(2026-08-12), 91天口径起点落在 05-13 得 -27.32%,
+    而支付宝的起点是 05-12、得 -28.13%, 差一个交易日就差 0.8 个百分点。
+    """
+    end = conn.execute(
+        "SELECT MAX(date) d FROM fund_nav_daily WHERE code=? AND date<?",
+        (code, asof_s)).fetchone()["d"]
+    if not end:
+        return None, None
+    start_limit = (pd.Timestamp(end)
+                   - pd.Timedelta(days=fetcher.RETURN_DAYS["ret_3m"])
+                   ).strftime("%Y-%m-%d")
+    anchor = conn.execute(
+        "SELECT MAX(date) d FROM fund_nav_daily WHERE code=? AND date<=?",
+        (code, start_limit)).fetchone()["d"]
+    return anchor, end
+
+
 def scan(asof, top: int = 40) -> dict:
     """按标准策略走一遍当天的候选, 返回结构化结果(CLI 和页面共用)。
 
     rows 是**实际遍历路径**: 从跌幅最深处往下, 每行 (代码,名称,近3月,波动比,
-    规模,淘汰原因或None,是否选中), 走到选中那只就截止 —— 之后的候选策略压根
-    没看过。跌幅超上限的那批只计数(too_deep), 不进 rows。
+    规模,淘汰原因或None,是否选中,近3月窗口起点,窗口终点), 走到选中那只就截止
+    —— 之后的候选策略压根没看过。跌幅超上限的那批只计数(too_deep), 不进 rows。
     """
     conn = B.get_conn()
     names, types = {}, {}
@@ -160,8 +185,9 @@ def scan(asof, top: int = 40) -> dict:
                 why = "净值僵化-补涨"
             else:
                 chosen = code
+        _a, _e = _ret3m_window(conn, code, asof_s)
         rows.append((code, names.get(code, code), r3, beta, aum, why,
-                     code == chosen))
+                     code == chosen, _a, _e))
         if chosen is not None or len(rows) >= top:
             break
 
