@@ -12,6 +12,7 @@ import time
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
+import today_pick
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
@@ -1689,6 +1690,76 @@ with tab_sse:
         # 买入→该腿卖出"的累计持有天数收一次(而非按单腿天数)。数据
         # 2018 年起(2015-2017 期权刚上市流动性薄、QVIX 计算噪声偏大,
         # 已整段剔除, 见 fetcher.py)。
+        # ── 今天会买哪只(2026-08-13 加, 按钮触发) ──────────────────────
+        # 只在点按钮时算: 要跑一次 compute_metrics_asof(全市场重算区间收益,
+        # 实测约 9s)加上逐只 compute_beta, 挂在首屏会把整页拖慢, 而这个功能
+        # 一天最多看一次。
+        # 不显示"QVIX 是否触发": 页面拿到的是昨收, 盘中实时值在本地跑
+        # qvix_now.py, 摆一个基于昨收的"未触发"反而误导。
+        with st.expander("🎯 今天会买哪只(按线上标准策略现算)", expanded=False):
+            st.caption(
+                "从近3月跌幅最深的往下找, 一路上被规模/波动率刷掉的也列出来, "
+                "**走到选中那只就截止**——之后的候选策略压根没看过。跌幅超上限"
+                "的那批只报个数(它们被一条跟基金本身无关的规则一刀切掉, 逐只列"
+                "会把表刷满)。口径与回测完全一致: 全部 T-1(净值当晚才公布)、"
+                "规模用当时已披露的最新季报。")
+            if not fetcher.nav_ready():
+                st.info("净值库还在后台下载,稍等再点。")
+            else:
+                if st.button("算今日候选", key="today_pick_go"):
+                    with st.spinner("全市场重算近3月收益…约10秒"):
+                        st.session_state["today_pick_res"] = today_pick.scan(
+                            dt.date.today())
+                _tp = st.session_state.get("today_pick_res")
+                if _tp is not None:
+                    # 数据新鲜度校验: 这个功能最容易出的错不是算错, 是拿旧数据
+                    # 算出一个看起来很正常的答案。净值库比上证行情落后几个交易
+                    # 日, 答案就过期几天 —— 必须显式摆出来, 不能默认它是新的。
+                    _behind = _tp.get("behind")
+                    _nm = _tp.get("nav_max")
+                    _sm = _tp.get("sse_max")
+                    if _nm is None:
+                        st.error("净值库是空的,没法算。")
+                    elif _behind:
+                        st.warning(
+                            f"⚠️ 数据不够新: 净值库最新 {_nm.date()},"
+                            f"而上证已到 {_sm.date()},**落后 {_behind} 个交易日**。"
+                            "下面的结果按旧数据算,仅供参考——等每日跑批把净值补上"
+                            "(线上库最迟1小时换一次)再点一次。")
+                    else:
+                        st.success(
+                            f"✅ 数据是新的: 净值库与上证同步到 {_nm.date()}")
+                    _std = _tp["std"]
+                    st.caption(
+                        f"口径: 近3月跌幅最大 · 跌幅≤{_std['max_drop']:.0f}% · "
+                        f"波动率比值≥{_std['min_vol_ratio']} · "
+                        f"规模≥{_std['min_aum']}亿"
+                        + (f"~{_std['max_aum']}亿" if _std["max_aum"] else "(无上限)")
+                        + f" · 跌超上限的 {_tp['too_deep']} 只已跳过")
+                    if not _tp["rows"]:
+                        st.info("今天没有跌幅带内的候选——按策略放弃当天。")
+                    else:
+                        _tpd = pd.DataFrame([{
+                            "": "★" if r[6] else "",
+                            "基金": f"{r[1]} ({r[0]})",
+                            "近3月": f"{r[2]:+.2f}%",
+                            "波动率比值": f"{r[3]:.2f}" if r[3] is not None else "—",
+                            "规模(亿)": f"{r[4]:.2f}" if r[4] is not None else "—",
+                            "结论": "★ 选中" if r[6] else (r[5] or "通过"),
+                        } for r in _tp["rows"]])
+                        st.dataframe(_tpd, use_container_width=True,
+                                     hide_index=True,
+                                     height=(len(_tpd) + 1) * 35 + 3)
+                    if _tp["chosen"]:
+                        st.markdown(
+                            f"**★ {_tp['names'].get(_tp['chosen'], _tp['chosen'])} "
+                            f"({_tp['chosen']})**　基金回撤控制线 "
+                            f"{_tp['fund_line']:.2f}%　大盘回撤线 "
+                            f"{_tp['sse_line']:.2f}%")
+                    else:
+                        st.info("走完跌幅带也没有合格候选——按策略放弃当天,"
+                                "顺延到下一个信号日。")
+
         with st.expander("📜 策略复盘:QVIX 2年90%信号 + 近3月跌幅最大"
                          "(波动率比值≥1.5 + 规模≥2亿 + 近3月跌幅≤30%;没有真跌的合格候选就"
                          "放弃当天、顺延到下一个信号日)"
