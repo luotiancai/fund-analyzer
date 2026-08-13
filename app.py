@@ -1709,7 +1709,7 @@ with tab_sse:
             # 数字手抄一遍进页面, 抄错没人发现, 页面上的数和回测真正跑出来
             # 的数也随时可能对不上(实测就对不上过)。现在回测落库、页面读库,
             # 跑批推一次库页面自动跟着变, 不用改代码。
-            _bt_df, _bt_params, _bt_at = load_backtest_trades(
+            _bt_df, _bt_params, _bt_at, _bt_id = load_backtest_trades(
                 os.path.getmtime(fetcher.DB_PATH["rank"]))
             if _bt_df is None or _bt_df.empty:
                 st.info("暂无回测明细——跑一次 `python3 backtest_qvix.py` "
@@ -1760,7 +1760,7 @@ with tab_sse:
                     "蓝色=触发大盘回撤线离场,两格都染色=同日两条线双双触发;"
                     "连续接力同一只基金视为未真实离场,中间腿不收手续费,"
                     "只在链条最后一腿按累计持有天数收一次。"
-                    + (f"(明细跑于 {_fmt_cst(_bt_at, '%Y-%m-%d %H:%M')})"
+                    + (f"(跑批 #{_bt_id},明细跑于 {_fmt_cst(_bt_at, '%Y-%m-%d %H:%M')})"
                        if _bt_at else ""))
 
                 # 每笔卖出当天触发了哪条止损线, 直接从回测写下的「卖出原因」
@@ -1839,7 +1839,10 @@ with tab_sse:
                     _t = _fmt_cst(r["run_at"], "%m-%d %H:%M") or "—"
                     _w = f"{r['win_rate']:.0f}%" if r["win_rate"] is not None else "—"
                     _c = f"{r['cum_return']:+.0f}%" if r["cum_return"] is not None else "—"
-                    return f"{_t} · {r['label']} · {r['n_trades']}笔 胜率{_w} 复利{_c}"
+                    # 编号放最前面: label 是按参数自动拼的, 十几条跑批前缀
+                    # 高度雷同, 只有 #id 能一眼对上(讨论里说的也是这个号)。
+                    return (f"#{r['id']} · {_t} · {r['label']} · "
+                            f"{r['n_trades']}笔 胜率{_w} 复利{_c}")
 
                 # 用下拉框而不是 radio: 跑批已经攒到二十几条, radio 会把每条
                 # 铺成一行、光选择器就占掉近 30 行, 把明细表推到离上面那张
@@ -1946,7 +1949,7 @@ with tab_sse:
                            if len(_x_loss) else "无") +
                         "。⚠️ 对照实验,只用来跟标准策略比,不是线上在用的规则;"
                         "样本十几笔、跨度6年,统计上很薄。"
-                        + (f"(跑于 {_fmt_cst(_x_at, '%Y-%m-%d %H:%M')})"
+                        + (f"(跑批 #{_sel},跑于 {_fmt_cst(_x_at, '%Y-%m-%d %H:%M')})"
                            if _x_at else ""))
 
                     # 择向策略逐笔方向不同(有的买涨幅最大、有的买跌幅最大),

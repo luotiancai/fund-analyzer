@@ -2162,16 +2162,21 @@ def load_strategy_run(run_id: int) -> tuple:
 
 
 def load_backtest_trades() -> tuple:
-    """最新一次**标准策略**跑批的明细 → (DataFrame, params, run_at)。
-    没跑过返回 (None, {}, None)——调用方(app)据此决定是否隐藏整个复盘区。"""
+    """最新一次**标准策略**跑批的明细 → (DataFrame, params, run_at, run_id)。
+    没跑过返回 (None, {}, None, None)——调用方(app)据此决定是否隐藏复盘区。
+
+    run_id 是 2026-08-13 加的: 页面上原来只显示"明细跑于 <时间>", 而这些
+    跑批的 label 是按参数自动拼的、前缀高度雷同(一串"近3月跌幅最大 · 跌向须
+    真跌 · 波动≥…"), 光靠时间戳对不上是哪一跑, 讨论时说"#35/#37"在页面上
+    根本找不到对应。"""
     conn = _conn()
     row = conn.execute(
         "SELECT id FROM strategy.strategy_runs WHERE is_standard=1 "
         "ORDER BY run_at DESC, id DESC LIMIT 1").fetchone()
     conn.close()
     if not row:
-        return None, {}, None
-    return load_strategy_run(row["id"])
+        return None, {}, None, None
+    return load_strategy_run(row["id"]) + (row["id"],)
 
 
 def save_backtest_notes(notes: dict) -> None:
