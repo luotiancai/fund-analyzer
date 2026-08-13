@@ -1531,6 +1531,14 @@ with tab_sse:
             _show_vix = st.checkbox("VIX恐慌指数", value=True,
                                     key="sse_vix",
                                     help="50ETF期权QVIX（中国版VIX），右轴")
+            # skew 跟 QVIX 同为"波动率点", 共用右轴: QVIX 在 15~48 的上半区,
+            # skew 在 0 上下的下半区, 一张图里正好能看出"波动大不大"和"是
+            # 恐慌还是亢奋"两件事。默认关: 它是辅助维度, 且回填完才有全量。
+            _show_skew = st.checkbox("情绪偏度(skew)", value=False,
+                                     key="sse_skew",
+                                     help="虚值认沽IV−虚值认购IV(各取|delta|≈0.25那只)。"
+                                          "为正=资金抢买下跌保护→恐慌; 为负=抢买上涨"
+                                          "门票→亢奋。QVIX只说波动大不大, 不分方向")
 
         # Window slice keeps the anchor row (last close on/before the window
         # start) so the period change is measured against the true base point —
@@ -1596,6 +1604,22 @@ with tab_sse:
             fig_sse.update_layout(
                 yaxis2=dict(title="VIX恐慌指数", overlaying="y", side="right",
                             showgrid=False))
+            if _show_skew and "skew" in qvix_view.columns:
+                _sk = qvix_view.dropna(subset=["skew"])
+                if _sk.empty:
+                    st.caption("⚠️ 情绪偏度(skew)这段区间还没回填 —— "
+                               "跑 `python3 backfill_skew.py` 补")
+                else:
+                    fig_sse.add_trace(go.Scatter(
+                        x=_sk["date"], y=_sk["skew"],
+                        name="情绪偏度(认沽IV−认购IV)", yaxis="y2",
+                        line=dict(color="#59a14f", width=1.1),
+                        hovertemplate="偏度 %{y:+.2f}<extra></extra>"))
+                    # 0 是恐慌/亢奋的分界, 没有这条线光看曲线读不出正负
+                    fig_sse.add_hline(y=0, yref="y2", line_width=1,
+                                      line_dash="dot", line_color="#59a14f",
+                                      opacity=0.45)
+                    fig_sse.update_layout(yaxis2=dict(title="波动率(点)"))
             _thr_combos_df = load_qvix_threshold_combos(
                 fetcher.qvix_self_history_last_date())
             if _thr_combos_df is not None:
