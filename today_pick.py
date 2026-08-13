@@ -22,6 +22,7 @@ QVIX 用的是库里最后一个收盘值 —— 盘中要看实时值请跑 qvi
 """
 import argparse
 import datetime as dt
+import inspect
 import json
 import os
 import sys
@@ -32,10 +33,22 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backtest_qvix as B      # noqa: E402
 import fetcher                 # noqa: E402
 
-# 标准策略的默认参数(跟 backtest_qvix.run_backtest 的签名默认值保持一致,
-# 改那边记得也看这里 —— 这里显式写出来是为了打印时能说清"按什么口径选的")
-STD = dict(min_vol_ratio=1.5, min_aum=2.0, max_aum=None, max_drop=30.0,
-           dd_divisor=5.0, window=490, pct=0.90)
+def _std_params():
+    """标准策略的参数, **直接读 run_backtest 的签名默认值**。
+
+    不在这里抄一份字面量: 抄了就有两个真相来源, 改完策略忘了同步这边, 这个
+    脚本会安安静静地按旧口径给出答案 —— 而它恰恰是拿来决定"今天买哪只"的,
+    错了不会有任何报错。读签名的代价是依赖参数名不变; 万一改名, 下面的
+    KeyError 会当场炸出来, 比静默用错值好。
+    """
+    d = {k: v.default for k, v in
+         inspect.signature(B.run_backtest).parameters.items()
+         if v.default is not inspect.Parameter.empty}
+    return {k: d[k] for k in ("min_vol_ratio", "min_aum", "max_aum",
+                              "max_drop", "dd_divisor", "window", "pct")}
+
+
+STD = _std_params()
 
 
 def _threshold(asof: pd.Timestamp):
