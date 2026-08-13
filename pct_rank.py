@@ -10,11 +10,15 @@
 百分之多少"有意义得多 —— 后者的分母是事后最大值(极端序统计量), 任何规则
 都不可能逼近; 而分位回答的是"这套选基规则相比随机到底强多少"。
 
-候选池口径(与「无条件天花板」那条对照跑批一致):
-  · 只排除三类**这笔交易本身不成立**的标的 —— QDII/海外(跟QVIX恐慌-反弹
+候选池口径(与「可达天花板」那条对照跑批一致, 2026-08-13 起):
+  · 保留**规模≥2亿**这一条选基条件, 与标准策略同口径 —— 分母里混进策略
+    根本不会买的迷你基金没有意义, 而且那批基金的净值本身就不可信(015111
+    惠升领先优选 2024-03-28 单日 +20.18%, 而它当季末净资产只剩 100 万,
+    那 20% 是 93% 份额被短期赎回、赎回费分摊给剩下 7% 造成的);
+  · 另排除三类**这笔交易本身不成立**的标的 —— QDII/海外(跟QVIX恐慌-反弹
     逻辑脱钩, 策略一贯排除)、持有期锁定(赎不出来, 止损卖不掉)、净值僵化-
     补涨(脏数据);
-  · **不设**任何选基条件: 不要求真跌、无跌幅上限、无波动率门槛、无规模区间。
+  · 其余**不设**条件: 不要求真跌、无跌幅上限、无波动率门槛、无规模上限。
   · 每只候选都用**它自己的**双止损线(基金线=当日阈值/5×自身波动率比值,
     大盘线=阈值/5)逐日盯出卖点, 再按实现收益(扣完赎回费)排名 —— 跟策略
     那笔是同一套买卖口径, 可比。
@@ -33,7 +37,7 @@ sys.path.insert(0, __file__.rsplit("/", 1)[0])
 import backtest_qvix as B      # noqa: E402
 import fetcher                 # noqa: E402
 
-COL = "全市场分位"
+COL = "同池分位"
 
 
 def _pool_universe(conn):
@@ -74,6 +78,11 @@ def compute(run_id: int, dry_run: bool = False):
         metrics = fetcher.compute_metrics_asof(t["买入日"], cols={"ret_3m"})
         cand = {c for c, m in metrics.items()
                 if m.get("ret_3m") is not None and c not in exclude}
+        # 规模≥2亿: 用批量版一次 SQL 取完, 纯读库不触网(逐只 fund_aum_asof
+        # 要查两万多次, 会把这个脚本拖到小时级)。
+        aums = fetcher.funds_aum_asof(sorted(cand), t["买入日"], merge_classes=True)
+        cand = {c for c in cand
+                if aums.get(c) is not None and aums[c] >= 2.0}
 
         lo = (buy - pd.Timedelta(days=need + 20)).strftime("%Y-%m-%d")
         hi = (buy + pd.Timedelta(days=500)).strftime("%Y-%m-%d")
