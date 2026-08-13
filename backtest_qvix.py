@@ -49,8 +49,8 @@ NAV_ANOMALIES = {
 # 上面这段窗口×分位对比、以及后面出现过的"涨幅冠军+相关系数过滤"都是
 # 中途淘汰的旧方案, 历史版本见 git 历史, 不再列在这里。当前标准策略是
 # QVIX 2年90分位信号(window=490,pct=0.90) + 近3月跌幅最大(ret_col=
-# "ret_3m",pick="bottom") + 候选波动率比值≥2.0(min_vol_ratio=2.0,
-# 2026-08-12 定档, 见下面的三档实测) +
+# "ret_3m",pick="bottom") + 候选波动率比值≥1.5(min_vol_ratio=1.5,
+# 2026-08-13 定档, 见下面的实测) +
 # 候选规模 2~10亿(min_aum=2.0 于2026-08-06 从0.5亿提高; max_aum=10.0
 # 于2026-08-12 加, 见下面实测; 规模按 A/C 份额合并计算,
 # aum_basis="merged") +
@@ -64,8 +64,8 @@ NAV_ANOMALIES = {
 # 默认值随之从 720/0.95 改过来; min_aum=0.5 于 2026-07-28 加入)
 #
 #   笔数  胜率       累计收益(费后复利)  平均持有  平均收益(费后)
-#   7    7/7=100%   +643.58%          79天      +36.01%
-#   (7笔全部盈利, 最差 +3.51%; 最佳是009063财通智慧成长+101.79%)
+#   8    8/8=100%   +699.79%          75天      +32.61%
+#   (8笔全部盈利, 最差 +3.37%; 最佳是009063财通智慧成长+101.79%)
 #   样本只有7笔、跨6年, 100%胜率是"一笔小亏变成小赚"的结果, 统计上毫无
 #   意义, 别当成可靠预期。
 #
@@ -110,6 +110,20 @@ NAV_ANOMALIES = {
 #   ⚠️ 用户拍板加的; 我的保留意见记在 max_drop 说明里 —— 只影响一笔、
 #   相邻档位剧烈翻转(25%档只有+498.71%, 因为会误杀 2022-10-24 那只
 #   -26.93% 的全池最优), 在当前样本上近乎不可证伪。
+#
+#   2026-08-13 波动门槛从 2.0 退回 1.5。加了跌幅上限之后再比这两档,
+#   结论跟没有上限时相反:
+#     波动门槛(都配 2~10亿 + 跌幅≤30%)  笔数  胜率    费后复利     平均单笔
+#     1.5                              8    100%   +699.79%    +32.61%  ← 定档
+#     2.0                              7    100%   +643.58%    +36.01%
+#   1.5 档多的那笔是 2024-10-10 海富通科技创新(+6.68%, 近3月才跌 2.42%
+#   的擦边货, 它能进来是因为 09-26 那笔 10-09 就卖了腾出仓位); 另外
+#   2022-04-25 和 2024-02-05 两笔在 1.5 档选到了跌幅更接近 -30% 的标的
+#   (宝盈发展新动能 -29.71%→+36.98%、华泰柏瑞成长智选 -29.63%→+13.96%),
+#   而 2.0 档分别是 +24.57% 和 +17.96%。
+#   顺带一提, 跌幅上限在两个波动档上都是正贡献(1.5档 +144 个点、2.0档
+#   +37 个点), 这比它单独在 #37 上那一笔的改善更有说服力 —— 至少不是
+#   只在某一个参数组合下才管用。但样本仍然只有 8 笔。
 #
 #   2026-08-12 删掉涨幅兜底和配套的顺延规则后重跑。上一版(带兜底)是
 #   10笔/80.0%/+1326.59%/最差-3.20%。少掉的 386 个点来自丢掉北证50
@@ -652,7 +666,7 @@ def get_fund_nav_after(conn, code, from_date):
 
 def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  min_corr: float = None, ret_col: str = "ret_3m", pick: str = "bottom",
-                 min_vol_ratio: float = 2.0, dd_divisor: float = 5.0,
+                 min_vol_ratio: float = 1.5, dd_divisor: float = 5.0,
                  min_aum: float = 2.0, require_drop: bool = True,
                  regime_basis: str = "day", no_same_day_rebuy: bool = False,
                  max_aum: float = 10.0,
@@ -1218,9 +1232,9 @@ def main():
                              "最大、跌则选跌幅最大, 自动关掉「必须下跌」规则)")
     parser.add_argument("--min-vol-ratio",
                         type=lambda s: None if s.lower() == "none" else float(s),
-                        default=2.0,
-                        help="**跌幅分支**候选的波动率比值下限,默认2.0"
-                             "(2026-08-12 定档, 见 run_backtest 说明);"
+                        default=1.5,
+                        help="**跌幅分支**候选的波动率比值下限,默认1.5"
+                             "(2026-08-13 定档, 见 run_backtest 说明);"
                              "传 none 关掉过滤。涨幅分支另看 --top-min-vol-ratio")
     parser.add_argument("--max-drop",
                         type=lambda s: None if s.lower() == "none" else float(s),
@@ -1325,7 +1339,7 @@ def main():
     # 策略库是独立文件(fund_strategy.db), 跟行情主库分开发布。
     _is_standard = (args.window == 490 and args.pct == 0.90
                     and args.min_corr is None and args.lookback == "3m"
-                    and args.pick == "bottom" and args.min_vol_ratio == 2.0
+                    and args.pick == "bottom" and args.min_vol_ratio == 1.5
                     and args.dd_divisor == 5.0 and args.min_aum == 2.0
                     and args.max_aum == 10.0
                     and args.aum_basis == "merged"
