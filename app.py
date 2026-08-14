@@ -72,9 +72,15 @@ def _init_db_once():
 # 了五天的行情盖回去(2026-08-05)。
 #
 # 首屏同步拉 rank/market/strategy/sim, 合计 gz 约 2MB, 拉完立刻能画;
-# nav(净值 233MB)和 scale(季度数据 13.7MB)首屏一行都不读, 起线程后台拉,
-# 落地后 adopt_db 接管。cache 库压根不拉: 它是筛选结果缓存, 丢了自动重算,
-# 下一份别人的缓存过来毫无价值。
+# nav(净值 gz 61MB)和 scale(季度数据 gz 4MB)首屏一行都不读, **也不预拉** ——
+# 见下面 _need_nav: 点了要用净值的功能才开始下。cache 库压根不拉: 它是筛选
+# 结果缓存, 丢了自动重算, 下一份别人的缓存过来毫无价值。
+#
+# ⚠️ 流量优先, 别改回"开页面就后台拉": 用户常开**手机流量**看这个页面, 而且
+# 经常 reboot 应用 —— 容器一重建磁盘就清空, marker 跟着没, ETag 条件下载
+# 那道防线在这条路径上完全失效, 每次 reboot 都是实打实的 61MB。而他日常只
+# 看上证走势和策略回测, 这两块一行净值都不读(回测明细读的是 strategy 库的
+# 存档, 不是 nav)。原来的设计等于绝大多数 reboot 白烧 61MB。
 _DB_BASE = os.environ.get("FUND_ANALYZER_RELEASE_BASE") or (
     "https://github.com/luotiancai/fund-analyzer/releases/download/data/")
 _ASSET = {name: _DB_BASE + fn + ".gz"
@@ -83,9 +89,44 @@ _MARKER = {name: fetcher.DB_PATH[name] + ".from-release"
            for name, _fn, _t, _l in fetcher.DB_LAYOUT}
 _EAGER_DBS = ("rank", "market", "strategy", "sim")
 _LAZY_DBS = fetcher.LAZY_DBS          # ("nav", "scale")
+# 惰性库的 gz 大小, 只用于按钮上那句提示("要下多少") —— 会随数据增长慢慢
+# 变大, 差个几 MB 无所谓, 不值得为了准确去 HEAD 一次(那本身就是一次请求)。
+_LAZY_MB = 65
 
 
-def _download_gz(url: str, dest: str, marker: str) -> bool:
+@st.cache_resource(show_spinner=False)
+def _dl_state() -> dict:
+    """跨 rerun 存活的下载状态: {"t": 线程, "done"/"total": 压缩字节数}。
+
+    **必须挂在 cache_resource 上**: Streamlit 每次 rerun 都用**全新的模块
+    命名空间**重跑整个脚本, 模块级变量活不过一次 rerun。线程句柄放模块级
+    的话, 页面一刷新就"忘了自己正在下载", 又把下载按钮摆出来; 进度计数更
+    糟 —— 后台线程写的是它启动那一轮的旧字典, 新一轮读到的永远是 0。
+    """
+    return {"t": None, "done": 0, "total": 0}
+
+
+class _Counting:
+    """套在 response.raw 外面数字节 —— 用户开手机流量, 得让他看见烧了多少。
+
+    数的是**压缩后**的字节(实际走网络的量), 不是 gzip 解出来的 233MB。
+    只实现 read: GzipFile 只用这一个方法。
+    st 状态字典由调用方传进来, 不在这里调 _dl_state() —— 这个类跑在后台
+    线程里, 而 cache_resource 在无 ScriptRunContext 的线程里调会告警。
+    """
+
+    def __init__(self, raw, total, prog: dict):
+        self._raw, self._n, self._p = raw, 0, prog
+        prog["total"], prog["done"] = total, 0
+
+    def read(self, n=-1):
+        b = self._raw.read(n)
+        self._n += len(b)
+        self._p["done"] = self._n
+        return b
+
+
+def _download_gz(url: str, dest: str, marker: str, prog: dict = None) -> bool:
     """拉 gz 资产解压到 dest,marker 存版本戳;返回 dest 是否就位。
 
     直连下载地址(302 到对象存储),不走 api.github.com:未认证 API 每 IP
@@ -106,7 +147,11 @@ def _download_gz(url: str, dest: str, marker: str) -> bool:
             return True                  # 版本没变
         tmp = dest + ".tmp"
         try:
-            with open(tmp, "wb") as f, gzip.GzipFile(fileobj=dl.raw) as gz:
+            src = dl.raw
+            if prog is not None:
+                src = _Counting(dl.raw,
+                                int(dl.headers.get("Content-Length") or 0), prog)
+            with open(tmp, "wb") as f, gzip.GzipFile(fileobj=src) as gz:
                 shutil.copyfileobj(gz, f)
             os.replace(tmp, dest)
             with open(marker, "w") as m:
@@ -145,43 +190,89 @@ def _sync_db_from_release() -> bool:
 
 @st.cache_resource(ttl=3600, show_spinner=False)
 def _start_lazy_downloads():
-    """后台线程拉大库(净值/季度数据),拉完让它接管。首屏不等这些线程。
+    """后台线程拉大库(净值/季度数据)。**只由 _need_nav 在用户点按钮时调用。**
 
-    起线程而不是同步拉:233MB 挡在首屏前面就白拆了。期间需要净值的三处
-    (筛选/详情/模拟盘)由 fetcher.nav_ready() 挡住,显示"加载中"而不是
-    拿空表算出一堆看着合理的错数。
+    起线程而不是同步拉:解压后 233MB, 挡在页面前面十几秒一动不动很难受;
+    起了线程还能一边下一边看上证走势。期间需要净值的四处(筛选/详情/模拟盘/
+    今日候选)由 fetcher.nav_ready() 挡住,显示进度而不是拿空表算出一堆看着
+    合理的错数。
 
     TTL 与 _sync_db_from_release 一致(1h):跑批发新快照后 rank 会换成当天
     的,大库也得跟着换,否则各库的数据日期能差出一天。ETag 没变时
     _download_gz 直接返回、不重下,adopt_db 本身幂等,空跑代价接近零。
 
-    先拉 scale(13.7MB)再拉 nav(233MB):规模数据是基金列表的门槛要用的,
+    先拉 scale(gz 4MB)再拉 nav(gz 61MB):规模数据是基金列表的门槛要用的,
     早几十秒到位就早几十秒不再"查不到规模一律放行"。
     """
+    prog = _dl_state()      # 主线程里取好再传进去(见 _Counting 的说明)
+
     def _work():
         for name in sorted(_LAZY_DBS, key=lambda n: n != "scale"):
             try:
                 if _download_gz(_ASSET[name], fetcher.DB_PATH[name],
-                                _MARKER[name]):
+                                _MARKER[name], prog):
                     fetcher.adopt_db(name)
             except Exception:
                 fetcher.logger.exception("%s 库后台下载失败", name)
 
     t = threading.Thread(target=_work, name="lazy-db-download", daemon=True)
     t.start()
+    prog["t"] = t
     return t
 
 
 _IS_CLOUD = _sync_db_from_release()
 _init_db_once()
-if fetcher.LAZY_NAV:
-    _start_lazy_downloads()
 
 
-def _nav_notice(what: str):
-    """重表还在后台下载时的占位提示。"""
-    st.info(f"⏳ 正在后台加载净值数据（约 60MB，仅本次启动需要一次），"
-            f"{what}要等它就位。稍等十几秒后再点一次即可。")
+_PROG_DRAWN = False   # 本轮是否已经画过进度条(模块级变量每轮 rerun 自动归零)
+
+
+@st.fragment(run_every=2)
+def _nav_progress():
+    """下载中的进度条; 每 2 秒自己刷新一次, 不重跑整页。下完自动重跑整页。"""
+    if fetcher.nav_ready():
+        st.rerun(scope="app")           # 库就位了, 让整页重画、功能解锁
+        return
+    st_ = _dl_state()
+    done, total = st_["done"], st_["total"]
+    if total:
+        st.progress(min(done / total, 1.0),
+                    text=f"下载净值库 {done / 1048576:.1f} / "
+                         f"{total / 1048576:.0f} MB（压缩后实际流量）")
+    else:
+        st.progress(0.0, text="正在连接…")
+
+
+def _need_nav(what: str) -> bool:
+    """要读净值库的地方先调这个, 返回 True 才能往下算。
+
+    **不自动下载**: 净值库 gz 61MB, 而用户开手机流量、又经常 reboot(容器一
+    重建磁盘就清空, ETag 那道条件下载防线失效)。他日常只看上证和回测, 都不
+    碰净值 —— 自动拉等于绝大多数 reboot 白烧 61MB。所以摆个按钮、标明大小,
+    点了才下。
+    """
+    if fetcher.nav_ready():
+        return True                      # 本地模式或已下完
+    t = _dl_state()["t"]
+    if t is not None and t.is_alive():
+        # 进度条只画一次: 四个消费点在同一轮里都会走到这儿(st.tabs 会渲染
+        # 所有 tab 的内容), 每处都插一个 fragment 就是四个自转的进度条。
+        global _PROG_DRAWN
+        if not _PROG_DRAWN:
+            _PROG_DRAWN = True
+            _nav_progress()
+        else:
+            st.info("⏳ 净值库下载中，完成后本区自动可用。")
+        return False
+    st.warning(f"「{what}」要读净值库，需下载 **约 {_LAZY_MB}MB**"
+               f"（解压后 233MB；容器重启后要重新下）。"
+               f"上证走势和策略回测不需要它，可以直接看。")
+    if st.button(f"下载并启用{what}", key=f"_navdl_{what}",
+                 type="primary"):
+        _start_lazy_downloads()
+        st.rerun()
+    return False
 
 # ── 更新数据(仅本地)────────────────────────────────────────────────────────
 # 侧边栏已整体移除:云端数据由每日跑批自动更新,无需任何入口;
@@ -519,8 +610,7 @@ with tab_table:
     filter_ready = st.session_state.get("filter_applied", False)
     # 筛选要读净值(重算指标、按区间剔除历史不足的基金),云端重表还在后台
     # 下载时先挡住:空表算出来的结果看着像模像样,其实全错。
-    if filter_ready and not fetcher.nav_ready():
-        _nav_notice("筛选")
+    if filter_ready and not _need_nav("筛选"):
         filter_ready = False
 
     ret_col, mdd_col = PERIODS[period_label]
@@ -922,8 +1012,7 @@ with tab_table:
 with tab_detail:
     code_input = st.text_input("输入基金代码（6位数字）", placeholder="例如 000001")
     # 净值/持仓/规模都在重表里,云端后台下载完之前当作"没输入代码"处理。
-    if code_input and not fetcher.nav_ready():
-        _nav_notice("基金详情")
+    if code_input and not _need_nav("基金详情"):
         code_input = ""
     if code_input:
         with st.spinner(f"加载 {code_input} 净值历史…"):
@@ -1063,8 +1152,8 @@ with tab_sim:
     sim_date = simulator.get_current_date()
 
     # 模拟盘的交易日历、成交净值、持仓市值全部来自净值表。
-    if not fetcher.nav_ready():
-        _nav_notice("模拟盘")
+    if not _need_nav("模拟盘"):
+        pass
     elif sim_date is None:
         st.warning("本地还没有净值数据，请先点击侧边栏「🔄 更新数据」。")
     else:
@@ -1709,8 +1798,8 @@ with tab_sse:
                 "所以净值更新慢的基金窗口会整体前移。⚠️ 这跟支付宝/东财的"
                 "「近3月」不同——它们按**整3个自然月**取起点,差一个交易日就可能"
                 "差零点几个百分点。")
-            if not fetcher.nav_ready():
-                st.info("净值库还在后台下载,稍等再点。")
+            if not _need_nav("今日候选"):
+                pass
             else:
                 if st.button("算今日候选", key="today_pick_go"):
                     with st.spinner("全市场重算近3月收益…约10秒"):
