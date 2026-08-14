@@ -276,6 +276,25 @@ def load_qvix_threshold_combos(cache_key):
     return out
 
 
+# skew 的阈值口径**照抄 QVIX**(2年490个交易日、90分位、minp=0.97、shift(1)):
+# 两者同为波动率点、同样是"高于近两年九成的日子才算异常", 用同一套口径才好
+# 并排解读。语义不同的是方向 —— QVIX 高 = 波动大(不分涨跌), skew 高 = 认沽比
+# 认购贵得异常 = 资金在抢买下跌保护 = **真恐慌**。
+# 只用于图上展示, 不落库、不参与策略(要参与得先在回测里验过)。
+@st.cache_data(show_spinner="正在计算情绪偏度阈值…")
+def load_skew_threshold(cache_key):
+    hist = fetcher.load_qvix_self_history()
+    if hist is None or hist.empty or "skew" not in hist.columns:
+        return None
+    hist = hist.sort_values("date").reset_index(drop=True)
+    hist["date"] = pd.to_datetime(hist["date"])
+    hist["skew"] = pd.to_numeric(hist["skew"], errors="coerce")
+    out = hist[["date", "skew"]].copy()
+    out["thr"] = (hist["skew"].rolling(490, min_periods=int(490 * 0.97))
+                  .quantile(0.90).shift(1))
+    return out
+
+
 @st.cache_data(show_spinner=False)
 def load_backtest_trades(cache_key):
     """最新一次标准策略跑批的明细(策略库 strategy_runs,backtest_qvix.py
@@ -1531,9 +1550,9 @@ with tab_sse:
             _show_vix = st.checkbox("VIX恐慌指数", value=True,
                                     key="sse_vix",
                                     help="50ETF期权QVIX（中国版VIX），右轴")
-            # skew 跟 QVIX 同为"波动率点", 共用右轴: QVIX 在 15~48 的上半区,
-            # skew 在 0 上下的下半区, 一张图里正好能看出"波动大不大"和"是
-            # 恐慌还是亢奋"两件事。默认关: 它是辅助维度, 且回填完才有全量。
+            # skew 跟 QVIX 同为"波动率点", 共用右轴, 但**两个开关互相独立**
+            # —— 可以只看 skew 不看 QVIX(原来 skew 嵌在 QVIX 的绘制分支里,
+            # 不开 QVIX 就画不出来)。
             _show_skew = st.checkbox("情绪偏度(skew)", value=False,
                                      key="sse_skew",
                                      help="虚值认沽IV−虚值认购IV(各取|delta|≈0.25那只)。"
@@ -1604,22 +1623,6 @@ with tab_sse:
             fig_sse.update_layout(
                 yaxis2=dict(title="VIX恐慌指数", overlaying="y", side="right",
                             showgrid=False))
-            if _show_skew and "skew" in qvix_view.columns:
-                _sk = qvix_view.dropna(subset=["skew"])
-                if _sk.empty:
-                    st.caption("⚠️ 情绪偏度(skew)这段区间还没回填 —— "
-                               "跑 `python3 backfill_skew.py` 补")
-                else:
-                    fig_sse.add_trace(go.Scatter(
-                        x=_sk["date"], y=_sk["skew"],
-                        name="情绪偏度(认沽IV−认购IV)", yaxis="y2",
-                        line=dict(color="#59a14f", width=1.1),
-                        hovertemplate="偏度 %{y:+.2f}<extra></extra>"))
-                    # 0 是恐慌/亢奋的分界, 没有这条线光看曲线读不出正负
-                    fig_sse.add_hline(y=0, yref="y2", line_width=1,
-                                      line_dash="dot", line_color="#59a14f",
-                                      opacity=0.45)
-                    fig_sse.update_layout(yaxis2=dict(title="波动率(点)"))
             _thr_combos_df = load_qvix_threshold_combos(
                 fetcher.qvix_self_history_last_date())
             if _thr_combos_df is not None:
@@ -1672,6 +1675,43 @@ with tab_sse:
         # ── 策略复盘:买入近3月跌幅最大标的,基金/大盘双止损逐日盯盘
         # (backtest_qvix.py) ── 结果为脚本离线跑批后硬编码(全市场近3月
         # 涨跌幅重算无法在页面现算)。
+        # 情绪偏度(skew): 与 QVIX 共用右轴(同为波动率点), 但绘制**独立于**
+        # QVIX 开关 —— 只勾 skew 也能画。右轴的 title/overlaying 在这里兜底
+        # 配置一次, 免得只开 skew 时 y2 没被建出来。
+        if _show_skew:
+            _skdf = load_skew_threshold(fetcher.qvix_self_history_last_date())
+            _sk = None
+            if _skdf is not None:
+                _sk = _skdf.dropna(subset=["skew"])
+                _sk = _sk[(_sk["date"] >= view["date"].min())
+                          & (_sk["date"] <= view["date"].max())]
+            if _sk is None or _sk.empty:
+                st.caption("⚠️ 情绪偏度(skew)这段区间没有数据 —— "
+                           "跑 `python3 backfill_skew.py` 补")
+            else:
+                fig_sse.data[0].name = "上证指数"
+                fig_sse.data[0].showlegend = True
+                fig_sse.add_trace(go.Scatter(
+                    x=_sk["date"], y=_sk["skew"],
+                    name="情绪偏度(认沽IV−认购IV)", yaxis="y2",
+                    line=dict(color="#59a14f", width=1.1),
+                    hovertemplate="偏度 %{y:+.2f}<extra></extra>"))
+                _skt = _sk.dropna(subset=["thr"])
+                if not _skt.empty:
+                    fig_sse.add_trace(go.Scatter(
+                        x=_skt["date"], y=_skt["thr"],
+                        name="偏度阈值(2年90%)", yaxis="y2",
+                        line=dict(color="#59a14f", width=1.1, dash="dash"),
+                        hovertemplate="偏度阈值 %{y:+.2f}<extra></extra>"))
+                # 0 是恐慌/亢奋的天然分界(认沽贵还是认购贵), 跟上面那条
+                # 滚动阈值是两回事: 0 说"哪边贵", 阈值说"贵得异不异常"。
+                fig_sse.add_hline(y=0, yref="y2", line_width=1,
+                                  line_dash="dot", line_color="#59a14f",
+                                  opacity=0.45)
+                fig_sse.update_layout(
+                    yaxis2=dict(title="波动率(点)", overlaying="y",
+                                side="right", showgrid=False))
+
         # 2026-07-24 切换到当前标准参数: QVIX 2年90分位信号(window=490,
         # pct=0.90) + 候选按近3月跌幅从深到浅排(ret_col="ret_3m",
         # pick="bottom", 见 backtest_qvix.find_champion_on_date 同名参数
