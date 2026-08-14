@@ -1651,30 +1651,6 @@ with tab_sse:
             spikedash="dot", spikethickness=1,
             hoverformat="%Y-%m-%d", tickformat="%Y-%m-%d",
             dtick=max(1, _span_d // 8) * 86400000)
-        fig_sse.update_yaxes(
-            showspikes=True, spikemode="across", spikesnap="data",
-            spikedash="dot", spikethickness=1)
-        st.plotly_chart(fig_sse, use_container_width=True)
-
-        with st.expander("📄 每日数据（当前区间）"):
-            _sse_table = view.sort_values("date", ascending=False).reset_index(drop=True)
-            _tbl = pd.DataFrame({
-                "日期": _sse_table["date"].dt.strftime("%Y-%m-%d"),
-                "收盘点位": _sse_table["close"].round(2),
-                "日涨跌(%)": pd.to_numeric(_sse_table["pct"],
-                                         errors="coerce").round(2),
-            })
-            if qvix_view is not None:
-                _q = qvix_view.assign(
-                    日期=qvix_view["date"].dt.strftime("%Y-%m-%d"),
-                    **{"VIX恐慌指数": qvix_view["qvix"].round(2)})
-                _tbl = _tbl.merge(_q[["日期", "VIX恐慌指数"]],
-                                  on="日期", how="left")
-            st.dataframe(_tbl, use_container_width=True, height=420)
-
-        # ── 策略复盘:买入近3月跌幅最大标的,基金/大盘双止损逐日盯盘
-        # (backtest_qvix.py) ── 结果为脚本离线跑批后硬编码(全市场近3月
-        # 涨跌幅重算无法在页面现算)。
         # 情绪偏度(skew): 与 QVIX 共用右轴(同为波动率点), 但绘制**独立于**
         # QVIX 开关 —— 只勾 skew 也能画。右轴的 title/overlaying 在这里兜底
         # 配置一次, 免得只开 skew 时 y2 没被建出来。
@@ -1710,6 +1686,30 @@ with tab_sse:
                     yaxis2=dict(title="波动率(点)", overlaying="y",
                                 side="right", showgrid=False))
 
+        fig_sse.update_yaxes(
+            showspikes=True, spikemode="across", spikesnap="data",
+            spikedash="dot", spikethickness=1)
+        st.plotly_chart(fig_sse, use_container_width=True)
+
+        with st.expander("📄 每日数据（当前区间）"):
+            _sse_table = view.sort_values("date", ascending=False).reset_index(drop=True)
+            _tbl = pd.DataFrame({
+                "日期": _sse_table["date"].dt.strftime("%Y-%m-%d"),
+                "收盘点位": _sse_table["close"].round(2),
+                "日涨跌(%)": pd.to_numeric(_sse_table["pct"],
+                                         errors="coerce").round(2),
+            })
+            if qvix_view is not None:
+                _q = qvix_view.assign(
+                    日期=qvix_view["date"].dt.strftime("%Y-%m-%d"),
+                    **{"VIX恐慌指数": qvix_view["qvix"].round(2)})
+                _tbl = _tbl.merge(_q[["日期", "VIX恐慌指数"]],
+                                  on="日期", how="left")
+            st.dataframe(_tbl, use_container_width=True, height=420)
+
+        # ── 策略复盘:买入近3月跌幅最大标的,基金/大盘双止损逐日盯盘
+        # (backtest_qvix.py) ── 结果为脚本离线跑批后硬编码(全市场近3月
+        # 涨跌幅重算无法在页面现算)。
         # 2026-07-24 切换到当前标准参数: QVIX 2年90分位信号(window=490,
         # pct=0.90) + 候选按近3月跌幅从深到浅排(ret_col="ret_3m",
         # pick="bottom", 见 backtest_qvix.find_champion_on_date 同名参数
