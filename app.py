@@ -496,6 +496,43 @@ for _c in ("ret_1m", "ret_3m", "ret_6m", "ret_1y"):
     if _c in fund_df.columns:
         fund_df[_c] = pd.to_numeric(fund_df[_c], errors="coerce")
 
+# ── 表格上滚不动页面的修复 ────────────────────────────────────────────────────
+# 症状:策略复盘和历次回测两个 expander 都展开时,鼠标/触控板在页面上滑不动。
+# 原因不在高度(布局是正常的:section.stMain 是 height:100dvh 的滚动容器,
+# 内容撑到 2000+px,scrollHeight 也对)。真正的原因是**横向滚动抢手势**:
+# st.dataframe 内部是 glide-data-grid,它的 .dvn-scroller 是 overflow:auto 的
+# 滚动容器;我们的表列多(复盘表实测内容宽 1725px > 容器 1404px),所以它横向
+# 可滚。Chrome 的滚动锁定(scroll latching)会把整段手势钉在指针下这个滚动容器
+# 上:纯垂直滚轮它让位给页面,但触控板/鼠标滚轮几乎不可能只有垂直分量,只要
+# 带一点横向,整段手势就被表格吃掉——横向挪几十像素,页面一动不动。
+#   实测(1776×1288,两个 expander 都展开):指针在复盘表上,deltaX=8/deltaY=100
+#   连滚 5 次,页面 scrollTop 纹丝不动(0px),而表格 scrollLeft 从 32→72;
+#   同一手势放在表格外的空白处,页面正常滚 401px。
+# 只展开一个时,表格盖不满整屏,指针总能落在表格外,所以看起来"没毛病";两个
+# 都展开,两张宽表把整个视口占满,就彻底滑不动了——用户报的正是这个条件。
+# 修法:捕获阶段拦 wheel,指针在"纵向滚不动"的表格上时,把 deltaY 手动喂给
+# section.stMain、deltaX 留给表格,并 preventDefault 掉浏览器自己的锁定逻辑。
+# 纵向本来就能滚的表格(高度被截断的)不碰,保持原生行为。
+components.html("""<script>
+(function () {
+  const doc = window.parent.document;
+  if (doc.__dfWheelFix) return;          // Streamlit 每次 rerun 都会重放这段
+  doc.__dfWheelFix = true;
+  doc.addEventListener("wheel", function (e) {
+    if (e.ctrlKey) return;               // ctrl+滚轮是浏览器缩放, 别拦
+    const sc = e.target.closest && e.target.closest(".dvn-scroller");
+    if (!sc) return;
+    // 表格自己纵向能滚(内容比可视区高)就让它自己滚, 别抢。
+    if (sc.scrollHeight - sc.clientHeight > 1) return;
+    const main = doc.querySelector("section.stMain") || doc.scrollingElement;
+    if (!main) return;
+    e.preventDefault();
+    main.scrollTop += e.deltaY;
+    sc.scrollLeft += e.deltaX;           // 横向仍然归表格
+  }, {capture: true, passive: false});
+})();
+</script>""", height=0)
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_sse, tab_table, tab_detail, tab_sim = st.tabs(
     ["📈 上证指数", "📋 基金列表", "🔍 基金详情", "💰 模拟盘"])
