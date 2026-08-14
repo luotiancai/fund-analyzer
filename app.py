@@ -1703,11 +1703,9 @@ with tab_sse:
                         name="偏度阈值(2年90%)", yaxis="y2",
                         line=dict(color="#59a14f", width=1.1, dash="dash"),
                         hovertemplate="偏度阈值 %{y:+.2f}<extra></extra>"))
-                # 0 是恐慌/亢奋的天然分界(认沽贵还是认购贵), 跟上面那条
-                # 滚动阈值是两回事: 0 说"哪边贵", 阈值说"贵得异不异常"。
-                fig_sse.add_hline(y=0, yref="y2", line_width=1,
-                                  line_dash="dot", line_color="#59a14f",
-                                  opacity=0.45)
+                # 不画 y=0 的分界线: 有了滚动阈值那条虚线之后, 再加一条固定
+                # 参考线只是噪声 —— 判断"异不异常"看阈值就够, "哪边贵"从
+                # 曲线本身的正负一眼就能读。
                 fig_sse.update_layout(
                     yaxis2=dict(title="波动率(点)", overlaying="y",
                                 side="right", showgrid=False))
