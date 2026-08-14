@@ -276,10 +276,18 @@ def load_qvix_threshold_combos(cache_key):
     return out
 
 
-# skew 的阈值口径**照抄 QVIX**(2年490个交易日、90分位、minp=0.97、shift(1)):
-# 两者同为波动率点、同样是"高于近两年九成的日子才算异常", 用同一套口径才好
-# 并排解读。语义不同的是方向 —— QVIX 高 = 波动大(不分涨跌), skew 高 = 认沽比
-# 认购贵得异常 = 资金在抢买下跌保护 = **真恐慌**。
+# skew 阈值: 2年(490个交易日)滚动 **95分位**, minp=0.97, shift(1)。
+# 窗口/minp/shift 与 QVIX 一致, 但分位取 95 而不是 90 —— 因为同样 90 分位下
+# 两者的触发频率差很多, 而原因是序列性质不同, 不是口径问题:
+#     QVIX  超阈值 6.0%   一阶自相关 0.953   前半中位 19.95 → 后半 16.45
+#     skew  超阈值 10.2%  一阶自相关 0.639   前半中位  0.50 → 后半 -0.20
+# ① 波动率有强聚集性(自相关0.95): 冲高那几天会把滚动窗口的分位一起抬上去,
+#    阈值追着值跑, 于是"超过阈值"变难; skew 自相关低得多, 围绕中枢来回穿,
+#    穿越次数自然接近理论值 10%。
+# ② QVIX 还有明显下行趋势(中位从 19.95 降到 16.45), 窗口里装的是过去两年
+#    偏高的值, 阈值被垫高, 进一步压低触发次数。
+# 也就是说 skew 的 10.2% 才是 90 分位该有的样子, QVIX 的 6.0% 是偏少的那个。
+# 取 95 分位是为了让 skew 的触发也稀一些、跟 QVIX 的量级可比。
 # 只用于图上展示, 不落库、不参与策略(要参与得先在回测里验过)。
 @st.cache_data(show_spinner="正在计算情绪偏度阈值…")
 def load_skew_threshold(cache_key):
@@ -291,7 +299,7 @@ def load_skew_threshold(cache_key):
     hist["skew"] = pd.to_numeric(hist["skew"], errors="coerce")
     out = hist[["date", "skew"]].copy()
     out["thr"] = (hist["skew"].rolling(490, min_periods=int(490 * 0.97))
-                  .quantile(0.90).shift(1))
+                  .quantile(0.95).shift(1))
     return out
 
 
@@ -1676,7 +1684,7 @@ with tab_sse:
                 if not _skt.empty:
                     fig_sse.add_trace(go.Scatter(
                         x=_skt["date"], y=_skt["thr"],
-                        name="偏度阈值(2年90%)", yaxis="y2",
+                        name="偏度阈值(2年95%)", yaxis="y2",
                         line=dict(color="#59a14f", width=1.1, dash="dash"),
                         hovertemplate="偏度阈值 %{y:+.2f}<extra></extra>"))
                 # 不画 y=0 的分界线: 有了滚动阈值那条虚线之后, 再加一条固定
