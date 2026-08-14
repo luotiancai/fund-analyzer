@@ -276,37 +276,6 @@ def load_qvix_threshold_combos(cache_key):
     return out
 
 
-# skew 阈值: 2年(490个交易日)滚动 **98分位**, minp=0.97, shift(1)。
-# 窗口/minp/shift 与 QVIX 一致, 但分位取 98 而不是 90 —— 因为同样 90 分位下
-# 两者的触发频率差很多, 而原因是序列性质不同, 不是口径问题:
-#     QVIX  超阈值 6.0%   一阶自相关 0.953   前半中位 19.95 → 后半 16.45
-#     skew  超阈值 10.2%  一阶自相关 0.639   前半中位  0.50 → 后半 -0.20
-# ① 波动率有强聚集性(自相关0.95): 冲高那几天会把滚动窗口的分位一起抬上去,
-#    阈值追着值跑, 于是"超过阈值"变难; skew 自相关低得多, 围绕中枢来回穿,
-#    穿越次数自然接近理论值 10%。
-# ② QVIX 还有明显下行趋势(中位从 19.95 降到 16.45), 窗口里装的是过去两年
-#    偏高的值, 阈值被垫高, 进一步压低触发次数。
-# 也就是说 skew 的 10.2% 才是 90 分位该有的样子, QVIX 的 6.0% 是偏少的那个。
-# 各档实测(触发天数/触发率/当前阈值):
-#     90% → 164天 10.2% 2.70    95% → 89天 5.5% 4.10    97% → 61天 3.8% 4.70
-#     98% →  42天  2.6% 5.28    99% → 25天 1.6% 9.13
-# 取 98: 只留最极端的那批"认沽贵得离谱"的日子, 比 QVIX(6.0%)还稀一倍多 ——
-# 这条线是用来标注"真恐慌"的, 宁可漏也不要滥。
-# 只用于图上展示, 不落库、不参与策略(要参与得先在回测里验过)。
-@st.cache_data(show_spinner="正在计算情绪偏度阈值…")
-def load_skew_threshold(cache_key):
-    hist = fetcher.load_qvix_self_history()
-    if hist is None or hist.empty or "skew" not in hist.columns:
-        return None
-    hist = hist.sort_values("date").reset_index(drop=True)
-    hist["date"] = pd.to_datetime(hist["date"])
-    hist["skew"] = pd.to_numeric(hist["skew"], errors="coerce")
-    out = hist[["date", "skew"]].copy()
-    out["thr"] = (hist["skew"].rolling(490, min_periods=int(490 * 0.97))
-                  .quantile(0.98).shift(1))
-    return out
-
-
 @st.cache_data(show_spinner=False)
 def load_backtest_trades(cache_key):
     """最新一次标准策略跑批的明细(策略库 strategy_runs,backtest_qvix.py
@@ -1562,14 +1531,6 @@ with tab_sse:
             _show_vix = st.checkbox("VIX恐慌指数", value=True,
                                     key="sse_vix",
                                     help="50ETF期权QVIX（中国版VIX），右轴")
-            # skew 跟 QVIX 同为"波动率点", 共用右轴, 但**两个开关互相独立**
-            # —— 可以只看 skew 不看 QVIX(原来 skew 嵌在 QVIX 的绘制分支里,
-            # 不开 QVIX 就画不出来)。
-            _show_skew = st.checkbox("情绪偏度(skew)", value=False,
-                                     key="sse_skew",
-                                     help="虚值认沽IV−虚值认购IV(各取|delta|≈0.25那只)。"
-                                          "为正=资金抢买下跌保护→恐慌; 为负=抢买上涨"
-                                          "门票→亢奋。QVIX只说波动大不大, 不分方向")
 
         # Window slice keeps the anchor row (last close on/before the window
         # start) so the period change is measured against the true base point —
@@ -1663,40 +1624,6 @@ with tab_sse:
             spikedash="dot", spikethickness=1,
             hoverformat="%Y-%m-%d", tickformat="%Y-%m-%d",
             dtick=max(1, _span_d // 8) * 86400000)
-        # 情绪偏度(skew): 与 QVIX 共用右轴(同为波动率点), 但绘制**独立于**
-        # QVIX 开关 —— 只勾 skew 也能画。右轴的 title/overlaying 在这里兜底
-        # 配置一次, 免得只开 skew 时 y2 没被建出来。
-        if _show_skew:
-            _skdf = load_skew_threshold(fetcher.qvix_self_history_last_date())
-            _sk = None
-            if _skdf is not None:
-                _sk = _skdf.dropna(subset=["skew"])
-                _sk = _sk[(_sk["date"] >= view["date"].min())
-                          & (_sk["date"] <= view["date"].max())]
-            if _sk is None or _sk.empty:
-                st.caption("⚠️ 情绪偏度(skew)这段区间没有数据 —— "
-                           "跑 `python3 backfill_skew.py` 补")
-            else:
-                fig_sse.data[0].name = "上证指数"
-                fig_sse.data[0].showlegend = True
-                fig_sse.add_trace(go.Scatter(
-                    x=_sk["date"], y=_sk["skew"],
-                    name="情绪偏度(认沽IV−认购IV)", yaxis="y2",
-                    line=dict(color="#59a14f", width=1.1),
-                    hovertemplate="偏度 %{y:+.2f}<extra></extra>"))
-                _skt = _sk.dropna(subset=["thr"])
-                if not _skt.empty:
-                    fig_sse.add_trace(go.Scatter(
-                        x=_skt["date"], y=_skt["thr"],
-                        name="偏度阈值(2年98%)", yaxis="y2",
-                        line=dict(color="#59a14f", width=1.1, dash="dash"),
-                        hovertemplate="偏度阈值 %{y:+.2f}<extra></extra>"))
-                # 不画 y=0 的分界线: 有了滚动阈值那条虚线之后, 再加一条固定
-                # 参考线只是噪声 —— 判断"异不异常"看阈值就够, "哪边贵"从
-                # 曲线本身的正负一眼就能读。
-                fig_sse.update_layout(
-                    yaxis2=dict(title="波动率(点)", overlaying="y",
-                                side="right", showgrid=False))
 
         fig_sse.update_yaxes(
             showspikes=True, spikemode="across", spikesnap="data",

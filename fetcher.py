@@ -308,14 +308,16 @@ _DDL = {
     CREATE TABLE IF NOT EXISTS market.index_daily_cache (
         key TEXT PRIMARY KEY, data TEXT, saved_at REAL);
     -- 自算 QVIX 日频历史 + 当日阈值(490交易日90分位)。策略的信号判定读它。
-    -- skew = 虚值认沽IV − 虚值认购IV(各取|delta|≈0.25那只, 单位波动率点)。
-    -- QVIX 只回答"预期波动大不大", 暴跌暴涨都推高它(实测与上证日涨跌相关
-    -- 系数仅 -0.19, 97个信号日里 55% 发生在上涨日); skew 回答"是恐慌还是
-    -- 亢奋": 为正=资金抢买下跌保护, 为负=抢买上涨门票(相关系数 -0.463)。
-    -- 由 backfill_skew.py 回填、update_qvix_self_daily 每日续上。
+    -- ⚠️ QVIX 不分方向: 暴跌暴涨都推高它(与上证日涨跌相关系数仅 -0.19,
+    -- 97个信号日里 55% 发生在上涨日)。2026-08 试过加一列 skew(虚值认沽IV
+    -- − 虚值认购IV, |delta|≈0.25)来补方向, 判别力确实强(相关 -0.463), 但
+    -- **拿它当买入信号回测下来是负的**, 已整套删除, 别再走一遍: 单独跑
+    -- 98分位 15 笔 +579%, 其中赚钱的 4 笔本就是 QVIX 也会开的仓, 剩下 10
+    -- 笔"新增信号"复利 -6.08%、胜率 3/10 —— 平静期(QVIX 12~13)skew 冲高多
+    -- 半是期权卖方结构(备兑压低认购IV)造成的, 不是真有人抢买保护, 进场后
+    -- 没有恐慌就没有反弹可吃, 只能原地漂到止损。
     CREATE TABLE IF NOT EXISTS market.qvix_self_history (
-        date TEXT PRIMARY KEY, qvix REAL, note TEXT, threshold REAL,
-        skew REAL);
+        date TEXT PRIMARY KEY, qvix REAL, note TEXT, threshold REAL);
 """,
 
 "strategy": """
@@ -1994,9 +1996,8 @@ def save_qvix_self_history(rows: list) -> None:
     可以并排比对,而不是自算结果把optbbs历史顶替掉。rows 是
     [{"date","qvix","note"}, ...]。"""
     # 用 UPSERT 而不是 INSERT OR REPLACE: 后者是**整行替换**, 会把同一行的
-    # threshold 和 skew 一起抹成 NULL。threshold 每次跑批都会重算所以看不出
-    # 问题, 但 skew 是逐日联网取的, 抹了就得重新回填(2026-08-13 加 skew 列
-    # 时发现的坑)。这里只动 qvix/note。
+    # threshold 抹成 NULL(它每次跑批都重算, 所以平时看不出问题 —— 但只要
+    # 以后再往这张表加别的列, 整行替换就会静默清空它)。这里只动 qvix/note。
     conn = _conn()
     conn.executemany(
         "INSERT INTO qvix_self_history (date, qvix, note) VALUES (?, ?, ?) "
@@ -2240,19 +2241,6 @@ def update_qvix_self_daily() -> tuple:
 
     vix, note = qvix_calc.compute_qvix_for_date(target)
     save_qvix_self_history([{"date": target.isoformat(), "qvix": vix, "note": note}])
-    # 顺带补当天的 skew(认沽-认购IV偏度, 见 qvix_self_history 建表注释)。
-    # 失败不影响主流程 —— 它是辅助维度, 缺一天可以由 backfill_skew.py 补。
-    try:
-        import backfill_skew
-        _sk = backfill_skew.skew_on(target.isoformat())
-        if _sk is not None:
-            _c = _conn()
-            _c.execute("UPDATE qvix_self_history SET skew=? WHERE date=?",
-                       (_sk, target.isoformat()))
-            _c.commit(); _c.close()
-            logger.info("QVIX skew(%s) = %+.2f", target, _sk)
-    except Exception as e:
-        logger.warning("skew 计算失败(不影响主流程): %s", e)
     if vix is None:
         logger.warning("QVIX 每日自算(%s)失败: %s", target, note)
     else:
