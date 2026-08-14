@@ -276,8 +276,8 @@ def load_qvix_threshold_combos(cache_key):
     return out
 
 
-# skew 阈值: 2年(490个交易日)滚动 **95分位**, minp=0.97, shift(1)。
-# 窗口/minp/shift 与 QVIX 一致, 但分位取 95 而不是 90 —— 因为同样 90 分位下
+# skew 阈值: 2年(490个交易日)滚动 **98分位**, minp=0.97, shift(1)。
+# 窗口/minp/shift 与 QVIX 一致, 但分位取 98 而不是 90 —— 因为同样 90 分位下
 # 两者的触发频率差很多, 而原因是序列性质不同, 不是口径问题:
 #     QVIX  超阈值 6.0%   一阶自相关 0.953   前半中位 19.95 → 后半 16.45
 #     skew  超阈值 10.2%  一阶自相关 0.639   前半中位  0.50 → 后半 -0.20
@@ -287,7 +287,11 @@ def load_qvix_threshold_combos(cache_key):
 # ② QVIX 还有明显下行趋势(中位从 19.95 降到 16.45), 窗口里装的是过去两年
 #    偏高的值, 阈值被垫高, 进一步压低触发次数。
 # 也就是说 skew 的 10.2% 才是 90 分位该有的样子, QVIX 的 6.0% 是偏少的那个。
-# 取 95 分位是为了让 skew 的触发也稀一些、跟 QVIX 的量级可比。
+# 各档实测(触发天数/触发率/当前阈值):
+#     90% → 164天 10.2% 2.70    95% → 89天 5.5% 4.10    97% → 61天 3.8% 4.70
+#     98% →  42天  2.6% 5.28    99% → 25天 1.6% 9.13
+# 取 98: 只留最极端的那批"认沽贵得离谱"的日子, 比 QVIX(6.0%)还稀一倍多 ——
+# 这条线是用来标注"真恐慌"的, 宁可漏也不要滥。
 # 只用于图上展示, 不落库、不参与策略(要参与得先在回测里验过)。
 @st.cache_data(show_spinner="正在计算情绪偏度阈值…")
 def load_skew_threshold(cache_key):
@@ -299,7 +303,7 @@ def load_skew_threshold(cache_key):
     hist["skew"] = pd.to_numeric(hist["skew"], errors="coerce")
     out = hist[["date", "skew"]].copy()
     out["thr"] = (hist["skew"].rolling(490, min_periods=int(490 * 0.97))
-                  .quantile(0.95).shift(1))
+                  .quantile(0.98).shift(1))
     return out
 
 
@@ -1684,7 +1688,7 @@ with tab_sse:
                 if not _skt.empty:
                     fig_sse.add_trace(go.Scatter(
                         x=_skt["date"], y=_skt["thr"],
-                        name="偏度阈值(2年95%)", yaxis="y2",
+                        name="偏度阈值(2年98%)", yaxis="y2",
                         line=dict(color="#59a14f", width=1.1, dash="dash"),
                         hovertemplate="偏度阈值 %{y:+.2f}<extra></extra>"))
                 # 不画 y=0 的分界线: 有了滚动阈值那条虚线之后, 再加一条固定
