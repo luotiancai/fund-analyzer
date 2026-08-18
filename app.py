@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import json
 import math
+import re
 import os
 import shutil
 import threading
@@ -1973,9 +1974,10 @@ with tab_sse:
         with _tab_pick:
             st.caption(
                 "从近3月跌幅最深的往下找, 一路上被规模/波动率刷掉的也列出来, "
-                "**走到选中那只就截止**——之后的候选策略压根没看过。跌幅超上限"
-                "的那批只报个数(它们被一条跟基金本身无关的规则一刀切掉, 逐只列"
-                "会把表刷满)。口径与回测完全一致: 全部 T-1(净值当晚才公布)、"
+                "**走到选中那只就截止**——之后的候选策略压根没看过。想看某只"
+                "具体基金在今天这批候选里的位置, 用下面的「查基金代码」单查。"
+                "跌幅超上限的那批只报个数(它们被一条跟基金本身无关的规则一刀切掉, "
+                "逐只列会把表刷满)。口径与回测完全一致: 全部 T-1(净值当晚才公布)、"
                 "规模用当时已披露的最新季报。"
                 "「近3月窗口」列标出每只**实际**用的起止日: 终点是该基金早于今天"
                 "的最后一个净值日,起点是终点往回**91个自然日**取最近的净值日,"
@@ -2015,19 +2017,29 @@ with tab_sse:
                         f"规模≥{_std['min_aum']}亿"
                         + (f"~{_std['max_aum']}亿" if _std["max_aum"] else "(无上限)")
                         + f" · 跌超上限的 {_tp['too_deep']} 只已跳过")
+                    # 遍历路径和「查代码」共用这一张表: 查一只基金的意义就是
+                    # 把它摆到今天这批候选里比, 表结构不一样就没法比。数据行
+                    # 由 today_pick._row 统一产出(见那边说明)。
+                    def _pick_table(rows):
+                        return pd.DataFrame([{
+                            "": "★" if r["role"].startswith("★") else "",
+                            "跌幅榜": f"第{r['rank']}" if r["rank"] else "—",
+                            "基金": f"{r['name']} ({r['code']})",
+                            "近3月": (f"{r['ret3m']:+.2f}%"
+                                     if r["ret3m"] is not None else "—"),
+                            "近3月窗口": (f"{r['win_start'][5:]}→{r['win_end'][5:]}"
+                                       if r["win_start"] and r["win_end"] else "—"),
+                            "波动率比值": (f"{r['beta']:.2f}"
+                                       if r["beta"] is not None else "—"),
+                            "规模(亿)": (f"{r['aum']:.2f}"
+                                      if r["aum"] is not None else "—"),
+                            "结论": r["why"] or r["role"] or "通过",
+                        } for r in rows])
+
                     if not _tp["rows"]:
                         st.info("今天没有跌幅带内的候选——按策略放弃当天。")
                     else:
-                        _tpd = pd.DataFrame([{
-                            "": "★" if r[6] else "",
-                            "基金": f"{r[1]} ({r[0]})",
-                            "近3月": f"{r[2]:+.2f}%",
-                            "近3月窗口": (f"{r[7][5:]}→{r[8][5:]}"
-                                       if r[7] and r[8] else "—"),
-                            "波动率比值": f"{r[3]:.2f}" if r[3] is not None else "—",
-                            "规模(亿)": f"{r[4]:.2f}" if r[4] is not None else "—",
-                            "结论": "★ 选中" if r[6] else (r[5] or "通过"),
-                        } for r in _tp["rows"]])
+                        _tpd = _pick_table(_tp["rows"])
                         st.dataframe(_tpd, use_container_width=True,
                                      hide_index=True,
                                      height=(len(_tpd) + 1) * 35 + 3)
@@ -2040,6 +2052,33 @@ with tab_sse:
                     else:
                         st.info("走完跌幅带也没有合格候选——按策略放弃当天,"
                                 "顺延到下一个信号日。")
+
+                    # ── 查任意代码(2026-08-18 加) ────────────────────────
+                    # 用途是跟支付宝/东财对账: 手上看到一只跌得很惨的基金,
+                    # 想知道这套口径为什么没选它 —— 是规则排掉的(QDII/持有期/
+                    # 跌幅超上限/规模不够), 还是根本没进池子(数据漏了)。所以
+                    # 「没进池子」那一栏必须说清是哪一种, 见 today_pick.probe。
+                    # ⚠️ 近3月口径跟支付宝不同: 这里是终点往回 91 个自然日,
+                    # 支付宝按整 3 个自然月, 差一个交易日就可能差零点几个点,
+                    # 「近3月窗口」列标的就是每只实际用的起止日, 对账看这个。
+                    _probe_in = st.text_input(
+                        "查基金代码(多个用逗号/空格分隔)", key="today_pick_probe",
+                        placeholder="例如 026834, 012710 016848",
+                        help="用今天这套完全相同的口径算一遍并摆进上面同一张表, "
+                             "看它在跌幅榜第几名、卡在哪道门槛。用来跟支付宝的"
+                             "数字对账 —— 对不上先看「近3月窗口」那列。")
+                    if _probe_in.strip():
+                        _codes = [c for c in re.split(r"[,，\s]+", _probe_in.strip()) if c]
+                        with st.spinner("按同一口径现算…"):
+                            _pr = today_pick.probe(dt.date.today(), _codes, _tp)
+                        _prd = _pick_table(_pr)
+                        st.dataframe(_prd, use_container_width=True,
+                                     hide_index=True,
+                                     height=(len(_prd) + 1) * 35 + 3)
+                        st.caption(
+                            "跟上面那张表同一套口径、同一天的数据。跌幅榜名次的"
+                            f"分母是当天**真跌**的 {_tp.get('n_drop', '—')} 只"
+                            "(涨的不在策略的遍历路径上, 混进分母只会让名次虚高)。")
 
         # ── 历次回测跑批(2026-08-05):不是线上实盘规则,只挂上来做对比 ──
         # backtest_qvix.py 每跑一次就往策略库追加一条(fetcher.save_strategy_run),

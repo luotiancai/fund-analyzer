@@ -115,13 +115,48 @@ def _ret3m_window(conn, code: str, asof_s: str):
     return anchor, end
 
 
+def _row(code, name, r3, beta, aum, why, role, win_a, win_e, rank):
+    """遍历路径/代码查询共用的一行。两边必须同结构, 页面才能用同一张表渲染
+    —— 查一个代码的意义就是"把它摆到今天这批候选里比", 表长得不一样就没法比。
+    """
+    return {"code": code, "name": name, "ret3m": r3, "beta": beta, "aum": aum,
+            "why": why, "role": role, "win_start": win_a, "win_end": win_e,
+            "rank": rank}
+
+
+def _gates(conn, sse, code, asof_s, aum):
+    """三道门槛(窗口完整/波动率/规模)+净值僵化, 按策略的短路顺序判。
+    → (淘汰原因 or None, 波动率比值 or None, 规模 or None)。
+
+    僵化-补涨这道排在最后: 前面几道全是便宜的库内判断, 它要扫一段净值。"""
+    if not B._has_full_window(conn, code, asof_s,
+                              fetcher.RETURN_DAYS["ret_3m"]):
+        return "回看窗口不完整", None, aum
+    beta = B.compute_beta(conn, sse, code, asof_s)
+    if beta < STD["min_vol_ratio"]:
+        return f"波动{beta:.2f}<{STD['min_vol_ratio']}", beta, aum
+    if aum is None:
+        return "规模查不到", beta, aum
+    if aum < STD["min_aum"]:
+        return f"规模{aum:.2f}亿<{STD['min_aum']}", beta, aum
+    if STD["max_aum"] and aum > STD["max_aum"]:
+        return f"规模{aum:.2f}亿>{STD['max_aum']}", beta, aum
+    end = pd.Timestamp(asof_s)
+    if B._has_stale_catchup(conn, code, end - pd.Timedelta(days=101),
+                            end - pd.Timedelta(days=1)):
+        return "净值僵化-补涨", beta, aum
+    return None, beta, aum
+
+
 def scan(asof, top: int = 40) -> dict:
     """按标准策略走一遍当天的候选, 返回结构化结果(CLI 和页面共用)。
 
-    rows 是**实际遍历路径**: 从跌幅最深处往下, 每行 (代码,名称,近3月,波动比,
-    规模,淘汰原因或None,是否选中,近3月窗口起点,窗口终点), 走到选中那只就截止
-    —— 之后的候选策略压根没看过。跌幅超上限的那批只计数(too_deep), 不进 rows。
-    """
+    rows 是**实际遍历路径**: 从跌幅最深处往下, 每行一个 dict(见 _row)。
+    走到选中那只就截止 —— 之后的候选策略压根没看过。跌幅超上限的那批只
+    计数(too_deep), 不进 rows。
+
+    想知道某只具体基金在今天这批候选里的位置, 用 probe() 单查, 不要把这条
+    遍历路径拉长: 路径的意义就是"策略实际看过哪些", 多列的部分不属于它。"""
     conn = B.get_conn()
     names, types = {}, {}
     for it in json.loads(conn.execute(
@@ -156,44 +191,109 @@ def scan(asof, top: int = 40) -> dict:
         return out
     aums = fetcher.funds_aum_asof(sorted(cand), asof_s, merge_classes=True)
 
+    # 跌幅榜名次: 分母是「真跌」的那批(跟策略的遍历顺序同一个序列), 不含
+    # 涨的 —— 涨的根本不在这条路径上, 混进分母只会让名次看起来更靠前。
+    order = sorted((c for c in cand if cand[c] < 0), key=cand.get)
+    ranks = {c: i + 1 for i, c in enumerate(order)}
+    out["n_drop"] = len(order)
+
     rows, chosen, too_deep = [], None, 0
-    for code in sorted(cand, key=cand.get):        # 跌幅从深到浅
+    for code in order:                              # 跌幅从深到浅
         r3 = cand[code]
-        if r3 >= 0:
-            break                                   # 跌幅耗尽, 后面全是涨的
         if r3 < -STD["max_drop"]:
             too_deep += 1
             continue
-        why, beta, aum = None, None, aums.get(code)
-        if not B._has_full_window(conn, code, asof_s,
-                                  fetcher.RETURN_DAYS["ret_3m"]):
-            why = "回看窗口不完整"
-        else:
-            beta = B.compute_beta(conn, sse, code, asof_s)
-            if beta < STD["min_vol_ratio"]:
-                why = f"波动{beta:.2f}<{STD['min_vol_ratio']}"
-            elif aum is None:
-                why = "规模查不到"
-            elif aum < STD["min_aum"]:
-                why = f"规模{aum:.2f}亿<{STD['min_aum']}"
-            elif STD["max_aum"] and aum > STD["max_aum"]:
-                why = f"规模{aum:.2f}亿>{STD['max_aum']}"
-        if why is None and chosen is None:
-            end = pd.Timestamp(asof_s)
-            if B._has_stale_catchup(conn, code, end - pd.Timedelta(days=101),
-                                    end - pd.Timedelta(days=1)):
-                why = "净值僵化-补涨"
-            else:
-                chosen = code
+        why, beta, aum = _gates(conn, sse, code, asof_s, aums.get(code))
+        role = ""
+        if why is None:
+            chosen, role = code, "★ 选中"
         _a, _e = _ret3m_window(conn, code, asof_s)
-        rows.append((code, names.get(code, code), r3, beta, aum, why,
-                     code == chosen, _a, _e))
+        rows.append(_row(code, names.get(code, code), r3, beta, aum, why,
+                         role, _a, _e, ranks.get(code)))
         if chosen is not None or len(rows) >= top:
             break
 
-    out.update(rows=rows, too_deep=too_deep, chosen=chosen)
+    out.update(rows=rows, too_deep=too_deep, chosen=chosen, cand=cand,
+               ranks=ranks)
     if chosen is not None:
         b = B.compute_beta(conn, sse, chosen, asof_s)
         out["fund_line"] = thr / STD["dd_divisor"] * b
         out["sse_line"] = thr / STD["dd_divisor"]
+    return out
+
+
+def probe(asof, codes, res: dict = None) -> list:
+    """指定基金代码在**今天这套口径**下的诊断行, 结构与 scan 的 rows 一致。
+
+    res 传上一次 scan 的返回值就直接复用它的 cand/ranks(全市场重算近3月要
+    ~10秒, 查个代码没必要再跑一遍); 不传就自己算一遍。
+
+    跟 scan 的差别只有两处, 都是故意的:
+      · 跌幅超上限的照样出行(why 写明超了多少), 不像 scan 那样并进 too_deep
+        计数 —— 查一个具体代码时"它为什么没被选"正是要问的;
+      · 涨的(近3月为正)也出行, why="没真跌"。策略遍历到这就收工了, 但用户
+        手上拿着的那只未必在跌幅带里。
+    """
+    conn = B.get_conn()
+    names, types = {}, {}
+    for it in json.loads(conn.execute(
+            "SELECT data FROM fund_list").fetchone()[0]):
+        c = it.get("code", "")
+        names[c] = it.get("name") or c
+        types[c] = it.get("type") or ""
+    sse = B.load_cached_json(conn, "sse")
+    sse["close"] = pd.to_numeric(sse["close"], errors="coerce")
+    sse = sse.sort_values("date").reset_index(drop=True)
+
+    asof_s = pd.Timestamp(asof).strftime("%Y-%m-%d")
+    cand = (res or {}).get("cand")
+    ranks = (res or {}).get("ranks")
+    if cand is None:
+        metrics = fetcher.compute_metrics_asof(asof_s, cols={"ret_3m"})
+        cand = {c: m["ret_3m"] for c, m in metrics.items()
+                if m.get("ret_3m") is not None}
+        ranks = {c: i + 1 for i, c in enumerate(
+            sorted((c for c in cand if cand[c] < 0), key=cand.get))}
+
+    codes = [c.strip() for c in codes if c and c.strip()]
+    aums = fetcher.funds_aum_asof(codes, asof_s, merge_classes=True)
+    out = []
+    for code in codes:
+        r3 = cand.get(code)
+        if r3 is None:
+            # 「没进池子」要说清是哪一种 —— 这个功能是拿来跟支付宝对账的,
+            # 一句笼统的"不在候选池"没法判断到底是规则排掉的还是数据漏了。
+            t, n = types.get(code), names.get(code)
+            if n is None:
+                miss = "榜单里没有这个代码(不是C类/已清盘/代码敲错)"
+            elif t and ("QDII" in t or "海外" in t):
+                miss = f"规则排除: {t}(跟踪境外市场)"
+            elif B._HOLD_PERIOD_RE.search(n):
+                miss = "规则排除: 名称含持有期锁定"
+            elif fetcher.is_bond(t or ""):
+                miss = f"规则排除: 债券类({t})"
+            else:
+                _last = conn.execute(
+                    "SELECT MAX(date) d, COUNT(*) n FROM fund_nav_daily "
+                    "WHERE code=? AND date<?", (code, asof_s)).fetchone()
+                miss = (f"净值库里只有 {_last['n']} 条(最新 {_last['d']}),"
+                        "算不出近3月" if _last and _last["n"]
+                        else "净值库里没有这只的任何净值(候选池是**C类**"
+                        "全市场, A/E 等别的份额类别不在库里 —— 支付宝上"
+                        "拿到的常是 A 类代码, 换成同一只的 C 类再查)")
+            out.append(_row(code, n or code, None, None, aums.get(code),
+                            miss, "", None, None, None))
+            continue
+        if r3 >= 0:
+            why, beta, aum = "没真跌(近3月为正)", None, aums.get(code)
+        elif r3 < -STD["max_drop"]:
+            # 门槛照样跑一遍再把跌幅上限写在最前面: 用户要知道的是"除了跌太多
+            # 之外它还差在哪", 只报一条最先短路的没用。
+            _w, beta, aum = _gates(conn, sse, code, asof_s, aums.get(code))
+            why = f"跌幅{r3:.2f}%超上限{STD['max_drop']:.0f}%" + (f" + {_w}" if _w else "")
+        else:
+            why, beta, aum = _gates(conn, sse, code, asof_s, aums.get(code))
+        a, e = _ret3m_window(conn, code, asof_s)
+        out.append(_row(code, names.get(code, code), r3, beta, aum, why,
+                        "" if why else "过了全部门槛", a, e, ranks.get(code)))
     return out
