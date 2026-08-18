@@ -2581,6 +2581,109 @@ def recompute_all(progress_callback: Optional[Callable] = None) -> int:
     return saved
 
 
+def _asof_returns_vectorized(conn, asof: str, cols: set):
+    """compute_metrics_asof 的向量化快路: 只算区间收益列(cols ⊆ RETURN_DAYS)。
+
+    逐只路径(下面那个 for 循环)的耗时**不在 SQL 上**: 实测 5722 只共 13.0s,
+    其中一次性把数据读出来只要 1s, 剩下 9~12s 全花在"每只基金构造一个
+    DataFrame 再跑 _metrics_from_nav"上, 光 effective_daily_ret 就占一半。
+    所以这里把整段计算搬到**一整张表**上做, 5722 次 pandas 调用变成十几次。
+
+    口径与逐只路径**完全一致**(切换前逐只比对过 5722 只, 见下面几条保证):
+      · 切片起点取 min(每只最后净值日) - 窗口天数 - 宽限, 保证每只基金的
+        区间窗口(锚点在内)整段落在切片里 —— 锚点是"最后净值日往回 days_back
+        天之前的最后一个净值日", 切片截短了会让锚点前移/落空, 算出来的收益
+        就变了(实测直接按 asof-130天 切会有 8 只对不上、2 只消失);
+      · 切片内行数 < 60 的稀疏基金(定开/按周披露)一律退回逐只路径 —— 那两道
+        "至少 20 个点"的门槛在全历史上判和在切片上判不是一回事;
+      · effective_daily_ret 的第一行拿不到环比(shift 出 NaN), 但切片第一行
+        必然早于任何一只的窗口锚点, 影响不到结果。
+    """
+    ends = conn.execute(
+        "SELECT code, MAX(date) AS e, COUNT(*) AS n FROM fund_nav_daily "
+        "WHERE date < ? GROUP BY code", (asof,)).fetchall()
+    if not ends:
+        return {}, set()
+    need = max(RETURN_DAYS[c] for c in cols) + ANCHOR_GRACE_DAYS + 5
+    slice_start = (pd.Timestamp(min(r["e"] for r in ends))
+                   - timedelta(days=need)).strftime("%Y-%m-%d")
+    full_n = {r["code"]: r["n"] for r in ends}
+    big = pd.read_sql_query(
+        "SELECT code, date, nav, daily_ret_pct, acc_nav FROM fund_nav_daily "
+        "WHERE date < ? AND date >= ? ORDER BY code, date",
+        conn, params=(asof, slice_start))
+    if big.empty:
+        return {}, set(full_n)
+
+    code = big["code"]
+    n_slice = code.value_counts()
+    # 稀疏/历史被切片截短的退回逐只路径(见 docstring 第二条)
+    fallback = {c for c, n in full_n.items()
+                if n >= 20 and n_slice.get(c, 0) < 60}
+    if fallback:
+        keep = ~code.isin(fallback)
+        big = big[keep].reset_index(drop=True)
+        code = big["code"]
+        if big.empty:
+            return {}, fallback
+    # 全历史点数不够 20 的, 逐只路径也会跳过 —— 这里一并排除, 结果一致
+    thin = {c for c, n in full_n.items() if n < 20}
+    if thin:
+        big = big[~code.isin(thin)].reset_index(drop=True)
+        code = big["code"]
+        if big.empty:
+            return {}, fallback
+
+    dates = pd.to_datetime(big["date"])
+    nav = pd.to_numeric(big["nav"], errors="coerce")
+    acc = pd.to_numeric(big["acc_nav"], errors="coerce").fillna(nav)
+    r = pd.to_numeric(big["daily_ret_pct"], errors="coerce") / 100.0
+    implied_nav = nav / nav.groupby(code, sort=False).shift(1) - 1.0
+    implied_acc = acc / acc.groupby(code, sort=False).shift(1) - 1.0
+    # 下面五行是 effective_daily_ret 的逐字向量化版, 改那边记得改这里
+    conflict = (r - implied_nav).abs() > 0.003
+    dividendish = (r - implied_acc).abs() <= 0.003
+    use_implied = (conflict & ~dividendish & implied_nav.notna()) | r.isna()
+    rr = r.mask(use_implied, implied_nav)
+    rr = rr.mask(rr.abs() > 0.30, 0.0)      # mask 不碰 NaN, 与逐只版一致
+
+    pos = pd.Series(np.arange(len(big)), index=big.index)
+    last_pos = pos.groupby(code, sort=False).max()
+    first_pos = pos.groupby(code, sort=False).min()
+    end_f = dates.groupby(code, sort=False).transform("max")
+    first_date = dates.groupby(code, sort=False).transform("min")
+    # (1+r) 的组内累乘: NaN 当因子 1(等价于逐只版先 dropna 再连乘),
+    # 另开一列数非 NaN 个数, 用来复现"窗口内一个有效收益都没有→None"。
+    fac = (1.0 + rr).fillna(1.0)
+    cum = fac.groupby(code, sort=False).cumprod()
+    nn = rr.notna().astype(int).groupby(code, sort=False).cumsum()
+
+    out = {}
+    cum_v, nn_v = cum.to_numpy(), nn.to_numpy()
+    for key in cols:
+        days = RETURN_DAYS[key]
+        start_f = end_f - pd.Timedelta(days=days)
+        older = dates <= start_f
+        anchor = pos.where(older).groupby(code, sort=False).max()   # NaN=没有
+        # 没有锚点时的宽限: 全历史第一条比理想起点晚不超过 ANCHOR_GRACE_DAYS
+        # 就拿第一条当锚点(逐只版 _window_by_date 的同一条规则), 否则该只无值
+        grace_ok = ((first_date.groupby(code, sort=False).first()
+                     - start_f.groupby(code, sort=False).first()).dt.days
+                    <= ANCHOR_GRACE_DAYS)
+        anchor = anchor.fillna(first_pos.where(grace_ok))
+        for c, a in anchor.items():
+            if pd.isna(a):
+                out.setdefault(c, {})[key] = None
+                continue
+            a, e = int(a), int(last_pos[c])
+            if e <= a or nn_v[e] - nn_v[a] <= 0:
+                out.setdefault(c, {})[key] = None     # 窗口里没有有效收益
+                continue
+            out.setdefault(c, {})[key] = float(
+                (cum_v[e] / cum_v[a] - 1.0) * 100.0)
+    return out, fallback
+
+
 def compute_metrics_asof(asof: str,
                          progress_callback: Optional[Callable] = None,
                          cols: Optional[set] = None) -> dict:
@@ -2597,6 +2700,32 @@ def compute_metrics_asof(asof: str,
     """
     conn = _conn()
     codes = [r["code"] for r in conn.execute("SELECT code FROM fund_nav_meta")]
+    # 只要区间收益列(今日候选/回测/pct_rank 都是 cols={"ret_3m"})时走向量化
+    # 快路, 实测 13.0s → 见 _asof_returns_vectorized。回撤列还没向量化(窗口内
+    # cummax 麻烦), 带 mdd_* 的调用(筛选页的「截至日期」)照旧逐只算。
+    if cols and all(c in RETURN_DAYS for c in cols):
+        fast, fallback = _asof_returns_vectorized(conn, asof, set(cols))
+        codes = [c for c in codes if c in fallback]     # 剩这些逐只补算
+        out = dict(fast)
+        for i, code in enumerate(codes):
+            df = pd.read_sql_query(
+                "SELECT date, nav, daily_ret_pct, acc_nav FROM fund_nav_daily "
+                "WHERE code = ? AND date < ? ORDER BY date",
+                conn, params=(code, asof))
+            if len(df) >= 20:
+                df["date"] = pd.to_datetime(df["date"])
+                try:
+                    m = _metrics_from_nav(df, cols=cols)
+                except Exception as e:
+                    logger.debug("asof metrics failed %s: %s", code, e)
+                    m = None
+                if m is not None:
+                    out[code] = m
+        if progress_callback:
+            progress_callback(len(out), len(out))
+        conn.close()
+        return out
+
     out, total = {}, len(codes)
     for i, code in enumerate(codes):
         df = pd.read_sql_query(

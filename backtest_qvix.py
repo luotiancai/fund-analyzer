@@ -406,9 +406,11 @@ def _corr_with_market(conn, sse_df, code, window_start, window_end):
     return None if pd.isna(c) else c
 
 
-# compute_metrics_asof 是整个回测最贵的一步: 实测单次约 9.2s(逐只 SQL 2.0s
-# + 逐只 _metrics_from_nav 6.3s, 后者是 4000+ 次函数调用的固定开销, 跟数据
-# 量关系不大), 一次标准回测要调 ~35 次, 占总耗时九成以上。
+# compute_metrics_asof 是整个回测最贵的一步, 一次标准回测要调 ~35 次。
+# 2026-08-18 之前它是逐只 SQL + 逐只 _metrics_from_nav(单次约 9~13s, 占总耗时
+# 九成), 现在只要 cols 全是区间收益列就走向量化快路(见 fetcher.
+# _asof_returns_vectorized), 单次 1.3~2.3s —— 标准回测实测 257s → 40s,
+# 结果一字不差。
 #
 # 缓存最初是为 fallback_top(涨幅兜底)加的: 那条规则会让同一个信号日调两次
 # ——跌幅分支一次, 涨幅兜底再一次, 两次的 (asof, ret_col) 完全相同。规则已于
