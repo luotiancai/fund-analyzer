@@ -7,7 +7,7 @@
     python3 cloud_peek.py --sql "SELECT ..."   # 任意只读查询
 
 为什么要这个:线上数据是 gz 压缩的 SQLite,存在 GitHub Release 上。想确认
-"线上净值到哪天了""规模表覆盖多少只""模拟盘还在不在",过去只能手动
+"线上净值到哪天了""规模表覆盖多少只",过去只能手动
 gh release download 80MB、gunzip 出 400MB、再开 sqlite3 敲 SQL。一次几分钟,
 于是实际上从来没人看 —— 本地和云端差多少全靠猜,2026-08-05 那次把云端攒了
 五天的行情盖回去,直接原因就是没人知道两边差了多少。
@@ -31,7 +31,7 @@ import cloud_assets   # noqa: E402
 import fetcher        # noqa: E402
 
 # 默认拉的小库(合计约 2MB)。大库(nav/scale)要 --full。cache 不看。
-SMALL_DBS = ("rank", "market", "strategy", "sim")
+SMALL_DBS = ("rank", "market", "strategy")
 BIG_DBS = ("nav", "scale")
 
 # 体检项: (表名, 说明, 新鲜度 SQL 或 None)
@@ -45,8 +45,6 @@ CHECKS = [
     ("qvix_self_history", "QVIX 自算历史", "SELECT MAX(date) FROM qvix_self_history"),
     ("index_daily_cache", "指数日线缓存", None),
     ("fund_list", "榜单快照(整块1行)", None),
-    ("sim_trades", "模拟盘交易", None),
-    ("sim_archives", "模拟盘存档", None),
 ]
 
 

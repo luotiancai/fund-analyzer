@@ -56,8 +56,8 @@ jobs:
         # 一个 400MB 的 fund_cache.db 打包所有表, 发布单元跟更新节奏对不上,
         # 推一次策略结果能把跑批攒五天的行情盖回去(2026-08-05)。
         # cache(筛选结果缓存)不取: 跑批不读它, 丢了应用自己重算。
-        # strategy/sim 也不取: 权威写入方分别是本地回测和线上 app, 跑批只读
-        # 不写, 取回来再传回去只会平白增加覆盖它们的机会。
+        # strategy 也不取: 权威写入方是本地回测, 跑批只读不写, 取回来再传
+        # 回去只会平白增加覆盖它的机会。
         run: |
           mkdir -p "$FUND_ANALYZER_DATA"
           for db in fund_rank market fund_nav fund_scale; do
@@ -81,7 +81,7 @@ jobs:
           fi
       - name: 压缩并回传各个库
         # 一个库一个资产, 各自独立。只传跑批真正写过的那几个 —— 不碰
-        # strategy(本地回测发)、sim(线上 app 写)、cache(缓存)。
+        # strategy(本地回测发)、cache(缓存)。
         run: |
           cd "$FUND_ANALYZER_DATA"
           for db in fund_rank market fund_nav fund_scale; do

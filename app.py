@@ -31,7 +31,6 @@ except Exception:
     pass
 
 import fetcher
-import simulator
 
 _CST = ZoneInfo("Asia/Shanghai")
 
@@ -56,7 +55,6 @@ st.set_page_config(
 @st.cache_resource
 def _init_db_once():
     fetcher.init_db()
-    simulator.init_sim_db()
     return True
 
 
@@ -72,7 +70,7 @@ def _init_db_once():
 # fund_cache.db 里, 发布单元跟更新节奏对不上, 推一次策略结果就能把跑批攒
 # 了五天的行情盖回去(2026-08-05)。
 #
-# 首屏同步拉 rank/market/strategy/sim, 合计 gz 约 2MB, 拉完立刻能画;
+# 首屏同步拉 rank/market/strategy, 合计 gz 约 2MB, 拉完立刻能画;
 # nav(净值 gz 61MB)和 scale(季度数据 gz 4MB)首屏一行都不读, **也不预拉** ——
 # 见下面 _need_nav: 点了要用净值的功能才开始下。cache 库压根不拉: 它是筛选
 # 结果缓存, 丢了自动重算, 下一份别人的缓存过来毫无价值。
@@ -88,7 +86,7 @@ _ASSET = {name: _DB_BASE + fn + ".gz"
           for name, fn, _t, _l in fetcher.DB_LAYOUT}
 _MARKER = {name: fetcher.DB_PATH[name] + ".from-release"
            for name, _fn, _t, _l in fetcher.DB_LAYOUT}
-_EAGER_DBS = ("rank", "market", "strategy", "sim")
+_EAGER_DBS = ("rank", "market", "strategy")
 _LAZY_DBS = fetcher.LAZY_DBS          # ("nav", "scale")
 # 惰性库的 gz 大小, 只用于按钮上那句提示("要下多少") —— 会随数据增长慢慢
 # 变大, 差个几 MB 无所谓, 不值得为了准确去 HEAD 一次(那本身就是一次请求)。
@@ -194,7 +192,7 @@ def _start_lazy_downloads():
     """后台线程拉大库(净值/季度数据)。**只由 _need_nav 在用户点按钮时调用。**
 
     起线程而不是同步拉:解压后 233MB, 挡在页面前面十几秒一动不动很难受;
-    起了线程还能一边下一边看上证走势。期间需要净值的四处(筛选/详情/模拟盘/
+    起了线程还能一边下一边看上证走势。期间需要净值的三处(筛选/详情/
     今日候选)由 fetcher.nav_ready() 挡住,显示进度而不是拿空表算出一堆看着
     合理的错数。
 
@@ -395,24 +393,6 @@ def load_qvix_self(cache_key):
     return fetcher.load_qvix_self_history()
 
 
-# 1y max drawdown as it stood on the buy date (window: buy_date-365d → buy_date),
-# on the corrected daily-return growth index (nav_series 的 ret 列) so dividend
-# NAV resets don't count as drops, while build-up-period fake-zero growth rates
-# don't hide real ones. Immutable history, so the (code, buy_date) cache never
-# needs invalidating.
-@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
-def mdd_1y_at_buy(code: str, buy_date: str):
-    _start = (pd.Timestamp(buy_date) - pd.Timedelta(days=365)).strftime("%Y-%m-%d")
-    _s = simulator.nav_series(code, _start, buy_date)
-    # 买入决策发生在当日盘中，当日净值尚未公布 — 参考窗口止于前一交易日。
-    _s = _s[_s["date"] < buy_date]
-    if len(_s) < 2:
-        return None
-    _adj = (1.0 + _s["ret"].fillna(0.0)).cumprod()
-    _peak = _adj.cummax()
-    return float(((_peak - _adj) / _peak).max() * 100.0)
-
-
 # Red bands on trading days where 上证指数 fell over 1% — the user's main
 # operating signal, drawn on any date-axis figure that covers [dmin, dmax].
 def _add_sse_drop_bands(fig, sse, dmin, dmax):
@@ -535,8 +515,8 @@ components.html("""<script>
 </script>""", height=0)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_sse, tab_table, tab_detail, tab_sim = st.tabs(
-    ["📈 上证指数", "📋 基金列表", "🔍 基金详情", "💰 模拟盘"])
+tab_sse, tab_table, tab_detail = st.tabs(
+    ["📈 上证指数", "📋 基金列表", "🔍 基金详情"])
 
 # ─── Tab 1: Table ────────────────────────────────────────────────────────────
 with tab_table:
@@ -718,7 +698,7 @@ with tab_table:
             # Bumped when the filter rules change (v3: exclude funds younger
             # than the *selected* period window; v4-v6: exclude 债券/固收/偏债
             # types, is_bond 逐步收敛为「含债或固收」; v7: 回撤改按校正收益
-            # 复利口径,与模拟盘一致; v8: 新增「最低规模」过滤 + 规模(亿)列;
+            # 复利口径; v8: 新增「最低规模」过滤 + 规模(亿)列;
             # v9: 结果不再截断前 200 条,旧条目只有前 200 行、不能再复用),
             # so stale cached results never get served.
             "rule_ver": 9,
@@ -985,23 +965,16 @@ with tab_table:
                 st.dataframe(_tbl.style.apply(_shared_row_style, axis=1),
                              use_container_width=True)
 
-        # 模拟盘在持基金常驻网格最前（无需勾选），其后是表格勾选的基金。
-        _sim_d = simulator.get_current_date()
-        _sim_codes = sorted(simulator.holdings_and_cash(_sim_d)[0]) if _sim_d else []
-        _sim_names = dict(zip(fund_df["code"], fund_df["name"]))
-        _cells = [{"基金代码": _c, "基金名称": _sim_names.get(_c, "")}
-                  for _c in _sim_codes]
+        _cells = []
         for _ri in _sel_rows:
             # 重新筛选后表格可能变短,session 里残留的旧勾选行号会越界。
             if _ri >= len(table):
                 continue
-            _frow = table.iloc[_ri]
-            if str(_frow["基金代码"]).zfill(6) not in _sim_codes:
-                _cells.append(_frow)
+            _cells.append(table.iloc[_ri])
 
         if _cells:
             st.markdown(f"##### 已选基金的最新十大持仓（截至 {_asof_lim}）")
-            st.caption("模拟盘在持基金常驻最前；取季度末 ≤ 截至日期的最新披露季度，"
+            st.caption("取季度末 ≤ 截至日期的最新披露季度，"
                        "实际公告通常滞后季度末约两周")
 
             # 两遍渲染:先取全部卡片的持仓,统计出现在 ≥2 只基金里的标的并
@@ -1180,458 +1153,6 @@ with tab_detail:
                 use_container_width=True,
                 height=560,
             )
-
-# ─── Tab 3: Paper-trading simulator ──────────────────────────────────────────
-with tab_sim:
-    if _IS_CLOUD:
-        st.info("☁️ 云端页面是每日数据快照:模拟盘操作请在本地进行,"
-                "这里的改动会在次日跑批同步后被覆盖。")
-    _code_names = dict(zip(fund_df["code"], fund_df["name"]))
-    sim_date = simulator.get_current_date()
-
-    # 模拟盘的交易日历、成交净值、持仓市值全部来自净值表。
-    if not _need_nav("模拟盘"):
-        pass
-    elif sim_date is None:
-        st.warning("本地还没有净值数据，请先点击侧边栏「🔄 更新数据」。")
-    else:
-        # Flash message from the previous action (survives st.rerun).
-        _msg = st.session_state.pop("sim_msg", None)
-        if _msg:
-            st.success(_msg)
-
-        # ── 操作条（先处理动作，再渲染下方状态）──
-        c1, c1m, c2, c2m, _sp, c3, c4 = st.columns(
-            [1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1])
-
-        def _toast_if_sse_drop(_d):
-            # 主要操作信号：落到沪指跌超1%的日子就提示——空仓时没有
-            # 持仓图表可看，这条提示是唯一入口。
-            _sse0 = load_sse_daily(fetcher.index_daily_saved_at("sse"))
-            if _sse0 is not None and not _sse0.empty:
-                _row0 = _sse0[_sse0["date"] == _d]
-                if (not _row0.empty and pd.notna(_row0["pct"].iloc[0])
-                        and _row0["pct"].iloc[0] <= -1.0):
-                    st.toast(f"{_d} 沪指下跌 "
-                             f"{_row0['pct'].iloc[0]:.2f}%", icon="🔻")
-
-        if c1.button("▶️ 推进一天", type="primary", use_container_width=True):
-            sim_date, _moved = simulator.advance_day()
-            if not _moved:
-                st.toast("已到本地数据的最新日期，无法再推进", icon="⚠️")
-            else:
-                _toast_if_sse_drop(sim_date)
-        if c1m.button("⏩ 推进一月", use_container_width=True,
-                      help="跳到一个月后的最近交易日（数据不足一个月则到最新日期）"):
-            sim_date, _moved = simulator.advance_month()
-            if not _moved:
-                st.toast("已到本地数据的最新日期，无法再推进", icon="⚠️")
-            else:
-                _toast_if_sse_drop(sim_date)
-        if c2.button("◀️ 回退一天", use_container_width=True,
-                     help="回到上一个交易日，并撤销当前这天的全部买卖"):
-            sim_date, _moved = simulator.rollback_day()
-            if not _moved:
-                st.toast("已在第一个交易日，无法回退", icon="⚠️")
-        if c2m.button("⏪ 回退一月", use_container_width=True,
-                      help="回到一个月前的最近交易日，并撤销中间所有买卖"):
-            sim_date, _moved = simulator.rollback_month()
-            if not _moved:
-                st.toast("已在第一个交易日，无法回退", icon="⚠️")
-        with c3.popover("📂 存档管理", use_container_width=True):
-            _arch_name = st.text_input(
-                "存档名称", placeholder="如：半导体轮动策略", key="arch_name")
-            if st.button("💾 保存当前模拟盘", type="primary", key="arch_save",
-                         use_container_width=True):
-                _err = simulator.save_archive(_arch_name)
-                if _err:
-                    st.error(_err)
-                else:
-                    st.session_state["sim_msg"] = (
-                        f"已存档「{_arch_name.strip() or '未命名'}」")
-                    st.rerun()
-            st.divider()
-            _up = st.file_uploader(
-                "导入交易记录 CSV", type=["csv"], key="trades_csv_up",
-                help="接受「⬇️ 导出交易记录 CSV」导出的文件；"
-                     "导入会覆盖当前模拟盘（建议先存档），"
-                     "起始日期取首笔交易日，模拟日期定位到末笔交易日。")
-            if _up is not None and st.button(
-                    "📥 导入并覆盖当前模拟盘", key="trades_csv_go",
-                    use_container_width=True):
-                try:
-                    _csv_df = pd.read_csv(_up, encoding="utf-8-sig",
-                                          dtype={"代码": str})
-                except Exception:
-                    _csv_df = None
-                if _csv_df is None:
-                    st.error("无法读取 CSV 文件")
-                else:
-                    _sumr, _err = simulator.import_trades_csv(_csv_df)
-                    if _err:
-                        st.error(_err)
-                    else:
-                        st.session_state["sim_msg"] = (
-                            f"已导入 {_sumr['n']} 笔交易"
-                            f"（{_sumr['first']} ~ {_sumr['last']}），"
-                            f"模拟日期已定位到 {_sumr['last']}")
-                        st.rerun()
-            _archs = simulator.list_archives()
-            if not _archs.empty:
-                st.divider()
-                st.caption("⚠️ 载入会覆盖当前模拟盘的全部交易与日期；"
-                           "如需保留当前进度，请先存档。")
-                for _, _a in _archs.iterrows():
-                    _aid = int(_a["id"])
-                    # Name is edited in place: change + Enter saves it.
-                    _new_name = st.text_input(
-                        "策略名称", value=_a["name"],
-                        key=f"arch_rename_{_aid}",
-                        label_visibility="collapsed",
-                        help="直接修改名称，回车保存")
-                    if _new_name.strip() and _new_name.strip() != _a["name"]:
-                        _err = simulator.rename_archive(_aid, _new_name)
-                        st.toast(_err or f"已改名为「{_new_name.strip()}」",
-                                 icon="✏️")
-                    st.caption(
-                        f"{_a['start_date']} ~ {_a['current_date']} · "
-                        f"{_a['n_trades']} 笔交易 · 存于 "
-                        + _fmt_cst(_a["saved_at"], "%m-%d %H:%M"))
-                    a1, a2, a3 = st.columns(3)
-                    if a1.button("载入", key=f"arch_load_{_a['id']}",
-                                 use_container_width=True):
-                        _err = simulator.load_archive(int(_a["id"]))
-                        st.session_state["sim_msg"] = (
-                            _err or f"已载入存档「{_a['name']}」")
-                        st.rerun()
-                    if a2.button("复制", key=f"arch_copy_{_a['id']}",
-                                 use_container_width=True,
-                                 help="复制一份副本，原方案保持不变，"
-                                      "副本可载入后继续修改"):
-                        _err = simulator.copy_archive(int(_a["id"]))
-                        st.session_state["sim_msg"] = (
-                            _err or f"已复制存档「{_a['name']}」")
-                        st.rerun()
-                    if a3.button("删除", key=f"arch_del_{_a['id']}",
-                                 use_container_width=True):
-                        simulator.delete_archive(int(_a["id"]))
-                        st.rerun()
-        with c4.popover("🗑️ 重置", use_container_width=True):
-            # 日期用纯文本输入：st.date_input 的日历浮层在 popover 里会被
-            # 盖住/误触收起（portal z-index 问题），文本框没有这些破事。
-            _min_d = simulator.earliest_nav_day()
-            _max_d = simulator.latest_trading_day()
-            _start_txt = st.text_input(
-                "起始日期",
-                value=simulator.get_start_date(),
-                key="sim_start_pick_txt",
-                help=f"格式 YYYY-MM-DD，范围 {_min_d} ~ {_max_d}；"
-                     "非交易日自动顺延到下一个交易日。")
-            st.caption("清空全部模拟交易，从上面填的起始日重新开始。")
-            if st.button("确认重置", type="primary", key="sim_reset_confirm"):
-                try:
-                    _new_start = dt.date.fromisoformat(
-                        _start_txt.strip().replace("/", "-"))
-                except ValueError:
-                    st.error("日期格式不对，请用 YYYY-MM-DD，如 2021-01-05")
-                    _new_start = None
-                if _new_start:
-                    _snapped, _err = simulator.set_start_date(_new_start.isoformat())
-                    if _err:
-                        st.error(_err)
-                    else:
-                        _note = ("" if _snapped == _new_start.isoformat()
-                                 else f"（{_new_start} 非交易日，顺延至 {_snapped}）")
-                        st.session_state["sim_msg"] = f"模拟盘已重置，从 {_snapped} 开始{_note}"
-                        st.rerun()
-
-        # ── Valuation ──
-        pos, cash = simulator.holdings_and_cash(sim_date)
-        curve = simulator.equity_curve()
-        total = float(curve["value"].iloc[-1]) if not curve.empty \
-            else simulator.INITIAL_CAPITAL
-        prev_total = float(curve["value"].iloc[-2]) if len(curve) > 1 \
-            else simulator.INITIAL_CAPITAL
-        day_pnl = total - prev_total
-        total_pnl = total - simulator.INITIAL_CAPITAL
-
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("模拟日期", sim_date)
-        m2.metric("总资产", f"¥{total:,.0f}", delta=f"{day_pnl:+,.0f} 当日")
-        m3.metric("现金", f"¥{cash:,.0f}")
-        m4.metric("总收益", f"¥{total_pnl:+,.0f}")
-        m5.metric("总收益率", f"{total_pnl / simulator.INITIAL_CAPITAL * 100:+.2f}%")
-        # 沪指 stays visible even with no holdings — it's the operating
-        # signal; without it an empty-portfolio day hides whether 上证 fell.
-        _sse_all = load_sse_daily(fetcher.index_daily_saved_at("sse"))
-        if _sse_all is not None and not _sse_all.empty:
-            _upto = _sse_all[_sse_all["date"] <= sim_date]
-            if not _upto.empty:
-                _r = _upto.iloc[-1]
-                m6.metric(
-                    "上证指数" + ("" if _r["date"] == sim_date
-                                  else f"（{_r['date']}）"),
-                    f"{_r['close']:,.0f}",
-                    delta=(f"{_r['pct']:+.2f}% 当日"
-                           if pd.notna(_r["pct"]) else None))
-        st.caption(
-            f"从 {simulator.get_start_date()} 开始 · "
-            f"初始资金 ¥{simulator.INITIAL_CAPITAL:,.0f} · "
-            "按当日单位净值成交，不计手续费 · 回退一天会撤销当天的全部买卖 · "
-            "起始日期可在「重置」中修改")
-
-        st.divider()
-        hold = simulator.holdings_table(sim_date)
-        trades = simulator.trades_table(sim_date)
-
-        # ── 图表与持仓表现数据（先构建，再进布局）──
-        # Each line starts at that position's entry day at 0% and compounds
-        # the fund's official DAILY RETURNS (dividend-adjusted), not the raw
-        # unit NAV — a payout day resets the unit NAV (looks like a -10%
-        # cliff) while the actual daily return stays ordinary. History stops
-        # at the simulated date — no peeking at the future.
-        fig_ret, _dd_rows = None, []
-        if not hold.empty:
-            _frames = []
-            for _, _h in hold.iterrows():
-                _c = _h["code"]
-                if not _h["open_nav"]:
-                    continue
-                _s = simulator.nav_series(_c, _h["open_date"], sim_date)
-                if _s.empty:
-                    continue
-                # Growth index anchored at 1 on the entry day (the entry
-                # day's own return predates the EOD fill, so it's divided
-                # out); missing returns count as flat. `ret` is the corrected
-                # daily return (see fetcher.effective_daily_ret).
-                _g = (1.0 + _s["ret"].fillna(0.0)).cumprod()
-                _g = _g / _g.iloc[0]
-                _frames.append(_s.assign(
-                    adj=_g,
-                    cum_ret=(_g - 1.0) * 100.0,
-                    fund=f"{_c} {_code_names.get(_c, '')}",
-                ))
-            if _frames:
-                _rets = pd.concat(_frames, ignore_index=True)
-                fig_ret = px.line(
-                    _rets, x="date", y="cum_ret", color="fund",
-                    title=f"持仓基金累计收益率（自各自买入日起，截至 {sim_date}）",
-                    labels={"date": "日期", "cum_ret": "累计收益率（%）",
-                            "fund": "基金"},
-                    height=380,
-                    color_discrete_sequence=[
-                        "#4269D0", "#EFB118", "#FF725C", "#6CC5B0",
-                        "#3CA951", "#FF8AB7", "#A463F2", "#97BBF5",
-                    ],
-                )
-                fig_ret.update_traces(
-                    line=dict(width=2),
-                    mode="lines+markers", marker=dict(size=8),
-                    hovertemplate="%{y:+.2f}%<extra>%{fullData.name}</extra>",
-                )
-                fig_ret.add_hline(
-                    y=0, line_dash="dot", line_color="gray", opacity=0.5)
-                fig_ret.update_layout(
-                    hovermode="x unified", hoverdistance=-1,
-                    spikedistance=-1)
-                # Ticks: at least one day apart (~8 ticks over the span),
-                # so a short history never falls back to hour-level ticks
-                # that would all render as the same date.
-                _rdates = pd.to_datetime(_rets["date"])
-                _span_d = max((_rdates.max() - _rdates.min()).days, 1)
-                fig_ret.update_xaxes(
-                    showspikes=True, spikemode="across", spikesnap="data",
-                    spikedash="dot", spikethickness=1,
-                    hoverformat="%Y-%m-%d", tickformat="%Y-%m-%d",
-                    dtick=max(1, _span_d // 8) * 86400000)
-
-                _add_sse_drop_bands(fig_ret, load_sse_daily(fetcher.index_daily_saved_at("sse")),
-                                    _rdates.min(), _rdates.max())
-
-                # Max drawdown since each position's buy date, from the same
-                # daily-return growth index the chart uses (so a dividend's
-                # NAV reset never counts as a drawdown), plus the fund's 1y
-                # max drawdown as it stood on the buy date for comparison.
-                _open_dates = dict(zip(hold["code"], hold["open_date"]))
-                for _f in _frames:
-                    _peak = _f["adj"].cummax()
-                    _mdd = ((_peak - _f["adj"]) / _peak).max() * 100.0
-                    # Run-up: current rise from the lowest point since the
-                    # position was opened, on the same growth index.
-                    _low = float(_f["adj"].min())
-                    _mru = (float(_f["adj"].iloc[-1]) / _low - 1.0) * 100.0
-                    _ret = float(_f["cum_ret"].iloc[-1])
-                    _label = _f["fund"].iloc[0]
-                    _c = _label.split()[0]
-                    _ref = mdd_1y_at_buy(_c, str(_open_dates[_c]))
-                    _dd_rows.append((_label, _ret, _mdd, _mru, _ref))
-                _dd_rows.sort(key=lambda r: r[2], reverse=True)
-
-        # ── 布局：左 = 图表/持仓/交易记录，右 = 交易面板 + 持仓表现 ──
-        col_main, col_side = st.columns([2.8, 1.1], gap="medium")
-
-        with col_side:
-            st.markdown("##### 🛒 交易")
-            with st.form("sim_buy", clear_on_submit=True):
-                st.markdown("**买入**")
-                buy_code = st.text_input("基金代码", placeholder="如 000001")
-                buy_amt = st.number_input(
-                    "金额（元）", min_value=0.0, value=100000.0, step=10000.0)
-                if st.form_submit_button("买入", use_container_width=True):
-                    if not buy_code.strip():
-                        st.error("请输入基金代码")
-                    else:
-                        _code = buy_code.strip().zfill(6)
-                        _err = simulator.buy(_code, buy_amt)
-                        if _err:
-                            st.error(_err)
-                        else:
-                            st.session_state["sim_msg"] = (
-                                f"已买入 {_code} {_code_names.get(_code, '')} "
-                                f"¥{buy_amt:,.0f}")
-                            st.rerun()
-            with st.form("sim_sell", clear_on_submit=True):
-                st.markdown("**卖出**")
-                _held = list(pos.keys())
-                sell_pick = st.selectbox(
-                    "持仓基金", options=_held,
-                    format_func=lambda c: (
-                        f"{c} {_code_names.get(c, '')}"
-                        f"（{pos[c][0]:,.2f} 份）"),
-                ) if _held else st.selectbox("持仓基金", options=["（暂无持仓）"])
-                sell_all = st.checkbox("全部卖出", value=True)
-                sell_shares = st.number_input(
-                    "卖出份额（未勾选全部时生效）",
-                    min_value=0.0, value=0.0, step=1000.0)
-                if st.form_submit_button("卖出", use_container_width=True):
-                    if not _held:
-                        st.error("当前没有持仓")
-                    else:
-                        _err = simulator.sell(
-                            sell_pick, None if sell_all else sell_shares)
-                        if _err:
-                            st.error(_err)
-                        else:
-                            st.session_state["sim_msg"] = (
-                                f"已卖出 {sell_pick} "
-                                f"{_code_names.get(sell_pick, '')}")
-                            st.rerun()
-
-        with col_main:
-            if fig_ret is not None:
-                _chart_col, _dd_col = st.columns([3, 1.4])
-                with _chart_col:
-                    st.plotly_chart(fig_ret, use_container_width=True)
-                    st.caption("🔻 红色竖带 = 上证指数当日下跌超 1%")
-                with _dd_col:
-                    st.markdown(
-                        "**📊 持仓表现（自买入）**",
-                        help="总收益率、当前最大前进（当前净值相对买入以来最低点"
-                             "的涨幅）、最大回撤均自买入日起算；最后一行为"
-                             "买入时点的近1年最大回撤，作为比较基准：回撤或"
-                             "亏损幅度超过它时红色提示，当前最大前进超过它时"
-                             "绿色标记。")
-                    _RED, _GREEN, _GRAY = "#e0454b", "#21a366", "#8a8f98"
-
-                    def _dd_line(label, value, color, bold=False):
-                        return (
-                            "<div style='display:flex;justify-content:"
-                            "space-between;font-size:0.82rem;"
-                            "line-height:1.7;'>"
-                            f"<span style='color:{_GRAY};'>{label}</span>"
-                            f"<span style='color:{color};"
-                            f"font-weight:{600 if bold else 400};"
-                            f"font-variant-numeric:tabular-nums;'>"
-                            f"{value}</span></div>")
-
-                    for _name, _ret, _mdd, _mru, _ref in _dd_rows:
-                        _dd_over = _ref is not None and _mdd > _ref
-                        _ret_over = (_ref is not None
-                                     and _ret < 0 and -_ret > _ref)
-                        _mru_over = _ref is not None and _mru > _ref
-                        _alarm = _dd_over or _ret_over
-                        _border = _RED if _alarm else "rgba(128,128,128,.3)"
-                        _rows = (
-                            _dd_line("总收益率", f"{_ret:+.2f}%",
-                                     _RED if _ret < 0 else _GREEN,
-                                     bold=_ret_over)
-                            + _dd_line("当前最大前进", f"+{_mru:.2f}%",
-                                       _GREEN if _mru_over else "inherit",
-                                       bold=_mru_over)
-                            + _dd_line("最大回撤", f"-{_mdd:.2f}%",
-                                       _RED if _dd_over else "inherit",
-                                       bold=_dd_over)
-                            + _dd_line("买入时近1年回撤",
-                                       (f"-{_ref:.2f}%"
-                                        if _ref is not None else "无数据"),
-                                       _GRAY))
-                        st.markdown(
-                            "<div style='border:1px solid "
-                            f"{_border};border-radius:8px;"
-                            "padding:6px 10px;margin-bottom:8px;'>"
-                            "<div style='font-size:0.84rem;"
-                            "font-weight:600;margin-bottom:2px;'>"
-                            f"{'⚠️ ' if _alarm else ''}{_name}</div>"
-                            f"{_rows}</div>",
-                            unsafe_allow_html=True)
-
-            # ── Holdings ──
-            st.markdown(f"#### 📦 当前持仓（{len(hold)} 只）")
-            if hold.empty:
-                st.info("暂无持仓，全部为现金。")
-            else:
-                st.dataframe(pd.DataFrame({
-                    "代码": hold["code"],
-                    "名称": hold["code"].map(_code_names),
-                    "买入日期": hold["open_date"],
-                    "成本(¥)": hold["cost"].round(2),
-                    "当日收益率(%)": pd.to_numeric(
-                        hold["day_ret"], errors="coerce").round(2),
-                    "净值日期": hold["nav_date"],
-                    "市值(¥)": hold["value"].round(2),
-                    "盈亏(¥)": hold["pnl"].round(2),
-                    "盈亏(%)": hold["pnl_pct"].round(2),
-                }).reset_index(drop=True), use_container_width=True)
-
-            # ── Trade log ──
-            with st.expander(f"📜 交易记录（{len(trades)} 笔）"):
-                if trades.empty:
-                    st.caption("还没有交易。")
-                else:
-                    _trades_view = pd.DataFrame({
-                        "日期": trades["date"],
-                        "操作": trades["action"].map(
-                            {"buy": "买入", "sell": "卖出"}),
-                        "代码": trades["code"],
-                        "名称": trades["code"].map(_code_names),
-                        "份额": trades["shares"].round(2),
-                        "成交净值": trades["nav"],
-                        "金额(¥)": trades["amount"].round(2),
-                        "卖出盈亏(¥)": pd.to_numeric(
-                            trades["pnl"], errors="coerce").round(2),
-                        "卖出盈亏(%)": pd.to_numeric(
-                            trades["pnl_pct"], errors="coerce").round(2),
-                    }).iloc[::-1].reset_index(drop=True)
-
-                    # 卖出行按已实现盈亏上色：绿=盈利卖出，红=亏损卖出
-                    # （与持仓表现卡一致：绿好红坏）。
-                    def _sell_row_style(row):
-                        if row["操作"] == "卖出" and pd.notna(row["卖出盈亏(¥)"]):
-                            _c = "#21a366" if row["卖出盈亏(¥)"] >= 0 else "#e0454b"
-                            return [f"color: {_c}; font-weight: 600"] * len(row)
-                        return [""] * len(row)
-
-                    st.dataframe(
-                        _trades_view.style.apply(_sell_row_style, axis=1)
-                        .format(precision=2, na_rep=""),
-                        use_container_width=True)
-                    # utf-8-sig BOM so Excel opens the CSV with correct 中文.
-                    st.download_button(
-                        "⬇️ 导出交易记录 CSV",
-                        _trades_view.to_csv(index=False).encode("utf-8-sig"),
-                        file_name=f"模拟盘交易记录_{sim_date}.csv",
-                        mime="text/csv",
-                    )
 
 # ─── Tab 4: SSE index ────────────────────────────────────────────────────────
 with tab_sse:

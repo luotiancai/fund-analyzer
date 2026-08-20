@@ -82,7 +82,6 @@ _LEGACY_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 #   rank        fund_rank.db       每日跑批        日          要
 #   market      market.db          跑批+本地QVIX   日          要
 #   strategy    fund_strategy.db   本地回测        手动        要
-#   sim         sim.db             线上 app        随时        要
 #   cache       cache.db           线上 app        随时        丢了自动重建
 #   nav         fund_nav.db        每日跑批        日          不要(233MB)
 #   scale       fund_scale.db      每日跑批        季          不要(13.7MB)
@@ -97,8 +96,6 @@ DB_LAYOUT = (
      ("index_daily_cache", "qvix_self_history"), False),
     ("strategy", "fund_strategy.db",
      ("strategy_runs", "backtest_notes"), False),
-    ("sim", "sim.db",
-     ("sim_trades", "sim_meta", "sim_archives"), False),
     ("cache", "cache.db",
      ("filter_results",), False),
     ("nav", "fund_nav.db",
@@ -154,8 +151,8 @@ def _migrate_db_location():
         except OSError:
             pass
 # 26h:榜单本质是每日数据,由 update_daily.py/「更新数据」按钮强制刷新;
-# 留 2h 余量给每日节奏。此前 1h 会让盘中任意交互(如模拟盘买入触发的
-# rerun)穿透缓存、现场全量重拉榜单卡住页面几十秒,还把标签页顶回首页。
+# 留 2h 余量给每日节奏。此前 1h 会让盘中任意交互触发的 rerun 穿透缓存、
+# 现场全量重拉榜单卡住页面几十秒,还把标签页顶回首页。
 FUND_LIST_TTL = 26 * 3600
 NAV_TTL = 86400         # 24 hours
 NAV_START = "2018-01-01"  # NAV history is kept from this date onward
@@ -332,33 +329,6 @@ _DDL = {
         buy_date TEXT PRIMARY KEY, note TEXT, saved_at REAL);
 """,
 
-"sim": """
-    -- 模拟盘。权威写入方是**线上 app**(用户点击), 跟其余全部由跑批写的表
-    -- 不同, 所以必须独立成库: 混在一起的话, 本地推一次库就把线上用户的
-    -- 操作盖掉了。
-    -- 交易流水是唯一真相来源, 持仓和现金都从它推算。
-    CREATE TABLE IF NOT EXISTS sim.sim_meta (
-        key   TEXT PRIMARY KEY,
-        value TEXT
-    );
-    CREATE TABLE IF NOT EXISTS sim.sim_trades (
-        id     INTEGER PRIMARY KEY AUTOINCREMENT,
-        date   TEXT NOT NULL,
-        code   TEXT NOT NULL,
-        action TEXT NOT NULL,      -- 'buy' | 'sell'
-        shares REAL NOT NULL,
-        nav    REAL NOT NULL,      -- execution unit NAV
-        amount REAL NOT NULL       -- buy: cash spent; sell: cash received
-    );
-    CREATE TABLE IF NOT EXISTS sim.sim_archives (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        name         TEXT NOT NULL,
-        saved_at     REAL NOT NULL,
-        current_date TEXT,
-        trades       TEXT NOT NULL,  -- JSON dump of sim_trades rows
-        start_date   TEXT
-    );
-""",
 
 "cache": """
     -- Top rows (200) of each distinct filter run, keyed by a hash of the
@@ -461,11 +431,6 @@ def init_db():
             conn.execute(f"ALTER TABLE rank.fund_sharpe DROP COLUMN {col}")
         except sqlite3.OperationalError:
             pass  # 列不存在(新库)或 SQLite 太老
-    # sim_archives.start_date 同理(simulator 里原来单独 ALTER 的那列)。
-    try:
-        conn.execute("ALTER TABLE sim.sim_archives ADD COLUMN start_date TEXT")
-    except sqlite3.OperationalError:
-        pass
     _migrate_nav_blobs(conn)
     conn.commit()
     conn.close()
@@ -676,10 +641,10 @@ def _period_return(df: pd.DataFrame, days_back: int) -> Optional[float]:
 
 def _period_mdd(df: pd.DataFrame, days_back: int) -> Optional[float]:
     """Max drawdown over the trailing `days_back` window, 按校正日收益率的
-    复利增长指数计算(分红视作再投),与模拟盘 mdd_1y_at_buy 同口径。
+    复利增长指数计算(分红视作再投)。
 
     此前用累计净值:它把历史分红单利加回,对分红基金会低估回撤
-    (002583 近1年 14.51% vs 复利口径 16.45%),导致表格与模拟盘对不上。
+    (002583 近1年 14.51% vs 复利口径 16.45%)。
     需要 df 已带校正收益列 r(_metrics_from_nav 保证)。"""
     window = _window_by_date(df, days_back)
     if window is None:

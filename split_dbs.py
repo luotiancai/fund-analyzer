@@ -118,7 +118,7 @@ def main():
             print(f"    {z}: {_count(dst, z, 'legacy'):,} 行")
 
     if not check_only:
-        # 派生索引: 净值按日期查(模拟盘的交易日历、回测的区间取数都要)。
+        # 派生索引: 净值按日期查(回测的区间取数要)。
         print("\n建 nav.idx_nav_date …", end="", flush=True)
         ti = time.time()
         dst.execute("CREATE INDEX IF NOT EXISTS nav.idx_nav_date "

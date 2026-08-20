@@ -19,7 +19,6 @@ QVIX 也得整段拉, 于是实际上从来不同步, 本地库一路飘。现�
 
 注意本地和云端**权威方不同的库**不在默认组里:
   · strategy 是你本地跑回测写的 —— 拉下来会盖掉你还没推的跑批;
-  · sim 的权威方是线上 app;
   · cache 是缓存, 拉了没意义。
 要拉这些得显式点名。
 
@@ -39,7 +38,7 @@ import fetcher        # noqa: E402
 
 # 日常同步组: 只有"云端是权威、本地纯消费"且小的库。
 DAILY = ("market", "rank")
-# --all 再加上大库。strategy/sim/cache 任何时候都不自动拉(见 docstring)。
+# --all 再加上大库。strategy/cache 任何时候都不自动拉(见 docstring)。
 ALL = DAILY + ("scale", "nav")
 
 
