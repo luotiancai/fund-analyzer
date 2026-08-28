@@ -31,7 +31,7 @@ import cloud_assets   # noqa: E402
 import fetcher        # noqa: E402
 
 # 默认拉的小库(合计约 2MB)。大库(nav/scale)要 --full。cache 不看。
-SMALL_DBS = ("rank", "market", "strategy")
+SMALL_DBS = ("rank", "qvix", "market", "strategy")
 BIG_DBS = ("nav", "scale")
 
 # 体检项: (表名, 说明, 新鲜度 SQL 或 None)

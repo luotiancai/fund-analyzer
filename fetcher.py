@@ -92,8 +92,20 @@ DB_LAYOUT = (
     ("rank", "fund_rank.db",
      ("fund_list", "fund_sharpe", "fund_nav_meta", "app_meta",
       "fund_index_code", "etf_target_map"), False),
+    # qvix 单独一个库, 而且排在 market 前面 —— 两条都是刻意的。
+    # 单独一个库: 它的权威写入方不再是云端跑批, 而是国内那台 VPS。上交所的
+    # 期权风险指标接口挡 GitHub runner 的境外 IP(2026-08-28 实测: 同一时刻
+    # 本机和 VPS 都拿得到 656 条合约, runner 上三次重试全失败, 报文分别是
+    # 非 JSON 错误页和 connection reset)。跟 index_daily_cache 挤在
+    # market.db 里的话, 跑批和 VPS 两个写入方推同一个文件, 谁后推谁把对方
+    # 盖掉 —— 正是 2026-08-05 那类事故。分开之后 VPS 独占 qvix.db, 跑批
+    # 碰都不碰。
+    # 排在 market 前面: 迁移期线上那份 market.db 里还留着一张同名的
+    # qvix_self_history, 而不带库名的表名解析是按 ATTACH 顺序走的(先挂的先
+    # 命中, 实测过), 排前面保证读写都落在新库上, 旧那张只是死重量。
+    ("qvix", "qvix.db", ("qvix_self_history",), False),
     ("market", "market.db",
-     ("index_daily_cache", "qvix_self_history"), False),
+     ("index_daily_cache",), False),
     ("strategy", "fund_strategy.db",
      ("strategy_runs", "backtest_notes"), False),
     ("cache", "cache.db",
@@ -298,12 +310,7 @@ _DDL = {
     );
 """,
 
-"market": """
-    -- 外部指数/波动率日线缓存, 一个 key 一整块 JSON。key: sse(上证)、
-    -- hsi/vhsi(恒生及其波动率)、ixic/vix、au9999/gvz、qvix(外部源)。
-    -- sse/hsi/vhsi 每日跑批刷新, 其余按 TTL 惰性拉。
-    CREATE TABLE IF NOT EXISTS market.index_daily_cache (
-        key TEXT PRIMARY KEY, data TEXT, saved_at REAL);
+"qvix": """
     -- 自算 QVIX 日频历史 + 当日阈值(490交易日90分位)。策略的信号判定读它。
     -- ⚠️ QVIX 不分方向: 暴跌暴涨都推高它(与上证日涨跌相关系数仅 -0.19,
     -- 97个信号日里 55% 发生在上涨日)。2026-08 试过加一列 skew(虚值认沽IV
@@ -313,8 +320,16 @@ _DDL = {
     -- 笔"新增信号"复利 -6.08%、胜率 3/10 —— 平静期(QVIX 12~13)skew 冲高多
     -- 半是期权卖方结构(备兑压低认购IV)造成的, 不是真有人抢买保护, 进场后
     -- 没有恐慌就没有反弹可吃, 只能原地漂到止损。
-    CREATE TABLE IF NOT EXISTS market.qvix_self_history (
+    CREATE TABLE IF NOT EXISTS qvix.qvix_self_history (
         date TEXT PRIMARY KEY, qvix REAL, note TEXT, threshold REAL);
+""",
+
+"market": """
+    -- 外部指数/波动率日线缓存, 一个 key 一整块 JSON。key: sse(上证)、
+    -- hsi/vhsi(恒生及其波动率)、ixic/vix、au9999/gvz、qvix(外部源)。
+    -- sse/hsi/vhsi 每日跑批刷新, 其余按 TTL 惰性拉。
+    CREATE TABLE IF NOT EXISTS market.index_daily_cache (
+        key TEXT PRIMARY KEY, data TEXT, saved_at REAL);
 """,
 
 "strategy": """

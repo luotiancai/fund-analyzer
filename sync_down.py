@@ -37,7 +37,10 @@ import cloud_assets   # noqa: E402
 import fetcher        # noqa: E402
 
 # 日常同步组: 只有"云端是权威、本地纯消费"且小的库。
-DAILY = ("market", "rank")
+# qvix 在组里但要留神: 它的权威写入方是 VPS 不是云端跑批。本机只读它
+# 的话照拉不误; 万一在本机回填过 QVIX 历史, 规矩跟 market 一样 ——
+# 先 push_dbs.py qvix 推上去再拉, 否则整库替换会把没推的那批冲掉。
+DAILY = ("qvix", "market", "rank")
 # --all 再加上大库。strategy/cache 任何时候都不自动拉(见 docstring)。
 ALL = DAILY + ("scale", "nav")
 

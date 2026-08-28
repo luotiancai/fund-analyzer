@@ -16,7 +16,7 @@ Pipeline (fetcher.run_pipeline):
 用法
   手动:     python3 update_daily.py
   仅重算:    python3 update_daily.py --recompute-only
-  仅补QVIX:  python3 update_daily.py --qvix-only   (见 run_qvix_only 说明)
+  仅补QVIX:  python3 update_daily.py --qvix-only   (VPS 专用, 见 run_qvix_only)
   仅刷规模:   python3 update_daily.py --scales-only (规模覆盖范围扩大后补全用)
   cron:      0 18 * * 1-5  cd /path/to/fund-analyzer && python3 update_daily.py >> update.log 2>&1
 """
@@ -47,7 +47,7 @@ def _log_progress(phase, done, total):
 
 def _qvix_dates_with_value() -> set:
     """qvix_self_history 里**已经有值**(qvix 非空)的日期集合。
-    用来判断一次补跑到底补上了什么:没补上任何东西就不必回传 82MB 的库。"""
+    用来判断一次补跑到底补上了什么:没补上任何东西就不必推一次库。"""
     hist = fetcher.load_qvix_self_history()
     if hist is None:
         return set()
@@ -68,20 +68,22 @@ def _emit_gha_output(**kv) -> None:
         log.warning("写 GITHUB_OUTPUT 失败(不影响补跑结果): %s", e)
 
 
-def run_qvix_only() -> None:
-    """只补自算QVIX,不碰基金净值、不刷指数缓存。
+def run_qvix_only() -> list:
+    """只补自算QVIX,不碰基金净值、不刷指数缓存。返回本次补上的日期列表。
 
-    为什么单独有这么一条路径:凌晨那次跑批撞上上交所期权风险指标接口抽风时
-    (2026-07-29、07-31 都栽在这上面,近5次里两次),当天的 QVIX 会在
-    qvix_self_history 里留一个空值,而页面取的是最后一个非空值——于是线上
-    整天显示前一天的数。update_qvix_self_daily 本身带"补最近15天空值"的自愈
-    逻辑,但它只在下一次跑批时才执行,那要等到次日凌晨;周五晚上失败的话
-    整个周末都补不上。所以在北京时间早上6点再跑一次,接口这个点基本都正常了。
+    **这条路径现在是 QVIX 的唯一生产者, 跑在国内那台 VPS 上**(2026-08-28
+    改)。原因是上交所的期权风险指标接口挡 GitHub runner 的境外 IP:那天同一
+    时刻本机和 VPS 都拿得到 656 条合约, runner 上三次重试全失败(报文分别是
+    非 JSON 错误页和 connection reset)。云端跑批从此不碰 QVIX, 它写的
+    qvix.db 也不由跑批发布 —— 一张表一个写入方, 没有互相覆盖的机会。
 
-    幂等:update_qvix_self_daily 是 INSERT OR REPLACE,凌晨那次已经成功的话
-    这里算出来是同一个数,没有副作用,只是白算十几秒。也正因为大部分早上都是
-    白跑,这里会把"到底补上了哪几天"写进 step output,让 workflow 只在真补上
-    了值的时候才回传数据库。"""
+    配套的 qvix-retry.yml(原来北京早上6点在 GitHub 上补跑一次)同时删掉了:
+    换个时间点再试一遍解决不了 IP 被挡, 只是每天多一条绿色的空跑记录。
+
+    幂等:update_qvix_self_daily 是 INSERT OR REPLACE, 重复跑算出来是同一个
+    数, 没有副作用。它自带"补最近15天空值"的自愈逻辑, 所以 VPS 关机几天再
+    开机, 一次就把断档补齐。返回的日期列表用来决定要不要推库 —— 什么都没
+    补上就不必为一个没变的库走一趟 0.3MB 的上传和回读验证。"""
     before = _qvix_dates_with_value()
     vix, note = fetcher.update_qvix_self_daily()
     filled = sorted(_qvix_dates_with_value() - before)
@@ -98,6 +100,7 @@ def run_qvix_only() -> None:
 
     _emit_gha_output(changed=str(bool(filled)).lower(),
                      filled=",".join(filled))
+    return filled
 
 
 def main():
@@ -105,7 +108,7 @@ def main():
     parser.add_argument("--recompute-only", action="store_true",
                         help="跳过下载,只用已存净值重算年化/回撤/收益率")
     parser.add_argument("--qvix-only", action="store_true",
-                        help="只补自算QVIX,不跑基金净值/指数(早间补跑用)")
+                        help="只补自算QVIX,不跑基金净值/指数(VPS 上每日跑这条)")
     parser.add_argument("--scales-only", action="store_true",
                         help="只刷基金季度规模,不跑净值/指数/QVIX"
                              "(规模覆盖范围扩大后的一次性补全用)")
@@ -149,34 +152,24 @@ def main():
         except Exception as e:
             log.warning("   基金规模刷新失败(不影响主流程): %s", e)
 
-    # ── 指数刷新 + QVIX自算 + 动态恐慌阈值 ──────────────────────────────────
-    # 上证指数刷新照旧(app 侧无过期时间,只在这里force_refresh才变)。QVIX
-    # 不再用 optbbs——那是免费QVIX源里唯一一家,却发布延迟常年到次日上午、
-    # 还偶发整天返回空值,而且历史极端行情日交叉验证对不上(见
-    # qvix_calc.py 顶部说明),已不再信任。改用
-    # fetcher.update_qvix_self_daily():上交所官方期权风险指标现算,写入
-    # 独立的 qvix_self_history 表,阈值也是照这份自算历史现算的。
-    log.info("刷新指数缓存(上证/恒生/VHSI)+ 自算QVIX…")
+    # ── 指数刷新 ────────────────────────────────────────────────────────────
+    # 上证指数刷新照旧(app 侧无过期时间,只在这里force_refresh才变)。
+    #
+    # **QVIX 不在这里算了**(2026-08-28 移走)。上交所的期权风险指标接口挡
+    # GitHub runner 的境外 IP:同一时刻本机和国内 VPS 都拿得到 656 条合约,
+    # runner 上三次重试全失败。QVIX 因此拆成独立的 qvix.db、权威写入方改成
+    # 国内那台 VPS(见 fetcher.DB_LAYOUT)。跑批既不下载 qvix.db 也不发布它,
+    # 在这儿硬算只有害处:每天往表里留一行空值,而那行空值又会被 VPS 那侧
+    # "补最近15天空值"的自愈逻辑当成活儿反复重试。
+    log.info("刷新指数缓存(上证/恒生/VHSI)…")
     try:
         sse = fetcher.fetch_sse_daily(force_refresh=True)
         fetcher.fetch_hsi_daily(force_refresh=True)
         fetcher.fetch_vhsi_daily(force_refresh=True)
-        vix, note = fetcher.update_qvix_self_daily()
-        hist = fetcher.load_qvix_self_history()
-        thr = None
-        if hist is not None:
-            row = hist.dropna(subset=["threshold"])
-            if not row.empty:
-                thr = float(row["threshold"].iloc[-1])
-        if sse is not None and vix is not None and thr is not None:
+        if sse is not None:
             s_last = sse.iloc[-1]
-            triggered = vix > thr
-            log.info("   上证 %s 收 %.0f(%+.2f%%) · QVIX(自算) %.2f · 恐慌阈值(2年90分位) %.2f%s",
-                     s_last["date"], s_last["close"], s_last["pct"],
-                     vix, thr,
-                     " · 🔔 B点触发(QVIX破阈值)" if triggered else "")
-        elif vix is None:
-            log.warning("   QVIX 自算未成功: %s", note)
+            log.info("   上证 %s 收 %.0f(%+.2f%%)",
+                     s_last["date"], s_last["close"], s_last["pct"])
     except Exception as e:
         log.warning("   指数刷新失败(不影响基金跑批): %s", e)
 

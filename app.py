@@ -86,7 +86,7 @@ _ASSET = {name: _DB_BASE + fn + ".gz"
           for name, fn, _t, _l in fetcher.DB_LAYOUT}
 _MARKER = {name: fetcher.DB_PATH[name] + ".from-release"
            for name, _fn, _t, _l in fetcher.DB_LAYOUT}
-_EAGER_DBS = ("rank", "market", "strategy")
+_EAGER_DBS = ("rank", "qvix", "market", "strategy")
 _LAZY_DBS = fetcher.LAZY_DBS          # ("nav", "scale")
 # 惰性库的 gz 大小, 只用于按钮上那句提示("要下多少") —— 会随数据增长慢慢
 # 变大, 差个几 MB 无所谓, 不值得为了准确去 HEAD 一次(那本身就是一次请求)。

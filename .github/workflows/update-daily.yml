@@ -3,9 +3,8 @@ name: 每日数据跑批
 on:
   schedule:
     # 18:37 UTC = 北京次日 02:37:周二至周六凌晨跑。前一交易日 15:00 收盘,
-    # 到凌晨2点半已过去11个半小时——基金净值(通常当晚20:00~23:00公布)、上证
-    # 日线、上交所期权风险指标(自算QVIX的数据源)都已发布。早上打开页面时数据
-    # 早就就绪, 不会撞上跑批还没跑完的空窗。
+    # 到凌晨2点半已过去11个半小时——基金净值(通常当晚20:00~23:00公布)和上证
+    # 日线都已发布。早上打开页面时数据早就就绪, 不会撞上跑批还没跑完的空窗。
     # 周日/周一凌晨对应周六/周日, 没有新净值, 不跑。
     #
     # 分钟数必须错开整点: 原来写的 0 17 命中了 GitHub 全球调度高峰, 实测每次
@@ -13,8 +12,12 @@ on:
     # 都没分到托管 runner, job 一步没跑就被判 cancelled(公共仓库的免费 job 在
     # runner 分配队列里优先级最低)。整点是最挤的, 别再往回改。
     #
-    # 注: 万一某天数据还没发布, update_qvix_self_daily 有"补最近15天空值"的
-    # 自愈逻辑, 下一次跑批会自动补上, 不需要为此把时间往后推。
+    # ⚠️ schedule 这个闹钟本身不可靠, 别把它当唯一触发源。2026-08-10 起当前
+    # cron 的 13 次排期实测: 中位迟 39 分钟, 最坏迟 151 分钟, 而 2026-08-27
+    # 那次**整个被丢掉**——没有失败记录, 没有 job, 什么都没有, 数据就那么停在
+    # 前一天。GitHub 官方文档写明拥堵时 "some queued jobs may be dropped"。
+    # 分钟数早就错开整点了, 那条建议已经用尽, 别再往这个方向调。要根治得靠
+    # 外部触发(workflow_dispatch 是同步建 run 的, 不经过这个会丢事件的定时器)。
     - cron: "37 18 * * 1-5"
   workflow_dispatch:      # 手动触发测试 / 单项补数据用
     inputs:
@@ -29,10 +32,11 @@ on:
 permissions:
   contents: write   # gh release upload 需要
 
-# 跟 qvix-retry.yml(北京早上6点的 QVIX 补跑)共用一个并发组:两个 workflow
-# 都是"下载 release 库 → 改 → 传回",同时跑会互相覆盖。共用并发组让后到的
-# 那个排队等前一个跑完,而不是并行。cancel-in-progress 必须是 false——取消
-# 跑到一半的跑批等于白跑几十分钟还什么都没写回去。
+# 并发组保留(现在组里只剩这一个 workflow —— qvix-retry.yml 已于 2026-08-28
+# 删除, QVIX 改由国内 VPS 独占产出)。留着是因为手动 workflow_dispatch 和
+# 定时那次完全可能撞上: 两次都是"下载 release 库 → 改 → 传回", 并行就会互相
+# 覆盖。让后到的排队等前一个跑完。cancel-in-progress 必须是 false——取消跑到
+# 一半的跑批等于白跑几十分钟还什么都没写回去。
 concurrency:
   group: fund-analyzer-db
   cancel-in-progress: false
@@ -59,6 +63,10 @@ jobs:
         # strategy 也不取: 权威写入方是本地回测, 跑批只读不写, 取回来再传
         # 回去只会平白增加覆盖它的机会。
         run: |
+          # 列表里**没有 qvix.db**, 这是刻意的: 它的权威写入方是国内那台
+          # VPS(上交所接口挡 runner 的境外 IP, 见 fetcher.DB_LAYOUT)。跑批
+          # 既不读它也不写它, 更不能传它 —— 传了就是拿一份空库盖掉 VPS 的
+          # 成果。
           mkdir -p "$FUND_ANALYZER_DATA"
           for db in fund_rank market fund_nav fund_scale; do
             if gh release download data --pattern "$db.db.gz" \
@@ -71,7 +79,7 @@ jobs:
             fi
           done
 
-      - name: 跑批(增量补净值 + 重算指标 + 刷新上证/QVIX)
+      - name: 跑批(增量补净值 + 重算指标 + 刷新上证)
         # scales-only 只刷规模,别的一概不碰;定时触发没有 inputs,默认 full。
         run: |
           if [ "${{ github.event.inputs.mode }}" = "scales-only" ]; then
