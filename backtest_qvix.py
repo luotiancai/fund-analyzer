@@ -20,6 +20,7 @@ from datetime import timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fetcher
+import qvix_calc
 
 # 数据分成若干独立的库(见 fetcher.DB_LAYOUT), 连接统一走 fetcher._conn():
 # 它把各库 ATTACH 到一个连接上, 不带库名的表名照常解析, 所以下面的 SQL
@@ -933,9 +934,22 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
         signals = qvix[(_jump >= jump_pct) & (qvix["thr"].notna())]
         print(f"信号口径: QVIX 比 {jump_days} 个交易日前涨 ≥{jump_pct:.0%}")
     else:
-        signals = qvix[(qvix["close"] > qvix["thr"]) & (qvix["thr"].notna())]
+        # 「链失效」日一并算信号。那天没有 QVIX 值不是"数据缺失", 是行情极端
+        # 到把公式撑爆了 —— 标的暴跌, 远期价掉到最低挂牌行权价以下, K0 选不
+        # 出来, 月份接连被跳过。详见 qvix_calc.CHAIN_BROKEN 那段: 2018 年至今
+        # 两条序列一共 3 天, 上证分别 -7.72%/-4.95%/-7.34%, 零误报。没有值可
+        # 跟阈值比, 直接判定为信号。
+        # 只在 threshold 口径下这么判: jump 口径比的是 QVIX 自身的涨幅, 那天
+        # 根本没有值可比, 强行塞进去等于换了个定义。
+        _broken = qvix["note"].map(qvix_calc.is_chain_broken)
+        signals = qvix[((qvix["close"] > qvix["thr"]) | _broken)
+                       & (qvix["thr"].notna())]
     signals = signals[signals["date"] >= _signal_floor]
-    print(f"信号日(QVIX > 阈值): {len(signals)} 天")
+    _n_broken = (0 if signal_mode == "jump"
+                 else int(signals["note"].map(qvix_calc.is_chain_broken).sum()))
+    print(f"信号日(QVIX > 阈值): {len(signals)} 天"
+          + (f"(其中 {_n_broken} 天是链失效日: 算不出值, 但那本身就是极端行情)"
+             if _n_broken else ""))
     signal_map = {row["date"]: row["thr"] for _, row in signals.iterrows()}
 
     trades = []

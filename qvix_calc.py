@@ -153,6 +153,32 @@ def compute_qvix(as_of: Optional[dt.datetime] = None) -> Optional[tuple]:
         return None
 
 
+# ── 「链失效」: 算不出来这件事本身就是信号 ────────────────────────────────
+# 失败分两类, 分界线是**取数**还是**算数**:
+#   · 取数失败(接口挂了、收盘价还没发布、当天没有这只标的的合约) —— 纯技术
+#     故障, 跟行情没关系, note 不带前缀。
+#   · 计算失败(合约数据完整地拿到了, 但公式在这堆数据上失效) —— note 带这个
+#     前缀。公式在完整数据上失效的现实原因基本只有一个: **行情极端到跑出了
+#     期权链的覆盖范围**。标的暴跌, 远期价 F 掉到最低挂牌行权价以下, K0 就
+#     选不出来(交易所加挂行权价永远慢半拍), 该月整个被跳过; 几个月份接连被
+#     跳过, 最后只剩下离 30 天太远的合约, 撞上"拒绝外推"那条护栏。
+#
+# 2018 年至今两条序列加起来只有 3 个这样的日子, **全部是历史级暴跌**:
+#   2020-02-03 上证 -7.72%(疫情后开市首日, 50 和 300 都失效)
+#   2022-03-15 上证 -4.95%(50 失效; 4月链 F=2.6459 掉到最低行权价 2.65 以下)
+#   2025-04-07 上证 -7.34%(300 失效)
+# 一个平静日的误报都没有。所以这些日子不该当成"数据缺失"跳过 —— 恰恰相反,
+# 它们是恐慌信号最强的那几天, 只是强到把温度计撑爆了。消费方(回测/今日候选)
+# 拿 is_chain_broken() 判定, 把它们直接算作信号日, 不再跟阈值比(没有值可比)。
+CHAIN_BROKEN = "链失效"
+
+
+def is_chain_broken(note) -> bool:
+    """这条 note 是不是「链失效」(见上方 CHAIN_BROKEN)。非字符串(NaN/None)
+    一律 False —— 库里 note 为空是正常路径(算出来了就不写原因)。"""
+    return isinstance(note, str) and note.startswith(CHAIN_BROKEN)
+
+
 @functools.lru_cache(maxsize=8)
 def _contract_re(underlying: str = _UNDERLYING):
     """合约代码正则。510050C2609M03000 → (C, 2609, M, 03000):
@@ -344,4 +370,6 @@ def compute_qvix_for_date(target_date: dt.date, spot: Optional[float] = None,
             last_err = f"结果 {vix:.2f} 超出合理区间,判为脏数据"
             continue
         return round(vix, 2), None
-    return None, last_err
+    # 走到这里说明合约数据是完整拿到了的, 只是公式在上面失效 —— 见文件上方
+    # CHAIN_BROKEN 那段: 这不是"没数据", 是行情极端到把温度计撑爆了。
+    return None, f"{CHAIN_BROKEN}: {last_err}"

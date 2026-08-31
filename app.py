@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import today_pick
+import qvix_calc
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
@@ -1276,6 +1277,29 @@ with tab_sse:
                     name=f"{_label}恐慌阈值(2年90%)", yaxis="y2",
                     line=dict(color=_color, width=1.2, dash="dash"),
                     hovertemplate=f"{_label}阈值 " + "%{y:.2f}<extra></extra>"))
+                # 链失效日在曲线上只是个断点, 什么都看不见 —— 而它恰恰是最
+                # 恐慌的那几天(标的跌出期权链的挂牌行权价范围, 公式失效;
+                # 见 qvix_calc.CHAIN_BROKEN)。在阈值线的高度上打个 ×, 位置
+                # 不代表数值(那天没有数值), 只代表"这天在阈值之上"。
+                _nb = f"note{_suffix}"
+                if _nb not in _qvix_hist.columns:
+                    continue
+                _bk = _qvix_hist[
+                    _qvix_hist[_nb].map(qvix_calc.is_chain_broken)]
+                if _bk.empty:
+                    continue
+                _bk = _bk[["date"]].merge(_t[["date", f"thr{_suffix}"]],
+                                          on="date", how="inner")
+                if _bk.empty:
+                    continue
+                fig_sse.add_trace(go.Scatter(
+                    x=_bk["date"], y=_bk[f"thr{_suffix}"],
+                    name=f"{_label}链失效(按信号处理)", yaxis="y2",
+                    mode="markers",
+                    marker=dict(symbol="x", size=12, color=_color,
+                                line=dict(width=2)),
+                    hovertemplate=f"{_label} 那天算不出来——跌出期权链行权价"
+                                  "范围,公式失效,按信号处理<extra></extra>"))
         if _show_vix and not _drawn:
             st.caption("⚠️ VIX恐慌指数数据暂不可用")
         if _drawn:
@@ -1610,12 +1634,22 @@ with tab_sse:
                     # 结果的前提 —— 没信号的日子策略根本不买。
                     _thr_ok = (_tp.get("thr") is not None
                                and not pd.isna(_tp["thr"]))
-                    if not _is_today and _thr_ok and _tp.get("qvix") is not None:
-                        if _tp["hit"]:
+                    _q_ok = (_tp.get("qvix") is not None
+                             and not pd.isna(_tp["qvix"]))
+                    if not _is_today and _thr_ok:
+                        if _tp.get("broken"):
+                            # 链失效日: 没有值可报, 但那天恰恰是最恐慌的
+                            # 几天之一(见 qvix_calc.CHAIN_BROKEN)。
+                            st.success(
+                                f"🔔 {_tp['qdate'].date()} QVIX **算不出来**"
+                                "——标的跌到跑出期权链的挂牌行权价范围,公式在那天"
+                                "失效了。算不出来本身就是极端行情的证据,按**触发**"
+                                "处理(与回测口径一致)。")
+                        elif _q_ok and _tp["hit"]:
                             st.success(
                                 f"🔔 {_tp['qdate'].date()} QVIX {_tp['qvix']:.2f} "
                                 f">阈值 {_tp['thr']:.2f}——那天**触发了**买入信号。")
-                        else:
+                        elif _q_ok:
                             st.info(
                                 f"😴 {_tp['qdate'].date()} QVIX {_tp['qvix']:.2f} "
                                 f"≤阈值 {_tp['thr']:.2f}——那天**没有**信号,策略"

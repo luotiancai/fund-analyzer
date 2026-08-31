@@ -41,6 +41,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backtest_qvix as B      # noqa: E402
 import fetcher                 # noqa: E402
+import qvix_calc               # noqa: E402
 
 def _std_params():
     """标准策略的参数, **直接读 run_backtest 的签名默认值**。
@@ -61,7 +62,10 @@ STD = _std_params()
 
 
 def _threshold(asof: pd.Timestamp):
-    """信号日当天该比的阈值(截至前一交易日的 window/pct 分位)。"""
+    """信号日当天该比的阈值(截至前一交易日的 window/pct 分位)。
+    返回 (日期, QVIX值, 阈值, 是否链失效日)。最后那个见
+    qvix_calc.CHAIN_BROKEN: 算不出值本身就是极端行情, 那天直接算信号,
+    QVIX值会是 NaN —— 调用方不能只看值跟阈值的大小。"""
     q = fetcher.load_qvix_self_history().rename(columns={"qvix": "close"})
     q["date"] = pd.to_datetime(q["date"])
     q["close"] = pd.to_numeric(q["close"], errors="coerce")
@@ -72,9 +76,9 @@ def _threshold(asof: pd.Timestamp):
     q["thr"] = thr
     row = q[q["date"] <= asof]
     if row.empty:
-        return None, None, None
+        return None, None, None, False
     r = row.iloc[-1]
-    return r["date"], r["close"], r["thr"]
+    return r["date"], r["close"], r["thr"], qvix_calc.is_chain_broken(r["note"])
 
 
 def data_freshness(conn, asof=None):
@@ -194,11 +198,16 @@ def scan(asof, top: int = 40) -> dict:
     sse = sse.sort_values("date").reset_index(drop=True)
 
     asof = pd.Timestamp(asof)
-    qdate, qvix, thr = _threshold(asof)
+    qdate, qvix, thr, broken = _threshold(asof)
     nav_max, sse_max, behind, need_date, missing = data_freshness(conn, asof)
+    # 链失效日直接算触发(见 _threshold): 那天没有 QVIX 值可跟阈值比, 但
+    # "算不出来"这件事本身就是行情极端的证据, 跟回测口径一致
+    # (backtest_qvix 的信号集合同样把它们算进去)。
     out = {"asof": asof, "qdate": qdate, "qvix": qvix, "thr": thr,
-           "hit": (qvix is not None and thr is not None
-                   and not pd.isna(thr) and qvix > thr),
+           "broken": broken,
+           "hit": (thr is not None and not pd.isna(thr)
+                   and (broken or (qvix is not None and not pd.isna(qvix)
+                                   and qvix > thr))),
            "nav_max": nav_max, "sse_max": sse_max, "behind": behind,
            "need_date": need_date, "missing": missing,
            "std": STD, "rows": [], "too_deep": 0, "chosen": None,
