@@ -66,6 +66,7 @@
 """
 
 import datetime as dt
+import functools
 import logging
 import math
 import re
@@ -86,7 +87,23 @@ import qvix_core
 log = logging.getLogger(__name__)
 
 _CST = ZoneInfo("Asia/Shanghai")
-_UNDERLYING = "510050"
+
+# 历史路径(compute_qvix_for_date)支持 510050 以外的标的, 实时路径不支持。
+# 为什么几乎白拿: 上交所那个风险指标接口一次返回**当天全部**ETF期权合约
+# (2026-08-28 实测 666 条, 510050/510300/510500/588000/588080 都在里面),
+# 换个前缀筛就是另一只的波指, 不多发一个请求、不多一个数据源。合约代码格式
+# (标的6位+C/P+到期月4位+M/A+行权价5位)、行权价×1000、到期日规则(到期月第
+# 四个星期三)、分红调整标志 M/A 五个标的完全一致, 整套公式原样适用。
+# 实时路径(qvix_core)仍然只做 510050: 它要保持零依赖以便整个粘进云函数,
+# 而实时值目前只有 50 波指有消费方(qvix_now.py)。
+_UNDERLYING_NAMES = {
+    "510050": "50ETF",
+    "510300": "300ETF",
+    "510500": "500ETF",
+    "588000": "科创50ETF",
+    "588080": "科创板50ETF",
+}
+_UNDERLYING = "510050"      # 不传 underlying 时的默认标的
 
 
 _SHIBOR_TENOR_DAYS = [
@@ -136,13 +153,18 @@ def compute_qvix(as_of: Optional[dt.datetime] = None) -> Optional[tuple]:
         return None
 
 
-_CONTRACT_RE = re.compile(r"^510050([CP])(\d{4})([A-Z])(\d{5})$")
+@functools.lru_cache(maxsize=8)
+def _contract_re(underlying: str = _UNDERLYING):
+    """合约代码正则。510050C2609M03000 → (C, 2609, M, 03000):
+    认购/认沽、到期月、标准(M)/分红调整(A)、行权价×1000。"""
+    return re.compile(rf"^{underlying}([CP])(\d{{4}})([A-Z])(\d{{5}})$")
 
 
-def spot_price_for_date(target_date: dt.date) -> Optional[float]:
-    """指定交易日 510050 收盘价;当天数据还没发布/非交易日返回 None。"""
+def spot_price_for_date(target_date: dt.date,
+                        underlying: str = _UNDERLYING) -> Optional[float]:
+    """指定交易日标的ETF收盘价;当天数据还没发布/非交易日返回 None。"""
     try:
-        df = fetcher.ak.fund_etf_hist_sina(symbol="sh510050")
+        df = fetcher.ak.fund_etf_hist_sina(symbol=f"sh{underlying}")
     except Exception:
         return None
     df["date"] = pd.to_datetime(df["date"]).dt.date
@@ -194,12 +216,14 @@ def _expiry_for_yymm(yymm: str) -> dt.date:
     return base
 
 
-def _listed_expiries(df, target_date: dt.date):
+def _listed_expiries(df, target_date: dt.date, cre=None):
     """当天数据里实际出现过的到期月代码 → (到期日期, 剩余自然天数),
-    按剩余天数升序;只看普通(非分红调整)合约。"""
+    按剩余天数升序;只看普通(非分红调整)合约。cre 是标的对应的合约
+    正则(见 _contract_re), 不传按默认标的。"""
+    cre = cre or _contract_re()
     out = {}
     for cid in df["CONTRACT_ID"]:
-        m = _CONTRACT_RE.match(cid)
+        m = cre.match(cid)
         if not m or m.group(3) != "M":
             continue
         yymm = m.group(2)
@@ -215,10 +239,12 @@ def _listed_expiries(df, target_date: dt.date):
     return sorted(out.items(), key=lambda kv: kv[1][1])
 
 
-def _build_chain_from_risk_indicator(df, yymm: str, S: float, T: float, r: float):
+def _build_chain_from_risk_indicator(df, yymm: str, S: float, T: float,
+                                     r: float, cre=None):
+    cre = cre or _contract_re()
     rows = []
     for _, row in df.iterrows():
-        m = _CONTRACT_RE.match(row["CONTRACT_ID"])
+        m = cre.match(row["CONTRACT_ID"])
         if not m or m.group(3) != "M" or m.group(2) != yymm:
             continue
         sigma = row["IMPLC_VOLATLTY"]
@@ -245,15 +271,19 @@ def _fetch_risk_indicator_with_retry(date_str: str, attempts: int = 3):
 
 
 def compute_qvix_for_date(target_date: dt.date, spot: Optional[float] = None,
-                           shibor_curve: Optional[list] = None) -> tuple:
+                           shibor_curve: Optional[list] = None,
+                           underlying: str = _UNDERLYING) -> tuple:
     """算某个收盘后交易日的QVIX(上交所官方期权风险指标反推,不依赖
     optbbs)。spot/shibor_curve 不传时现查当天的(单天用;批量回算时
     调用方应该一次性拉整段历史自己传,不然每天都要重新拉一遍全history)。
+    underlying 换标的(见 _UNDERLYING_NAMES),注意 spot 要跟着换成那只
+    ETF 的收盘价——传错了不会报错,只会算出一个像模像样的错数。
     失败返回 (None, 原因字符串)。"""
+    name = _UNDERLYING_NAMES.get(underlying, underlying)
     if spot is None:
-        spot = spot_price_for_date(target_date)
+        spot = spot_price_for_date(target_date, underlying)
     if spot is None:
-        return None, "拿不到50ETF当日收盘价(可能还没发布/非交易日)"
+        return None, f"拿不到{name}当日收盘价(可能还没发布/非交易日)"
     if shibor_curve is None:
         shibor_curve = shibor_curve_for_date(target_date)
 
@@ -264,11 +294,12 @@ def compute_qvix_for_date(target_date: dt.date, spot: Optional[float] = None,
         return None, f"接口失败: {e}"
     if df is None or df.empty:
         return None, "当天无数据(非交易日/上市前/尚未发布)"
-    df = df[df["CONTRACT_ID"].str.startswith("510050")]
+    cre = _contract_re(underlying)
+    df = df[df["CONTRACT_ID"].str.startswith(underlying)]
     if df.empty:
-        return None, "当天无50ETF期权数据"
+        return None, f"当天无{name}期权数据(可能还没上市)"
 
-    pairs = _candidate_pairs(_listed_expiries(df, target_date))
+    pairs = _candidate_pairs(_listed_expiries(df, target_date, cre))
     if not pairs:
         return None, "找不到满足条件的近月/次近月(合约月份不足)"
 
@@ -282,7 +313,8 @@ def compute_qvix_for_date(target_date: dt.date, spot: Optional[float] = None,
         # K0 选不出来,前两对候选全被跳过,最后拿 6月(99天)/9月(197天)外推回
         # 30天(w1=1.70)算出 29.37 入库——那不是30天口径的数。
         # 50ETF 合约月间隔约30天,到期后新近月最远也就35天左右,所以正常情况
-        # 下 near_days 不会超过40。
+        # 下 near_days 不会超过40。上交所几只ETF期权的合约月份挂法一致
+        # (当月/下月/随后两个季月),这条对 510300 等标的同样成立。
         if near_days > 40:
             last_err = f"最近的可用近月已剩{near_days}天,30天目标落在它之前,拒绝外推"
             continue
@@ -290,8 +322,8 @@ def compute_qvix_for_date(target_date: dt.date, spot: Optional[float] = None,
         r1 = _rate_for_days(shibor_curve, near_days, 0.02)
         r2 = _rate_for_days(shibor_curve, next_days, 0.02)
 
-        near_chain = _build_chain_from_risk_indicator(df, near_ms, spot, T1, r1)
-        next_chain = _build_chain_from_risk_indicator(df, next_ms, spot, T2, r2)
+        near_chain = _build_chain_from_risk_indicator(df, near_ms, spot, T1, r1, cre)
+        next_chain = _build_chain_from_risk_indicator(df, next_ms, spot, T2, r2, cre)
         near = _term_variance(near_chain, r1, T1)
         nxt = _term_variance(next_chain, r2, T2)
         if near is None or nxt is None:

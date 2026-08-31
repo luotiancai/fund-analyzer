@@ -320,8 +320,18 @@ _DDL = {
     -- 笔"新增信号"复利 -6.08%、胜率 3/10 —— 平静期(QVIX 12~13)skew 冲高多
     -- 半是期权卖方结构(备兑压低认购IV)造成的, 不是真有人抢买保护, 进场后
     -- 没有恐慌就没有反弹可吃, 只能原地漂到止损。
+    -- qvix/note/threshold 是 50ETF(510050)期权算的, qvix300/note300/
+    -- threshold300 是沪深300ETF(510300)期权算的, 同一套方法论、同一个数据
+    -- 请求(上交所那个风险指标接口一次返回全部标的的合约, 见 qvix_calc 的
+    -- _UNDERLYING_NAMES)。宽表而不是加一列 underlying 做联合主键: 两条
+    -- 序列天然按 date 对齐, 图上要并排画、阈值要并排比, 拆成长表反而每处
+    -- 读取都得 pivot 一次; 而且现有读取方全是 SELECT *, 加列自动带出来。
+    -- 300 的历史只到 2019-12-23(510300期权上市日)为止, 之前的行 qvix300
+    -- 为 NULL, 阈值要满 475 个交易日才给值, 所以 threshold300 从 2021-11
+    -- 前后才开始有数。
     CREATE TABLE IF NOT EXISTS qvix.qvix_self_history (
-        date TEXT PRIMARY KEY, qvix REAL, note TEXT, threshold REAL);
+        date TEXT PRIMARY KEY, qvix REAL, note TEXT, threshold REAL,
+        qvix300 REAL, note300 TEXT, threshold300 REAL);
 """,
 
 "market": """
@@ -446,6 +456,15 @@ def init_db():
             conn.execute(f"ALTER TABLE rank.fund_sharpe DROP COLUMN {col}")
         except sqlite3.OperationalError:
             pass  # 列不存在(新库)或 SQLite 太老
+    # 沪深300波指三列(2026-08-31 加)。存量 qvix.db 是分库时建的四列表,
+    # CREATE TABLE IF NOT EXISTS 不会给它补列, 只能在这里 ALTER。
+    for col, typ in (("qvix300", "REAL"), ("note300", "TEXT"),
+                     ("threshold300", "REAL")):
+        try:
+            conn.execute(
+                f"ALTER TABLE qvix.qvix_self_history ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass  # 列已存在, 或 qvix 库这会儿还没挂上(云端两段式)
     _migrate_nav_blobs(conn)
     conn.commit()
     conn.close()
@@ -1970,18 +1989,26 @@ def qvix_phase(now: Optional[datetime] = None) -> tuple:
 
 
 
-def save_qvix_self_history(rows: list) -> None:
+def save_qvix_self_history(rows: list, suffix: str = "") -> None:
     """写入/覆盖自算QVIX历史(backfill_qvix_history.py 用)。跟 optbbs 的
     index_daily_cache 是两张独立的表,互不覆盖——这样optbbs的值和自算值
     可以并排比对,而不是自算结果把optbbs历史顶替掉。rows 是
-    [{"date","qvix","note"}, ...]。"""
+    [{"date","qvix","note"}, ...]。
+
+    suffix="300" 时写 qvix300/note300 列(沪深300ETF期权算的那条),rows 的
+    键名不变、仍然是 "qvix"/"note" —— 调用方那边两条序列的构造代码完全
+    一样,只有落哪一列不同。"""
     # 用 UPSERT 而不是 INSERT OR REPLACE: 后者是**整行替换**, 会把同一行的
     # threshold 抹成 NULL(它每次跑批都重算, 所以平时看不出问题 —— 但只要
-    # 以后再往这张表加别的列, 整行替换就会静默清空它)。这里只动 qvix/note。
+    # 以后再往这张表加别的列, 整行替换就会静默清空它)。加了 300 三列之后
+    # 这已经不是"以后"的问题了: 整行替换会当场把另一条序列清空。
+    assert suffix in ("", "300"), suffix
+    vcol, ncol = f"qvix{suffix}", f"note{suffix}"
     conn = _conn()
     conn.executemany(
-        "INSERT INTO qvix_self_history (date, qvix, note) VALUES (?, ?, ?) "
-        "ON CONFLICT(date) DO UPDATE SET qvix=excluded.qvix, note=excluded.note",
+        f"INSERT INTO qvix_self_history (date, {vcol}, {ncol}) VALUES (?, ?, ?) "
+        f"ON CONFLICT(date) DO UPDATE SET {vcol}=excluded.{vcol}, "
+        f"{ncol}=excluded.{ncol}",
         [(r["date"], r.get("qvix"), r.get("note")) for r in rows])
     conn.commit()
     conn.close()
@@ -2006,15 +2033,20 @@ def load_qvix_self_history() -> Optional[pd.DataFrame]:
     return df if not df.empty else None
 
 
-def save_qvix_self_threshold(dates: list, thresholds: list) -> None:
+def save_qvix_self_threshold(dates: list, thresholds: list,
+                             suffix: str = "") -> None:
     """把滚动2年90分位恐慌阈值写回 qvix_self_history 的 threshold 列
-    (按自算QVIX序列现算的,不是套用optbbs那条历史算出来的阈值)。"""
+    (按自算QVIX序列现算的,不是套用optbbs那条历史算出来的阈值)。
+    suffix="300" 写 threshold300(沪深300波指自己的阈值——两条序列水平
+    不同,300 常年比 50 高2~3个点,绝不能共用一条阈值线)。"""
+    assert suffix in ("", "300"), suffix
+    col = f"threshold{suffix}"
     conn = _conn()
     cols = [r[1] for r in conn.execute("PRAGMA table_info(qvix_self_history)")]
-    if "threshold" not in cols:
-        conn.execute("ALTER TABLE qvix_self_history ADD COLUMN threshold REAL")
+    if col not in cols:
+        conn.execute(f"ALTER TABLE qvix_self_history ADD COLUMN {col} REAL")
     conn.executemany(
-        "UPDATE qvix_self_history SET threshold = ? WHERE date = ?",
+        f"UPDATE qvix_self_history SET {col} = ? WHERE date = ?",
         [(t, d) for d, t in zip(dates, thresholds)])
     conn.commit()
     conn.close()
@@ -2196,18 +2228,47 @@ def load_backtest_notes() -> dict:
     return {r["buy_date"]: r["note"] for r in rows}
 
 
+# 阈值口径:滚动窗口(交易日)、最小样本、分位。50 和 300 两条序列共用同一
+# 套参数,各自在自己的序列上滚 —— 集中在这里,免得两处各写一遍慢慢漂开。
+# 2026-07-27 起生产口径从 720/0.95(3年95分位)对齐到 490/0.90(2年90分位)
+# ——与 2026-07-24 定档的标准策略(backtest_qvix.py 头部快照)及 app.py
+# 展示线同口径,不然 notify 邮件报的阈值偏高 ~1.6个点,QVIX 落在两阈值之间
+# 时会漏信号。
+# min_periods=475(=490×0.97):阈值要接近满窗口才给值,不足宁可空着也不用
+# 不完整窗口凑数——早期用240(约1年)会让阈值在头两年里被少量样本撑出来的
+# 分位数带偏,不够稳。不用严格490:历史里偶发接口失败/数据缺失(约1.6%的
+# 交易日),真设成490会导致窗口只要出现过一天缺失就整个失真成NaN,475留了
+# 约15天的容错,仍然远比240严格(同 backtest_qvix.py 的 minp_ratio=0.97)。
+QVIX_THR_WINDOW, QVIX_THR_MINP, QVIX_THR_PCT = 490, 475, 0.90
+
+# 每天算哪几条波指:(列名后缀, 标的代码, 显示名)。同一个上交所风险指标
+# 请求里筛不同前缀就是不同标的的波指,加一条不多花一次网络往返(详见
+# qvix_calc._UNDERLYING_NAMES 那段)。50 是策略在用的生产信号,300 是
+# 2026-08-31 加的旁证序列(覆盖面更宽、含深市成分)。
+QVIX_SERIES = (
+    ("", "510050", "50ETF"),
+    ("300", "510300", "300ETF"),
+)
+
+# 510300 期权上市日。之前的交易日没有合约,算不出来也不该留失败记录 ——
+# 回填/自愈都拿这个日期做下界。
+QVIX300_START = datetime(2019, 12, 23).date()
+
+
 def update_qvix_self_daily() -> tuple:
-    """收盘后重算"最近一个已收盘交易日"的自算QVIX,写入 qvix_self_history
-    并重算滚动2年90分位阈值。update_daily.py(06:00)和 notify_qvix.py
-    (14:40)都调这个,取代原来基于 optbbs 的 fetch_qvix_daily(force_refresh=True)。
+    """收盘后重算"最近一个已收盘交易日"的自算QVIX(50ETF 和 300ETF 两条),
+    写入 qvix_self_history 并各自重算滚动2年90分位阈值。update_daily.py
+    (06:00)和 notify_qvix.py(14:40)都调这个,取代原来基于 optbbs 的
+    fetch_qvix_daily(force_refresh=True)。
 
     目标日期不是"今天"——06:00 时今天还没开盘,14:40 时今天还没收盘,
-    两边其实都是在补"上一个交易日"的数据,天然幂等(INSERT OR REPLACE),
+    两边其实都是在补"上一个交易日"的数据,天然幂等(UPSERT),
     重复调用无副作用。上交所官方接口本身也有发布延迟(实测过收盘3小时后
     仍未发布),这天万一还没发布,下一次调用(次日/当天晚些)自然会
     补上,调用方不需要关心这件事。
 
-    返回 (qvix_value_or_None, note)。"""
+    返回 (qvix_value_or_None, note) —— **50ETF 那条**, 保持老签名不变:
+    调用方(update_daily/notify_qvix)报的是生产信号那条,300 只入库。"""
     import qvix_calc
     today = datetime.now(_CST).date()
     try:
@@ -2219,51 +2280,55 @@ def update_qvix_self_daily() -> tuple:
         logger.warning("QVIX 每日自算:拉交易日历失败 %s", e)
         return None, f"交易日历拉取失败: {e}"
 
-    vix, note = qvix_calc.compute_qvix_for_date(target)
-    save_qvix_self_history([{"date": target.isoformat(), "qvix": vix, "note": note}])
-    if vix is None:
-        logger.warning("QVIX 每日自算(%s)失败: %s", target, note)
-    else:
-        logger.info("QVIX 每日自算(%s) = %.2f", target, vix)
+    out = {}
+    for suffix, underlying, name in QVIX_SERIES:
+        if suffix == "300" and target < QVIX300_START:
+            continue
+        vix, note = qvix_calc.compute_qvix_for_date(target, underlying=underlying)
+        save_qvix_self_history(
+            [{"date": target.isoformat(), "qvix": vix, "note": note}], suffix)
+        if vix is None:
+            logger.warning("%s QVIX 每日自算(%s)失败: %s", name, target, note)
+        else:
+            logger.info("%s QVIX 每日自算(%s) = %.2f", name, target, vix)
 
-    # 自愈:补最近15天里"接口临时失败"留下的空值(qvix IS NULL)。update 每次
-    # 只算"上一个收盘日", 某天上交所接口抽风留的空值之后不会再被重算、会成
-    # 永久空洞(2026-07-28/29 就这么丢过)。这里顺带把近15天的空值重试一遍,
-    # 接口恢复后自动补上。失败不影响主流程。
-    try:
-        _h = load_qvix_self_history()
-        if _h is not None:
-            _cut = (today - timedelta(days=15)).isoformat()
-            _nulls = _h[_h["qvix"].isna() & (_h["date"].astype(str) >= _cut)
-                        & (_h["date"].astype(str) != target.isoformat())]["date"].tolist()
-            for _d in _nulls:
-                _v, _n = qvix_calc.compute_qvix_for_date(datetime.fromisoformat(_d).date())
-                if _v is not None:
-                    save_qvix_self_history([{"date": _d, "qvix": _v, "note": None}])
-                    logger.info("QVIX 空值自愈回补(%s) = %.2f", _d, _v)
-    except Exception as e:
-        logger.warning("QVIX 空值自愈失败(不影响主流程): %s", e)
+        # 自愈:补最近15天里"接口临时失败"留下的空值(值 IS NULL)。update 每次
+        # 只算"上一个收盘日", 某天上交所接口抽风留的空值之后不会再被重算、会成
+        # 永久空洞(2026-07-28/29 就这么丢过)。这里顺带把近15天的空值重试一遍,
+        # 接口恢复后自动补上。失败不影响主流程。
+        vcol = f"qvix{suffix}"
+        try:
+            _h = load_qvix_self_history()
+            if _h is not None and vcol in _h.columns:
+                _cut = (today - timedelta(days=15)).isoformat()
+                _nulls = _h[_h[vcol].isna() & (_h["date"].astype(str) >= _cut)
+                            & (_h["date"].astype(str) != target.isoformat())]["date"].tolist()
+                for _d in _nulls:
+                    _date = datetime.fromisoformat(_d).date()
+                    if suffix == "300" and _date < QVIX300_START:
+                        continue
+                    _v, _n = qvix_calc.compute_qvix_for_date(
+                        _date, underlying=underlying)
+                    if _v is not None:
+                        save_qvix_self_history(
+                            [{"date": _d, "qvix": _v, "note": None}], suffix)
+                        logger.info("%s QVIX 空值自愈回补(%s) = %.2f", name, _d, _v)
+        except Exception as e:
+            logger.warning("%s QVIX 空值自愈失败(不影响主流程): %s", name, e)
 
-    hist = load_qvix_self_history()
-    if hist is not None:
-        hist = hist.sort_values("date").reset_index(drop=True)
-        # 2026-07-27 起生产口径从 720/0.95(3年95分位)对齐到 490/0.90
-        # (2年90分位)——与 2026-07-24 定档的标准策略(backtest_qvix.py
-        # 头部快照)及 app.py 展示线同口径,不然 notify 邮件报的阈值偏高
-        # ~1.6个点,QVIX 落在两阈值之间时会漏信号。
-        # min_periods=475(=490×0.97):阈值要接近满窗口才给值,不足宁可
-        # 空着也不用不完整窗口凑数——早期用240(约1年)会让阈值在头
-        # 两年里被少量样本撑出来的分位数带偏,不够稳。不用严格490:历史
-        # 里偶发接口失败/数据缺失(约1.6%的交易日),真设成490会导致
-        # 窗口只要出现过一天缺失就整个失真成NaN,475留了约15天的
-        # 容错,仍然远比240严格(同 backtest_qvix.py 的 minp_ratio=0.97)。
-        # 这列**故意不 shift**:存的是"截至该日收盘"的分位。实盘用法是次日
-        # 盘中拿最后一行来比(qvix_now.py), 今天的数据天然不在窗口里;
-        # 回测(backtest_qvix.py)在自己那边 shift(1) 达成同一口径。别在
-        # 这里加 shift——那会让实盘比的阈值凭空旧一天。
-        hist["threshold"] = hist["qvix"].rolling(490, min_periods=475).quantile(0.90)
-        save_qvix_self_threshold(hist["date"].tolist(), hist["threshold"].tolist())
-    return vix, note
+        hist = load_qvix_self_history()
+        if hist is not None and vcol in hist.columns:
+            hist = hist.sort_values("date").reset_index(drop=True)
+            # 这列**故意不 shift**:存的是"截至该日收盘"的分位。实盘用法是次日
+            # 盘中拿最后一行来比(qvix_now.py), 今天的数据天然不在窗口里;
+            # 回测(backtest_qvix.py)在自己那边 shift(1) 达成同一口径。别在
+            # 这里加 shift——那会让实盘比的阈值凭空旧一天。
+            thr = (pd.to_numeric(hist[vcol], errors="coerce")
+                   .rolling(QVIX_THR_WINDOW, min_periods=QVIX_THR_MINP)
+                   .quantile(QVIX_THR_PCT))
+            save_qvix_self_threshold(hist["date"].tolist(), thr.tolist(), suffix)
+        out[suffix] = (vix, note)
+    return out.get("", (None, "未计算"))
 
 
 # ── Daily-batch pipeline ──────────────────────────────────────────────────────

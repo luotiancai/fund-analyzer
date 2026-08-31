@@ -338,31 +338,42 @@ def load_sse_daily(cache_key):
     return fetcher.fetch_sse_daily()
 
 
-_QVIX_THR_COMBOS = [
-    ("2年90%", 490, 0.90, "#f28e2b"),
-]
+# 上证图上能叠的几条波指:图例名 → (库里的列名后缀, 颜色)。跟
+# fetcher.QVIX_SERIES 是同一批标的,这里只管画。50ETF 是策略在用的生产
+# 信号,300ETF 是旁证——它覆盖两市、含深市成分(中际旭创、宁德、比亚迪
+# 这些上证50 里一只都没有),水平常年比 50 高 2~3 个点,所以两条线各画
+# 各的阈值,**绝不能共用一条**。
+_QVIX_LINES = {
+    "50ETF": ("", "#f28e2b"),
+    "300ETF": ("300", "#af7aa1"),
+}
 
 
 @st.cache_data(show_spinner="正在计算候选恐慌阈值…")
-def load_qvix_threshold_combos(cache_key):
-    """按 backtest_qvix.py 同一套口径(minp_ratio=0.97,含 shift(1):
-    第 d 天画的是"截至 d-1 收盘"的分位,与回测信号/实盘用法同口径)现算
-    滚动阈值(窗口×分位),供上证指数图叠加展示——与线上生产阈值列
-    (490/0.90,minp=475,fetcher.update_qvix_self_daily 里精确维护,
-    2026-07-27 起已从720/0.95对齐到这个口径;那列不 shift,存"截至该日
-    收盘"的值,次日实盘拿最后一行来比,语义等价)算法一致但
-    独立现算,只用于图上对比展示,不影响生产阈值/策略复盘本身。"""
+def load_qvix_thresholds(cache_key):
+    """按 backtest_qvix.py 同一套口径(含 shift(1):第 d 天画的是"截至
+    d-1 收盘"的分位,与回测信号/实盘用法同口径)现算滚动阈值,供上证指数图
+    叠加展示——与线上生产阈值列(fetcher.update_qvix_self_daily 里精确
+    维护;那列不 shift,存"截至该日收盘"的值,次日实盘拿最后一行来比,
+    语义等价)算法一致但独立现算,只用于图上对比展示,不影响生产阈值/
+    策略复盘本身。窗口/最小样本/分位一律取 fetcher 的常量,别在这里另写
+    一份数字——图上画的和策略判的必须是同一条线。
+
+    返回 date + 每条序列一列(列名 thr / thr300)。"""
     hist = fetcher.load_qvix_self_history()
     if hist is None or hist.empty:
         return None
     hist = hist.sort_values("date").reset_index(drop=True)
-    hist["date"] = pd.to_datetime(hist["date"])
-    hist["qvix"] = pd.to_numeric(hist["qvix"], errors="coerce")
-    out = hist[["date"]].copy()
-    for label, window, pct, _color in _QVIX_THR_COMBOS:
-        minp = int(window * 0.97)
-        out[label] = (hist["qvix"].rolling(window, min_periods=minp)
-                      .quantile(pct).shift(1))
+    out = pd.DataFrame({"date": pd.to_datetime(hist["date"])})
+    for _label, (suffix, _color) in _QVIX_LINES.items():
+        col = f"qvix{suffix}"
+        if col not in hist.columns:
+            continue
+        out[f"thr{suffix}"] = (
+            pd.to_numeric(hist[col], errors="coerce")
+            .rolling(fetcher.QVIX_THR_WINDOW,
+                     min_periods=fetcher.QVIX_THR_MINP)
+            .quantile(fetcher.QVIX_THR_PCT).shift(1))
     return out
 
 
@@ -1167,7 +1178,7 @@ with tab_sse:
         _sse_ranges = {"近1月": 30, "近3月": 91, "近6月": 182,
                        "近1年": 365, "近3年": 365 * 3, "近5年": 365 * 5,
                        "近10年": 365 * 10, "全部": None}
-        _c_rng, _c_bands, _c_vix = st.columns([4, 1, 1])
+        _c_rng, _c_bands, _c_vix = st.columns([3, 1, 2])
         with _c_rng:
             _rng = st.radio("时间区间", list(_sse_ranges.keys()), index=3,
                             horizontal=True, key="sse_range")
@@ -1176,9 +1187,15 @@ with tab_sse:
                                       key="sse_bands",
                                       help="长区间下标记较密，可关闭")
         with _c_vix:
-            _show_vix = st.checkbox("VIX恐慌指数", value=True,
-                                    key="sse_vix",
-                                    help="50ETF期权QVIX（中国版VIX），右轴")
+            # 默认只画 50ETF —— 它才是策略在用的那条。两条一起画会连阈值
+            # 共四条线, 图上太挤, 要对比时再勾 300。
+            _vix_pick = st.multiselect(
+                "VIX恐慌指数", list(_QVIX_LINES.keys()), default=["50ETF"],
+                key="sse_vix_pick",
+                help="期权隐含波动率算的中国版VIX,右轴,各带自己的恐慌阈值线。"
+                     "50ETF是策略在用的生产信号;300ETF覆盖两市、含深市成分,"
+                     "水平常年高2~3个点,只作旁证。清空即不显示。")
+        _show_vix = bool(_vix_pick)
 
         # Window slice keeps the anchor row (last close on/before the window
         # start) so the period change is measured against the true base point —
@@ -1217,49 +1234,64 @@ with tab_sse:
         # are incomparable with index points, so it never shares the left
         # scale. 数据源:qvix_self_history(上交所官方期权风险指标反推,
         # 不是 optbbs——见 qvix_calc.py 顶部说明)。阈值线现算
-        # (_QVIX_THR_COMBOS,见上方 load_qvix_threshold_combos)——候选
-        # 组合已收敛到只剩标准的2年90%一组,不再提供勾选,随VIX直接画。
-        qvix_view = None
+        # (见上方 load_qvix_thresholds)——分位组合已收敛到只剩标准的
+        # 2年90%一组,不再提供勾选,随所选标的直接画。
+        _qvix_hist = _thr_df = None
         if _show_vix:
-            _qvix = load_qvix_self(fetcher.qvix_self_history_last_date())
-            if _qvix is not None and not _qvix.empty:
-                qvix_view = _qvix.dropna(subset=["qvix"]).copy()
-                qvix_view["date"] = pd.to_datetime(qvix_view["date"])
-                qvix_view = qvix_view[
-                    (qvix_view["date"] >= view["date"].min())
-                    & (qvix_view["date"] <= view["date"].max())]
-            if qvix_view is None or qvix_view.empty:
-                st.caption("⚠️ VIX恐慌指数数据暂不可用")
-                qvix_view = None
-        if qvix_view is not None:
+            _qvix_hist = load_qvix_self(fetcher.qvix_self_history_last_date())
+            if _qvix_hist is not None and not _qvix_hist.empty:
+                _qvix_hist = _qvix_hist.copy()
+                _qvix_hist["date"] = pd.to_datetime(_qvix_hist["date"])
+                _qvix_hist = _qvix_hist[
+                    (_qvix_hist["date"] >= view["date"].min())
+                    & (_qvix_hist["date"] <= view["date"].max())]
+            _thr_df = load_qvix_thresholds(
+                fetcher.qvix_self_history_last_date())
+        _drawn = []
+        if _qvix_hist is not None and not _qvix_hist.empty:
+            for _label in _vix_pick:
+                _suffix, _color = _QVIX_LINES[_label]
+                _col = f"qvix{_suffix}"
+                if _col not in _qvix_hist.columns:
+                    continue
+                _line = _qvix_hist.dropna(subset=[_col])
+                if _line.empty:
+                    continue
+                _drawn.append(_label)
+                fig_sse.add_trace(go.Scatter(
+                    x=_line["date"], y=_line[_col],
+                    name=f"{_label}波指", yaxis="y2",
+                    line=dict(color=_color, width=1.3),
+                    hovertemplate=f"{_label}波指 " + "%{y:.2f}<extra></extra>"))
+                if _thr_df is None or f"thr{_suffix}" not in _thr_df.columns:
+                    continue
+                _t = _thr_df[
+                    (_thr_df["date"] >= view["date"].min())
+                    & (_thr_df["date"] <= view["date"].max())
+                ].dropna(subset=[f"thr{_suffix}"])
+                if _t.empty:
+                    continue
+                fig_sse.add_trace(go.Scatter(
+                    x=_t["date"], y=_t[f"thr{_suffix}"],
+                    name=f"{_label}恐慌阈值(2年90%)", yaxis="y2",
+                    line=dict(color=_color, width=1.2, dash="dash"),
+                    hovertemplate=f"{_label}阈值 " + "%{y:.2f}<extra></extra>"))
+        if _show_vix and not _drawn:
+            st.caption("⚠️ VIX恐慌指数数据暂不可用")
+        if _drawn:
             fig_sse.data[0].name = "上证指数"
             fig_sse.data[0].showlegend = True
-            fig_sse.add_trace(go.Scatter(
-                x=qvix_view["date"], y=qvix_view["qvix"],
-                name="VIX恐慌指数(QVIX,自算)", yaxis="y2",
-                line=dict(color="#f28e2b", width=1.3),
-                hovertemplate="VIX %{y:.2f}<extra></extra>"))
             # Default (right-side vertical) legend keeps clear of the
             # 跌超1% annotations that sit above the plot area.
             fig_sse.update_layout(
                 yaxis2=dict(title="VIX恐慌指数", overlaying="y", side="right",
                             showgrid=False))
-            _thr_combos_df = load_qvix_threshold_combos(
-                fetcher.qvix_self_history_last_date())
-            if _thr_combos_df is not None:
-                _thr_view = _thr_combos_df[
-                    (_thr_combos_df["date"] >= view["date"].min())
-                    & (_thr_combos_df["date"] <= view["date"].max())]
-                for _label, _window, _pct, _color in _QVIX_THR_COMBOS:
-                    _line = _thr_view.dropna(subset=[_label])
-                    if _line.empty:
-                        continue
-                    fig_sse.add_trace(go.Scatter(
-                        x=_line["date"], y=_line[_label],
-                        name=f"恐慌阈值({_label})", yaxis="y2",
-                        line=dict(color=_color, width=1.2, dash="dash"),
-                        hovertemplate=f"阈值({_label}) " +
-                                      "%{y:.2f}<extra></extra>"))
+            # 300 波指 2019-12-23(510300期权上市)才有, 阈值还要再攒满 490
+            # 个交易日的窗口。选了却没画出来时说一句, 免得看着像坏了。
+            _absent = [x for x in _vix_pick if x not in _drawn]
+            if _absent:
+                st.caption(f"⚠️ 这个区间内没有 {'、'.join(_absent)} 的数据"
+                           "(300ETF期权 2019-12-23 才上市)")
 
         if _show_bands:
             _add_sse_drop_bands(fig_sse, sse_df,
@@ -1853,10 +1885,18 @@ with tab_sse:
                 "日涨跌(%)": pd.to_numeric(_sse_table["pct"],
                                          errors="coerce").round(2),
             })
-            if qvix_view is not None:
-                _q = qvix_view.assign(
-                    日期=qvix_view["date"].dt.strftime("%Y-%m-%d"),
-                    **{"VIX恐慌指数": qvix_view["qvix"].round(2)})
-                _tbl = _tbl.merge(_q[["日期", "VIX恐慌指数"]],
-                                  on="日期", how="left")
+            # 图上画了哪几条波指, 表里就跟着出哪几列(_drawn 是上面实际画成
+            # 的那批, 不是勾选的那批 —— 勾了但区间内没数据的不该在表里留个
+            # 空列)。
+            if _qvix_hist is not None and _drawn:
+                _q = _qvix_hist.assign(
+                    日期=_qvix_hist["date"].dt.strftime("%Y-%m-%d"))
+                _qcols = ["日期"]
+                for _label in _drawn:
+                    _suffix, _ = _QVIX_LINES[_label]
+                    _name = f"{_label}波指"
+                    _q[_name] = pd.to_numeric(_q[f"qvix{_suffix}"],
+                                              errors="coerce").round(2)
+                    _qcols.append(_name)
+                _tbl = _tbl.merge(_q[_qcols], on="日期", how="left")
             st.dataframe(_tbl, use_container_width=True, height=420)
