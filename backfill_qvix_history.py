@@ -22,15 +22,8 @@ docstring)。干脆自己按标准方法论把历史重算一遍,不再依赖 op
 更新 fetcher.update_qvix_self_daily() 共用同一套实现),这里只是批量
 循环 + 提前一次性拉好整段历史(50ETF价格、SHIBOR)避免每天重复拉取。
 
---series 选标的:50ETF(510050,默认,策略在用的生产信号)或 300ETF
-(510300,沪深300波指,写 qvix300/note300/threshold300 三列)。两条序列
-同一套方法论、同一个接口,只是筛的合约前缀不同(见 qvix_calc 里
-_UNDERLYING_NAMES 那段)。300 的下界是 510300 期权上市日 2019-12-23,
-更早的日子没有合约。
-
 用法:
-  python3 backfill_qvix_history.py                # 50ETF,2018年至今全量
-  python3 backfill_qvix_history.py --series 300   # 300ETF,2019-12-23至今
+  python3 backfill_qvix_history.py                # 2018年至今全量
   python3 backfill_qvix_history.py --start 2024-01-01
 """
 
@@ -64,25 +57,16 @@ def main():
                              f"早于此日期会被钳到{_MIN_DATE.isoformat()}(2015-2017数据判定为噪声,不再使用)")
     parser.add_argument("--end", type=str, default=None, help="截止日期 YYYY-MM-DD,默认今天(补历史缺口时用,避免重跑已有区间)")
     parser.add_argument("--delay", type=float, default=0.15, help="每个交易日请求间隔秒数,别对官方接口太猛")
-    parser.add_argument("--series", choices=("50", "300"), default="50",
-                        help="算哪只标的的波指:50=510050(默认,写 qvix 列);"
-                             "300=510300(写 qvix300 列)")
     args = parser.parse_args()
 
     fetcher.init_db()
-    suffix = "" if args.series == "50" else args.series
-    underlying = "510050" if args.series == "50" else "510300"
-    name = qc._UNDERLYING_NAMES[underlying]
-    # 50 的下界是"2015-2017噪声太大"这个判断(见模块docstring), 300 的下界是
-    # 硬约束——510300 期权 2019-12-23 才上市, 更早的日子根本没有合约。
-    floor = _MIN_DATE if args.series == "50" else fetcher.QVIX300_START
-
     today = dt.datetime.now(_CST).date()
     start = (dt.datetime.strptime(args.start, "%Y-%m-%d").date()
-             if args.start else floor)
-    if start < floor:
-        log.warning("起始日期%s早于%s,已钳到%s", start, floor, floor)
-        start = floor
+             if args.start else _MIN_DATE)
+    if start < _MIN_DATE:
+        log.warning("起始日期%s早于%s,已钳到%s(2015-2017数据判定为噪声,见模块docstring)",
+                    start, _MIN_DATE, _MIN_DATE)
+        start = _MIN_DATE
     end = (dt.datetime.strptime(args.end, "%Y-%m-%d").date()
            if args.end else today)
 
@@ -90,10 +74,10 @@ def main():
     cal = fetcher.ak.tool_trade_date_hist_sina()
     cal["trade_date"] = pd.to_datetime(cal["trade_date"]).dt.date
     dates = sorted(d for d in cal["trade_date"] if start <= d <= end)
-    log.info("[%s] 共 %d 个交易日(%s ~ %s)", name, len(dates), dates[0], dates[-1])
+    log.info("共 %d 个交易日(%s ~ %s)", len(dates), dates[0], dates[-1])
 
-    log.info("拉%s历史价格…", name)
-    spot_df = fetcher.ak.fund_etf_hist_sina(symbol=f"sh{underlying}")
+    log.info("拉50ETF历史价格…")
+    spot_df = fetcher.ak.fund_etf_hist_sina(symbol="sh510050")
     spot_df["date"] = pd.to_datetime(spot_df["date"]).dt.date
     spot_map = dict(zip(spot_df["date"], spot_df["close"]))
 
@@ -119,11 +103,10 @@ def main():
         curve = shibor_map.get(d)
         if spot is None:
             results.append({"date": d.isoformat(), "qvix": None,
-                            "note": f"无{name}当日收盘价"})
+                            "note": "无50ETF当日收盘价"})
             fail += 1
         else:
-            vix, err = qc.compute_qvix_for_date(d, spot=spot, shibor_curve=curve,
-                                                underlying=underlying)
+            vix, err = qc.compute_qvix_for_date(d, spot=spot, shibor_curve=curve)
             if vix is None:
                 results.append({"date": d.isoformat(), "qvix": None, "note": err})
                 fail += 1
@@ -137,7 +120,7 @@ def main():
                      i + 1, len(dates), ok, fail, elapsed / 60, eta / 60)
         time.sleep(args.delay)
 
-    fetcher.save_qvix_self_history(results, suffix)
+    fetcher.save_qvix_self_history(results)
 
     log.info("重算滚动2年90分位恐慌阈值…")
     # 窗口/最小样本/分位一律引用 fetcher 的常量, 不在这里再写一遍数字 ——
@@ -145,13 +128,13 @@ def main():
     # 不 shift, 存"截至该日收盘"的值, 理由同 fetcher.update_qvix_self_daily。
     hist = fetcher.load_qvix_self_history()
     hist = hist.sort_values("date").reset_index(drop=True)
-    thr = (pd.to_numeric(hist[f"qvix{suffix}"], errors="coerce")
+    thr = (pd.to_numeric(hist["qvix"], errors="coerce")
            .rolling(fetcher.QVIX_THR_WINDOW, min_periods=fetcher.QVIX_THR_MINP)
            .quantile(fetcher.QVIX_THR_PCT))
-    fetcher.save_qvix_self_threshold(hist["date"].tolist(), thr.tolist(), suffix)
+    fetcher.save_qvix_self_threshold(hist["date"].tolist(), thr.tolist())
 
-    log.info("✅ %s 完成,写入 %d 条(成功%d 失败%d),总耗时 %.1f 分钟",
-             name, len(results), ok, fail, (time.time() - t0) / 60)
+    log.info("✅ 完成,写入 %d 条(成功%d 失败%d),总耗时 %.1f 分钟",
+             len(results), ok, fail, (time.time() - t0) / 60)
 
 
 if __name__ == "__main__":

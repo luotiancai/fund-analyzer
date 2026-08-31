@@ -706,7 +706,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  top_min_vol_ratio=None,
                  signal_mode: str = "threshold",
                  jump_days: int = 3, jump_pct: float = 0.20,
-                 max_drop: float = 30.0, qvix_series: str = "50"):
+                 max_drop: float = 30.0):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
     的 475/490 那套道理)。默认 490/0.90 是当前线上在用的参数
@@ -880,19 +880,13 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     # Load QVIX —— 自算(qvix_self_history,上交所官方期权风险指标反推,
     # 不再是 optbbs 的 index_daily_cache)。阈值按传入的 window/pct 现算,
     # 不用表里预存的那一列(那一列固定是线上用的490/0.90)。
-    print(f"加载数据... (信号序列={qvix_series}ETF波指, 窗口={window}天, 分位={pct}, 排名依据={ret_col}, "
+    print(f"加载数据... (窗口={window}天, 分位={pct}, 排名依据={ret_col}, "
           f"方向={pick}, 相关系数门槛={min_corr}, 波动率比值下限={min_vol_ratio}, "
           f"回撤线除数={dd_divisor})")
-    # 信号序列: "50"=50ETF波指(qvix 列, 生产口径), "300"=沪深300波指
-    # (qvix300 列)。只取需要的那三列重建 DataFrame, 不用 rename —— 两条
-    # 序列同在一张宽表里, rename 容易把另一条的列名也带进来。
-    _sfx = "" if qvix_series == "50" else qvix_series
-    _hist = fetcher.load_qvix_self_history()
-    qvix = pd.DataFrame({
-        "date": pd.to_datetime(_hist["date"]),
-        "close": pd.to_numeric(_hist[f"qvix{_sfx}"], errors="coerce"),
-        "note": _hist[f"note{_sfx}"],
-    })
+    qvix = fetcher.load_qvix_self_history()
+    qvix = qvix.rename(columns={"qvix": "close"})
+    qvix["date"] = pd.to_datetime(qvix["date"])
+    qvix["close"] = pd.to_numeric(qvix["close"], errors="coerce")
     qvix = qvix.sort_values("date").reset_index(drop=True)
     minp = int(window * minp_ratio)
     # .shift(1):信号日 d 比的是"截至 d-1 收盘"的分位, 不含 d 当天——实盘
@@ -1292,12 +1286,6 @@ def main():
                         help="跌幅深度上限(正数百分比), 只对跌幅分支生效。"
                              "默认30(2026-08-12 定档, 见 run_backtest 说明);"
                              "传 none 取消上限")
-    parser.add_argument("--qvix-series", choices=["50", "300"], default="50",
-                        help="信号用哪只标的的波指:50=50ETF(默认, 生产口径, "
-                             "阈值从2019-12起有值);300=沪深300(510300期权"
-                             "2019-12-23上市, 攒满490个交易日窗口后阈值从"
-                             "2021-12-08才有值, 样本比50短约1.7年——要跟50"
-                             "比就给50也加 --min-signal-date 2021-12-08)")
     parser.add_argument("--signal-mode", choices=["threshold", "jump"],
                         default="threshold",
                         help="买入信号来源: threshold(默认,线上口径)=QVIX高过"
@@ -1382,8 +1370,7 @@ def main():
                           top_min_vol_ratio=args.top_min_vol_ratio,
                           max_drop=args.max_drop,
                           signal_mode=args.signal_mode,
-                          jump_days=args.jump_days, jump_pct=args.jump_pct,
-                          qvix_series=args.qvix_series)
+                          jump_days=args.jump_days, jump_pct=args.jump_pct)
     elapsed = time.time() - t0
 
     if not trades:
@@ -1405,9 +1392,6 @@ def main():
                     and args.min_signal_date is None
                     and args.top_min_vol_ratio is None
                     and args.signal_mode == "threshold"
-                    # 信号序列也得是标准那条: 300 波指跑批是对照实验, 绝不
-                    # 能顶掉主复盘表(它的样本区间还比 50 短 1.7 年)。
-                    and args.qvix_series == "50"
                     and args.max_drop == 30.0
                     and not args.no_require_drop)
     _params = {
@@ -1432,9 +1416,6 @@ def main():
         "signal_mode": args.signal_mode,
         "jump_days": args.jump_days if args.signal_mode == "jump" else None,
         "jump_pct": args.jump_pct if args.signal_mode == "jump" else None,
-        # 信号取自哪条波指序列(50=50ETF, 300=沪深300)。历史跑批之间比较时
-        # 必须先看这一项 —— 两条序列水平差 2~3 个点, 阈值也各算各的。
-        "qvix_series": args.qvix_series,
     }
     if args.no_save:
         print("--no-save: 这次不落库")
