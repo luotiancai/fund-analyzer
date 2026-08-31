@@ -19,8 +19,13 @@
 报个数、不进表: 它们被一条跟基金本身无关的规则一刀切掉, 逐只列会把表刷满
 (实测某天有 48 只)。
 
-不显示"QVIX 是否触发信号": 页面拿到的只是昨收, 而盘中实时值要跑 qvix_now.py
-(qvix.command), 在页面上摆一个基于昨收的"未触发"反而误导。
+"QVIX 是否触发信号"只对**历史日期**报, 当天不报: 当天页面拿到的只是昨收,
+而盘中实时值要跑 qvix_now.py(qvix.command), 摆一个基于昨收的"未触发"反而
+误导; 历史日期的收盘值是定局, 那天有没有信号恰恰是解读结果的前提 —— 没信号
+的日子策略根本不买, 选中那只只是"假如买会买哪只"。
+
+scan(asof) 收任意决策日, 不是只能算今天: 口径全是 T-1, 换个日期算的就是那天
+收盘后该买哪只。回测只留结果, 这里能看见完整的淘汰路径。
 
 ⚠️ 所有指标都是**信号日 T-1 口径**(基金净值当晚才公布, 决策时看不到当天),
 跟回测完全一致; 规模用信号日当时**已披露**的最新季报(无未来函数)。
@@ -72,22 +77,39 @@ def _threshold(asof: pd.Timestamp):
     return r["date"], r["close"], r["thr"]
 
 
-def data_freshness(conn):
-    """(净值库最新日, 上证最新日, 落后几个交易日)。
+def data_freshness(conn, asof=None):
+    """(净值库最新日, 上证最新日, 落后几个交易日, 该决策日要的最后净值日, 缺几个交易日)。
 
     这个功能最容易出的错不是算错, 是**拿旧数据算出一个看起来很正常的答案**
     —— 本地跑回测习惯带 --no-sync, 净值库停在几天前也不会报错。所以调用方
-    必须先看这个: 净值库比上证行情落后几个交易日, 就是答案过期几天。
+    必须先看这个。
+
+    两个数不是一回事, 别拿 behind 当判据:
+      · behind = 净值库落后上证多少个交易日, 只说明**库本身**新不新;
+      · missing = 这个 asof **能不能算准**。T-1 口径要的是早于 asof 的最后
+        一个交易日(need_date)的净值, 库到了 need_date 就够 —— 上证多出
+        今天这根 K 线不影响昨天的答案。
+
+    回看历史日期时两者会彻底分家: 库停在上周而你在算 2026-06 那天, behind
+    说"不新"是对的, 但那天要的净值早就齐了, 拿 behind 判会天天报一个假警;
+    反过来 asof=今天、库停在几天前, missing 才会如实报出缺几天。
     """
     nav_max = conn.execute(
         "SELECT MAX(date) d FROM fund_nav_daily").fetchone()["d"]
     sse = B.load_cached_json(conn, "sse")
     sse_max = sse["date"].max()
     if not nav_max:
-        return None, sse_max, None
+        return None, sse_max, None, None, None
     nav_max = pd.Timestamp(nav_max)
     behind = int((sse["date"] > nav_max).sum())
-    return nav_max, sse_max, behind
+    need_date = missing = None
+    if asof is not None:
+        prior = sse.loc[sse["date"] < pd.Timestamp(asof), "date"]
+        if not prior.empty:
+            need_date = prior.max()
+            missing = int(((sse["date"] > nav_max)
+                           & (sse["date"] <= need_date)).sum())
+    return nav_max, sse_max, behind, need_date, missing
 
 
 def _ret3m_window(conn, code: str, asof_s: str):
@@ -173,11 +195,12 @@ def scan(asof, top: int = 40) -> dict:
 
     asof = pd.Timestamp(asof)
     qdate, qvix, thr = _threshold(asof)
-    nav_max, sse_max, behind = data_freshness(conn)
+    nav_max, sse_max, behind, need_date, missing = data_freshness(conn, asof)
     out = {"asof": asof, "qdate": qdate, "qvix": qvix, "thr": thr,
            "hit": (qvix is not None and thr is not None
                    and not pd.isna(thr) and qvix > thr),
            "nav_max": nav_max, "sse_max": sse_max, "behind": behind,
+           "need_date": need_date, "missing": missing,
            "std": STD, "rows": [], "too_deep": 0, "chosen": None,
            "fund_line": None, "sse_line": None, "names": names}
     if thr is None or pd.isna(thr):
