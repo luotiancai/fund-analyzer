@@ -2,14 +2,16 @@
 """把云端的库同步到本地(按库、按需、远端没变就不下)。
 
     python3 sync_down.py                 # 同步日常那几个小库(约 2MB)
-    python3 sync_down.py market          # 只同步上证/QVIX(约 0.2MB)
+    python3 sync_down.py qvix            # 只同步 QVIX/阈值(约 0.05MB)
+    python3 sync_down.py market          # 只同步上证行情(约 0.2MB)
     python3 sync_down.py --all           # 连净值/规模一起(约 65MB)
     python3 sync_down.py --status        # 只看本地和云端各是什么版本
 
 分库之前, 本地想要一点新数据的最小粒度是 62MB 的重表段 —— 想同步今天的
 QVIX 也得整段拉, 于是实际上从来不同步, 本地库一路飘。现在按库拉:
 
-    market.db     ~0.2MB   上证/QVIX/阈值   每天要
+    qvix.db       ~0.05MB  QVIX/阈值        每天要
+    market.db     ~0.2MB   上证行情         每天要
     fund_rank.db  ~2MB     榜单/指标        每天要
     fund_scale.db ~3MB     季度规模/持仓    一季度一次
     fund_nav.db   ~60MB    净值             跑回测前偶尔一次
@@ -22,10 +24,10 @@ QVIX 也得整段拉, 于是实际上从来不同步, 本地库一路飘。现�
   · cache 是缓存, 拉了没意义。
 要拉这些得显式点名。
 
-⚠️ **market 平时以云端为准**(qvix/threshold 由线上每日跑批产出), 但只要你
-本地往 market 里回填过历史, 就得先推再拉 —— 同步是**整库文件替换**, 直接拉
-会把本地还没推的那批整段冲掉。2026-08-13 就这么丢过约 790 天的期权偏度回填,
-只能重跑 20 分钟补回来。
+⚠️ **market 平时以云端为准**(上证行情由线上每日跑批产出; qvix/threshold
+2026-08-28 起拆去 qvix.db, 由 VPS 写), 但只要你本地往 market 里回填过历史,
+就得先推再拉 —— 同步是**整库文件替换**, 直接拉会把本地还没推的那批整段冲掉。
+2026-08-13 就这么丢过约 790 天的期权偏度回填, 只能重跑 20 分钟补回来。
 正确顺序: **先 `python3 push_dbs.py market` 推上去, 再 sync_down**。
 """
 

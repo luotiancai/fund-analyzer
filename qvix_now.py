@@ -211,12 +211,17 @@ def main() -> int:
     # 那个前提不成立了, 而且本机算的正是云端凌晨已经算好的同一个数(两边都
     # 是补"上一个已收盘交易日", 同一个上交所接口)。改成直接拉云端那份:
     #   · 少打一次上交所接口 + 少算一次滚动分位;
-    #   · market.db 从此只有云端一个写入方, 本地纯消费, 不会有覆盖问题。
+    #   · qvix.db 从此只有 VPS 一个写入方, 本地纯消费, 不会有覆盖问题。
     # 注意**盘中实时值不入库** —— 它只落 qvix_now.json(见下面 OUT), 所以
     # 同步整个文件替换不会碰掉任何本机自产的数据。
+    #
+    # 拉的是 qvix 不是 market: 2026-08-28 把 qvix_self_history 从 market.db
+    # 拆进独立的 qvix.db(见 fetcher.DB_LAYOUT)之后, 这里还在拉 market, 于是
+    # 本地 qvix.db 再没被更新过 —— 09-03 盘中打出来的阈值还写着"截至
+    # 08-28"(线上那份已经到 09-02), 而且是静悄悄的, 同步照样报成功。
     try:
         import sync_down
-        sync_down.sync(["market"], quiet=True)
+        sync_down.sync(["qvix"], quiet=True)
     except Exception as e:
         log.warning("QVIX 历史同步失败(%s), 阈值可能不是最新", e)
 
