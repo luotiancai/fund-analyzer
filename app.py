@@ -35,6 +35,12 @@ import fetcher
 
 _CST = ZoneInfo("Asia/Shanghai")
 
+# 「可买池分位」列名。这一列不是回测产出的, 是 pct_rank.py 事后算好写回
+# trades 的(见那个脚本的 docstring), 所以列可能不在——标准跑批换了而
+# pct_rank.py 没补跑时就是这样。名字在两处出现过, 写死成常量免得改一处漏
+# 一处; 跟 pct_rank.COL 必须一致。
+COL_POOL_PCT = "可买池分位"
+
 
 def _fmt_cst(ts: float, fmt: str) -> str:
     """Unix ts → 北京时间字符串,不依赖服务器自身时区(云端容器多半是
@@ -1384,6 +1390,15 @@ with tab_sse:
                 _days = pd.to_numeric(_done["持有天数"], errors="coerce").dropna()
                 _best_i = _rets.idxmax()
                 _cum_ex = ((1 + _rets.drop(_best_i) / 100).prod() - 1) * 100
+                # 平均可买池分位现算, 别写死: 这列由 pct_rank.py 事后写回
+                # trades, 换一次标准策略笔数和数值都会变(2026-09-04 加
+                # sell_cooldown 那次就从 8 笔的旧数变成 9 笔)。列不在(标准
+                # 跑批还没补跑 pct_rank.py)时整句不显示, 而不是显示一个假数。
+                _pcts = pd.to_numeric(
+                    _bt_df.get(COL_POOL_PCT, pd.Series(dtype=str))
+                    .astype(str).str.rstrip("%"), errors="coerce").dropna()
+                _pct_txt = (f";{len(_pcts)}笔平均{_pcts.mean():.1f}%"
+                            if len(_pcts) else "")
                 _loss = _rets[_rets <= 0]
                 _loss_txt = ("、".join(f"{v:+.2f}%" for v in _loss)
                              if len(_loss) else "无")
@@ -1400,7 +1415,8 @@ with tab_sse:
                     "「可买池分位」是这一笔在当天**本来可以买的所有基金**(规模≥2亿、"
                     "排除QDII/海外和持有期锁定和净值脏数据,一两千只)里排第几——分母"
                     "**不含**策略自己那三道筛选(真跌/跌幅≤30%/波动≥1.5),否则等于给"
-                    "筛选免票;每只都按同一套双止损跑过,50%就是闭眼瞎选;8笔平均88.1%。"
+                    "筛选免票;每只都按同一套双止损跑过,50%就是闭眼瞎选"
+                    f"{_pct_txt}。"
                     "候选须同时满足\"真正下跌但跌幅≤30% + 波动率比值≥1.5 + 规模≥2亿\""
                     "(2026-08-12 在修好除权 bug 的数据上重验后定档:波动门槛低于1.5会让"
                     "跌幅榜被\"没真跌的低波动标的\"占据;10亿上限的依据是事后最优解"
@@ -1466,7 +1482,7 @@ with tab_sse:
                     # 由 pct_rank.py 单独算好写进 trades —— 每个信号日要给一两千
                     # 只基金逐日跑止损, 约15分钟, 不适合塞进每次回测。
                     # ⚠️ 换了标准策略要重跑 pct_rank.py, 否则这列是上一版的旧数。
-                    "卖出日", "持有收益", "可买池分位", "期间最高", "期间最大回撤",
+                    "卖出日", "持有收益", COL_POOL_PCT, "期间最高", "期间最大回撤",
                     "同期上证",
                 ] if c in _review_df.columns]].copy()
                 # 「备注」是人工点评(backtest_notes 表), 算不出来、只能人写,

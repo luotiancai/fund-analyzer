@@ -1473,6 +1473,14 @@ def main():
         print(f"已存为策略跑批 #{_rid}「{_lbl}」"
               + ("(默认参数, 标记为线上标准策略, 主复盘表读它)"
                  if _is_standard else "(对照实验, 页面历史列表里可翻到)"))
+        # 「可买池分位」那一列是 pct_rank.py 另外算好写回 trades 的, 回测
+        # 本身不产出。换了标准策略只重跑这个脚本, 复盘表上那一列会整列变空
+        # (2026-09-04 加 sell_cooldown 那次就是这样), 所以标准跑批落库后
+        # 直接把下一条命令打出来, 别指望人记得。
+        if _is_standard:
+            print(f"⚠️  接着跑 `python3 pct_rank.py {_rid}` 补「可买池分位」"
+                  f"(约15分钟), 否则复盘表上那一列是空的; 两步都做完再 "
+                  f"`python3 push_dbs.py strategy`。")
 
     df = pd.DataFrame(trades)
     print(f"\n{'='*110}")
