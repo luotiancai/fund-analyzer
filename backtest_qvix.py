@@ -1,6 +1,7 @@
 """
 回测: QVIX恐慌信号买入 + 双止损(基金回撤控制线 / 大盘回撤线)
-- 买入: QVIX > 2年90分位阈值, 且资金可用(空仓或当天恰好卖出)
+- 买入: QVIX > 2年90分位阈值, 且资金可用(空仓, 且距上次卖出已隔 2 个交易日 ——
+  场外基金 T 日赎回、T+1 确认份额、资金 T+2 才到账, 卖出当天和次日都买不进去)
   · 找不到"真正跌过"的合格候选就放弃当天, 顺延到下一个信号日
     (2026-08-12 之前这里有"改买涨幅最大"的兜底和配套的"顺延至标的换掉",
      两条都已删除, 理由见 run_backtest 里买入那段注释)
@@ -65,9 +66,18 @@ NAV_ANOMALIES = {
 # 默认值随之从 720/0.95 改过来; min_aum=0.5 于 2026-07-28 加入)
 #
 #   笔数  胜率       累计收益(费后复利)  平均持有  平均收益(费后)
-#   9    8/9=88.9%  +878.95%          69天      +33.65%
+#   9    8/9=88.9%  +922.26%          69天      +34.17%
 #   (唯一亏损是012847诺安积极回报-0.10%, 基本打平; 最佳是021528财通成长
 #   优选+140.43%)
+#
+#   ⚠️ 2026-09-04 口径变更: 卖出后隔 2 个交易日才能买(sell_cooldown=2,
+#   赎回款 T+2 到账)。以前允许"当天卖完当天买", 全表只有一处被它撑着 ——
+#   2024-09-26 那笔 10-09 双线止损, 旧口径 10-10 就买了海富通科技创新
+#   (009024), 那天钱还在路上。改完之后同一只推迟到 10-11(那天也是信号日),
+#   买得更便宜: +6.66% → +11.40%, 总数 +878.95% → +922.26%。
+#   **只动了这一笔**, 其余八笔买卖日和标的一个字没变 —— 因为全历史就这一次
+#   出现"卖出后两个交易日内又逢信号日"。跑批 #53 是变更后的第一条标准。
+#   要复现变更前的数字: --sell-cooldown 0(实测精确回到 +878.95%)。
 #
 #   ⚠️ 2026-08-31 口径变更: "QVIX 算不出来的日子"现在也算信号日(那天不是
 #   没数据, 是行情极端到把公式撑爆了 —— 见 qvix_calc.CHAIN_BROKEN)。84 个
@@ -78,7 +88,7 @@ NAV_ANOMALIES = {
 #   跑批 #52「信号换成沪深300波指(对照)」是 2026-08-31 那次多标的实验留下
 #   的记录, 代码里已经没有 --qvix-series 这个选项了(整套撤掉, 原委见
 #   qvix_calc._UNDERLYING 上方)。那条跑批留着当证据: 同区间 300 是 +801.22%,
-#   不如 50 的 +878.95%。
+#   不如 50 的 +878.95%(两边都是 sell_cooldown=0 之前的口径, 可比)。
 #
 #   样本只有9笔、跨6年, 高胜率是"一笔小亏变成小赚"的结果, 统计上毫无
 #   意义, 别当成可靠预期。
@@ -705,6 +715,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  min_vol_ratio: float = 1.5, dd_divisor: float = 5.0,
                  min_aum: float = 2.0, require_drop: bool = True,
                  regime_basis: str = "day", no_same_day_rebuy: bool = False,
+                 sell_cooldown: int = 2,
                  max_aum: float = None,
                  aum_basis: str = "merged",
                  min_signal_date: str = None,
@@ -723,6 +734,16 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     后面被 ret_col/pick 这条反转策略取代, 相关系数过滤对新逻辑没有
     实测过、也没有继续保留的理由, 显式关掉。仍保留参数只是为了不删掉
     这条已验证过有效的机制, 以后想重新启用可以传 0.6。
+
+    sell_cooldown(2026-09-04 加, 默认 2=标准): 卖出后隔几个交易日才允许下一次
+    买入。场外基金赎回是 T 日申请 / T+1 确认份额 / 资金 T+2 到账, 所以卖出
+    当天和次日手上根本没有钱, 最早能申购的是 T+2。在这条规则之前, 回测允许
+    "当天卖完当天就买"(甚至买回同一只), 那是**做不到的交易** —— 标准策略里
+    2024-10-10 买海富通科技创新(009024)就是这么来的: 前一交易日 2024-10-09
+    刚双线止损卖掉华富健康文娱, 资金要到 10-11 才到账。传 0 恢复旧口径(只用来
+    跟历史跑批对齐, 别拿它当策略)。
+    注意 no_same_day_rebuy 在 sell_cooldown>=1 时已经无事可做: 卖出当天连买
+    别的都不行, 更不用说买回同一只。
 
     ret_col/pick: 排名依据("ret_1m"近1月/"ret_3m"近3月)和方向
     ("top"=选最高即冠军/动量, "bottom"=选最低即跌幅最大/反转候选,
@@ -967,10 +988,14 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     trades = []
     position = None
 
-    # 逐交易日走: 持仓时每天检查双止损线, 空仓(或当天刚卖出)遇信号日则买入
+    # 逐交易日走: 持仓时每天检查双止损线, 空仓且资金已到账时遇信号日则买入
     all_days = sse[sse["date"] >= _signal_floor]
 
-    for _, day_row in all_days.iterrows():
+    # 赎回款到账前不能买: 卖出日的下标 + sell_cooldown 才解冻(见该参数说明)。
+    # 用下标而不是日历天数, 因为"后天"要的是下下个**交易日**。
+    unlocked_i = 0
+
+    for i, (_, day_row) in enumerate(all_days.iterrows()):
         day = day_row["date"]
         day_str = day.strftime("%Y-%m-%d")
         sse_close = float(day_row["close"])
@@ -1043,9 +1068,10 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                 })
                 sold_today = code
                 position = None
+                unlocked_i = i + sell_cooldown
 
-        # ── Step 2: 空仓(含当天刚卖出)且为信号日时买入 ──
-        if position is None and day in signal_map:
+        # ── Step 2: 空仓、赎回款已到账、且为信号日时买入 ──
+        if position is None and day in signal_map and i >= unlocked_i:
             threshold = signal_map[day]
             # pick="regime": 方向由大盘状态决定, 依据看 regime_basis
             # ("day"=信号日当天单日涨跌 / "window"=比一个回看窗口前、截至
@@ -1069,6 +1095,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
             # 止损卖出当天不许再买回同一只:双止损刚喊撤退就原地买回,
             # 等于止损白做(#6 的 2024-11-18 就是这样, 卖出 017513 当天
             # 又买回 017513, 接着亏 10.47%)。开关默认关, 保持旧行为。
+            # 2026-09-04 起 sell_cooldown(默认2)已经把"卖出当天买入"整个
+            # 堵死了, 这个开关只在显式 --sell-cooldown 0 时还有意义。
             _excl = exclude_codes
             if no_same_day_rebuy and sold_today:
                 _excl = (set(exclude_codes) if exclude_codes else set()) | {sold_today}
@@ -1203,6 +1231,9 @@ def _apply_chain_fees(trades):
     离场, 中间腿不收手续费; 只有链条最后一腿按"链条首次买入→该腿卖出"的
     累计持有天数收一次手续费(按实际持有时长计, 而非单腿天数)。
 
+    sell_cooldown>=1(2026-09-04 起的默认)下卖出日和下一笔买入日之间必然
+    隔着交易日, 接力链条根本组不出来, 这段等于恒走"每笔各收各的";
+    保留是因为 --sell-cooldown 0 还能复现旧口径。
     """
     n = len(trades)
     chain_start = None
@@ -1340,7 +1371,13 @@ def main():
                              "单日涨跌; window=比一个回看窗口前(截至前一交易日,"
                              "跟基金排名同口径)")
     parser.add_argument("--no-same-day-rebuy", action="store_true",
-                        help="止损卖出当天不许再买回同一只基金(默认允许)")
+                        help="止损卖出当天不许再买回同一只基金(默认允许)。"
+                             "注: --sell-cooldown 默认2已经禁掉了卖出当天的"
+                             "一切买入, 这个开关只在 --sell-cooldown 0 下有用")
+    parser.add_argument("--sell-cooldown", type=int, default=2,
+                        help="卖出后隔几个交易日才允许买入, 默认2(赎回款"
+                             "T+2到账, 卖出当天和次日买不进去)。传0=旧口径"
+                             "(卖出当天就能买), 只用来跟历史跑批对齐")
     parser.add_argument("--no-save", action="store_true",
                         help="这次不落库。默认每跑一次都追加一条到策略库"
                              "(strategy.strategy_runs), 页面能翻到历史每一跑;"
@@ -1370,6 +1407,7 @@ def main():
                           require_drop=not args.no_require_drop,
                           regime_basis=args.regime_basis,
                           no_same_day_rebuy=args.no_same_day_rebuy,
+                          sell_cooldown=args.sell_cooldown,
                           aum_basis=args.aum_basis,
                           min_signal_date=args.min_signal_date,
                           top_min_vol_ratio=args.top_min_vol_ratio,
@@ -1398,6 +1436,7 @@ def main():
                     and args.top_min_vol_ratio is None
                     and args.signal_mode == "threshold"
                     and args.max_drop == 30.0
+                    and args.sell_cooldown == 2
                     and not args.no_require_drop)
     _params = {
         "window": args.window, "pct": args.pct, "ret_col": _ret_col,
@@ -1409,6 +1448,9 @@ def main():
         # 只对 pick="regime" 有意义。页面按它描述规则, 不同跑批各说各的。
         "regime_basis": args.regime_basis if args.pick == "regime" else None,
         "no_same_day_rebuy": args.no_same_day_rebuy,
+        # 卖出→下次买入的冻结交易日数。2026-09-04 之前的跑批没有这个键,
+        # 等同于 0(卖出当天就能买回), 跟之后的跑批比较时必须先看这一项。
+        "sell_cooldown": args.sell_cooldown,
         # 规模口径。2026-08-06 之前的跑批是 "single"(只算被选中那个代码的
         # 份额类别), 之后是 "merged"(A/C 等份额合并)。同一个 min_aum 数值
         # 在两种口径下松紧完全不同, 历史跑批之间比较时必须先看这一项。

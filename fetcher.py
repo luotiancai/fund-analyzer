@@ -2074,6 +2074,11 @@ def describe_run(params: dict) -> str:
     # 这里不再拼这两段而改变, 所以直接不认这两个键。
     if p.get("no_same_day_rebuy"):
         bits.append("止损当天禁买回")
+    # 卖出→买入的冻结期。标准是 2 个交易日(赎回款 T+2 到账), 只在偏离标准
+    # 时点出来。2026-09-04 之前的跑批没有这个键, 那时的行为等同 0。
+    _cd = p.get("sell_cooldown")
+    if _cd is not None and _cd != 2:
+        bits.append("卖出当天即可买回" if _cd == 0 else f"卖出后冻结{_cd}个交易日")
     if p.get("min_aum") and p.get("max_aum"):
         bits.append(f"规模{p['min_aum']}~{p['max_aum']}亿")
     elif p.get("min_aum"):
