@@ -126,7 +126,6 @@ _rate_for_days = qvix_core.rate_for_days
 _years_to_expiry = qvix_core.years_to_expiry
 _candidate_pairs = qvix_core.candidate_pairs
 _term_variance = qvix_core.term_variance
-_expiry_candidates = qvix_core.expiry_candidates
 _fetch_chain = qvix_core.fetch_chain
 
 
@@ -140,8 +139,8 @@ def compute_qvix(as_of: Optional[dt.datetime] = None) -> Optional[tuple]:
 
     as_of 用于把结果"冻结"在某一刻(中午休市11:30 / 收盘后15:00), 调用方见
     fetcher.qvix_phase()。SHIBOR 取不到时的兜底利率仍走本项目的
-    fetcher.get_risk_free_rate()(1年期国债收益率, 带DB缓存); qvix_core 独立
-    部署到云函数时用它自己的默认常数。"""
+    fetcher.get_risk_free_rate()(1年期国债收益率, 带DB缓存); qvix_core 自己
+    也有一个默认常数, 单独跑它(python3 qvix_core.py)时用那个。"""
     try:
         fallback = fetcher.get_risk_free_rate()
     except Exception:
@@ -220,8 +219,8 @@ def shibor_curve_for_date(target_date: dt.date) -> Optional[list]:
 def _expiry_for_yymm(yymm: str) -> dt.date:
     """'2301' → 该月合约的**真实**到期日(第四个星期三,遇休市顺延至下一交易日)。
 
-    qvix_core.expiry_date_for_yymm 只算第四个周三就停了:那份文件要保持零
-    依赖(整个粘进云函数就得能跑),拿不到交易日历,所以"顺延"这一步只能在
+    qvix_core.expiry_date_for_yymm 只算第四个周三就停了:那份文件保持零
+    依赖(见它的模块说明),拿不到交易日历,所以"顺延"这一步只能在
     这里补。实时路径不需要补——它的到期日是从新浪接口取的真实值。
     2018年至今只撞上一次:2023-01-25 是春节休市,1月合约实际到期日是
     2023-01-30。漏掉顺延会让 2022-12-28~2023-01-20 共17个交易日的近月剩余

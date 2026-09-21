@@ -88,7 +88,8 @@ def main():
     ok_sina, _ = _step("Step 2: 新浪行情接口 (hq.sinajs.cn) — 自算QVIX核心依赖", test_sina_hq)
 
     # ── Step 3: akshare 期权合约代码列表 ──────────────────────────────
-    # compute_qvix → _fetch_chain → option_sse_codes_sina
+    # 跟 qvix_core._contract_codes_multi 打的是同一个新浪清单接口(它自己用
+    # urllib 直接拼 OP_UP_/OP_DOWN_, 不走 akshare), 这一格红了那边也拿不到。
     def test_opt_codes(timeout):
         import akshare as ak
         df = ak.option_sse_codes_sina(symbol="看涨期权", trade_date="2608",
@@ -96,15 +97,12 @@ def main():
         return f"拿到 {len(df)} 个认购合约代码"
     _step("Step 3: akshare option_sse_codes_sina (期权代码列表)", test_opt_codes, timeout=20)
 
-    # ── Step 4: akshare 到期日探测 ─────────────────────────────────────
-    # compute_qvix → _expiry_candidates → option_sse_expire_day_sina
-    def test_expire_day(timeout):
-        import akshare as ak
-        result = ak.option_sse_expire_day_sina(trade_date="2608", symbol="50ETF")
-        return f"到期日={result}"
-    _step("Step 4: akshare option_sse_expire_day_sina (到期日探测)", test_expire_day, timeout=20)
+    # 原 Step 4 探的是 option_sse_expire_day_sina(stock.finance.sina.com.cn 的
+    # getRemainderDay)。2026-09-21 那个接口整个挂掉(504/连接超时)之后, 到期日
+    # 改成从行情行第47个字段直接读, 它已经不在自算链路里了 —— 留着只会在它
+    # 继续挂的时候红一格, 让人以为自算坏了。见 qvix_core.fetch_chains_with_expiry。
 
-    # ── Step 5: 完整自算QVIX ───────────────────────────────────────────
+    # ── Step 4: 完整自算QVIX ───────────────────────────────────────────
     def test_compute_qvix(timeout):
         import fetcher
         fetcher.init_db()
@@ -112,10 +110,10 @@ def main():
         r = qvix_calc.compute_qvix()
         if r is not None:
             return f"QVIX={r[0]}, 时间={r[1]}"
-        return "compute_qvix 返回 None (链路内部某步失败,见上面Step 2-4)"
-    ok_self, _ = _step("Step 5: 完整自算QVIX (compute_qvix)", test_compute_qvix, timeout=45)
+        return "compute_qvix 返回 None (链路内部某步失败,见上面Step 2-3)"
+    ok_self, _ = _step("Step 4: 完整自算QVIX (compute_qvix)", test_compute_qvix, timeout=45)
 
-    # ── Step 6: optbbs 兜底 ───────────────────────────────────────────
+    # ── Step 5: optbbs 兜底 ───────────────────────────────────────────
     def test_optbbs(timeout):
         import akshare as ak
         df = ak.index_option_50etf_min_qvix()
@@ -126,7 +124,7 @@ def main():
                 last = df.iloc[-1]
                 return f"optbbs QVIX={last['qvix']:.2f}, 时间={last['time']}"
         return "optbbs 返回空数据"
-    ok_optbbs, _ = _step("Step 6: optbbs 兜底 (index_option_50etf_min_qvix)", test_optbbs, timeout=25)
+    ok_optbbs, _ = _step("Step 5: optbbs 兜底 (index_option_50etf_min_qvix)", test_optbbs, timeout=25)
 
     # ── 汇总 ──────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
