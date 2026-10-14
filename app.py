@@ -14,7 +14,6 @@ import numpy as np
 import pandas as pd
 import today_pick
 import plotly.express as px
-import plotly.graph_objects as go
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
@@ -30,7 +29,6 @@ except Exception:
     pass
 
 import fetcher
-import sse_view
 from sse_view import fmt_cst as _fmt_cst
 
 
@@ -330,60 +328,6 @@ def load_sse_daily(cache_key):
     return fetcher.fetch_sse_daily()
 
 
-_QVIX_COLOR = sse_view.QVIX_COLOR
-
-
-@st.cache_data(show_spinner="正在计算候选恐慌阈值…")
-def load_qvix_thresholds(cache_key):
-    """图上那条恐慌阈值线, 口径见 sse_view.qvix_thresholds。"""
-    return sse_view.qvix_thresholds(fetcher.load_qvix_self_history())
-
-
-@st.cache_data(show_spinner=False)
-def load_backtest_trades(cache_key):
-    """最新一次标准策略跑批的明细(策略库 strategy_runs,backtest_qvix.py
-    跑完落库)。cache_key 传数据库文件的 mtime:云端换快照、本地重跑回测
-    都会让它变,缓存随即失效,不需要额外的失效逻辑。"""
-    return fetcher.load_backtest_trades()
-
-
-@st.cache_data(show_spinner=False)
-def load_strategy_runs(cache_key):
-    """历次回测跑批的摘要(不含明细),新的在前。"""
-    return fetcher.list_strategy_runs()
-
-
-@st.cache_data(show_spinner=False)
-def load_strategy_run_detail(cache_key, run_id):
-    """某一次跑批的明细 → (DataFrame, params, run_at)。"""
-    return fetcher.load_strategy_run(run_id)
-
-
-@st.cache_data(show_spinner="正在加载VIX恐慌指数数据…")
-def load_qvix_self(cache_key):
-    """自算QVIX历史(qvix_self_history表,上交所官方期权风险指标反推,
-    不是 optbbs)。"""
-    return fetcher.load_qvix_self_history()
-
-
-# Red bands on trading days where 上证指数 fell over 1% — the user's main
-# operating signal, drawn on any date-axis figure that covers [dmin, dmax].
-def _add_sse_drop_bands(fig, sse, dmin, dmax):
-    if sse is None or sse.empty:
-        return
-    _d = pd.to_datetime(sse["date"])
-    _drop = sse[(sse["pct"] <= -1.0) & (_d >= dmin) & (_d <= dmax)]
-    for _, _r in _drop.iterrows():
-        _dd = pd.Timestamp(_r["date"])
-        fig.add_vrect(
-            x0=_dd - pd.Timedelta(hours=12), x1=_dd + pd.Timedelta(hours=12),
-            fillcolor="#e0454b", opacity=0.15, line_width=0)
-        fig.add_annotation(
-            x=_dd, y=1.02, yref="paper", yanchor="bottom",
-            text=f"沪指{_r['pct']:.1f}%", showarrow=False, textangle=-40,
-            font=dict(size=10, color="#e0454b"))
-
-
 # Precomputed 回撤/收益率 as a merge-ready DataFrame, built once and shared
 # across sessions/reruns (reading ~20k SQLite rows + dict→DataFrame on every
 # filter click is what made 筛选 feel slow). `cache_key` is last_update_time(),
@@ -488,8 +432,10 @@ components.html("""<script>
 </script>""", height=0)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_sse, tab_table, tab_detail = st.tabs(
-    ["📈 上证指数", "📋 基金列表", "🔍 基金详情"])
+# 上证页(行情图/策略复盘/对照回测/每日数据) 2026-10-14 起挪去 BWG 上的静态页
+# (build_site.py), 这里只留要净值库的几块。
+tab_pick, tab_table, tab_detail = st.tabs(
+    ["🎯 今天会买哪只", "📋 基金列表", "🔍 基金详情"])
 
 # ─── Tab 1: Table ────────────────────────────────────────────────────────────
 with tab_table:
@@ -1127,494 +1073,191 @@ with tab_detail:
                 height=560,
             )
 
-# ─── Tab 4: SSE index ────────────────────────────────────────────────────────
-with tab_sse:
-    sse_df = load_sse_daily(fetcher.index_daily_saved_at("sse"))
-    if sse_df is None or sse_df.empty:
-        st.warning("上证指数数据获取失败，请稍后重试。")
+# ─── Tab: 今天会买哪只(2026-08-13 加, 按钮触发) ─────────────────────────────
+# 只在点按钮时算: 要跑一次 compute_metrics_asof(全市场重算区间收益,
+# 实测约 9s)加上逐只 compute_beta, 挂在首屏会把整页拖慢, 而这个功能
+# 一天最多看一次。
+# 不显示"QVIX 是否触发": 页面拿到的是昨收, 盘中实时值在本地跑
+# qvix_now.py, 摆一个基于昨收的"未触发"反而误导。
+with tab_pick:
+    st.caption(
+        "从近3月跌幅最深的往下找, 一路上被规模/波动率刷掉的也列出来, "
+        "**走到选中那只就截止**——之后的候选策略压根没看过。想看某只"
+        "具体基金在这批候选里的位置, 用下面的「查基金代码」单查。"
+        "跌幅超上限的那批只报个数(它们被一条跟基金本身无关的规则一刀切掉, "
+        "逐只列会把表刷满)。口径与回测完全一致: 全部 T-1(净值当晚才公布)、"
+        "规模用当时已披露的最新季报。"
+        "「近3月窗口」列标出每只**实际**用的起止日: 终点是该基金早于"
+        "决策日的最后一个净值日,起点是终点往回**91个自然日**取最近的"
+        "净值日,"
+        "所以净值更新慢的基金窗口会整体前移。⚠️ 这跟支付宝/东财的"
+        "「近3月」不同——它们按**整3个自然月**取起点,差一个交易日就可能"
+        "差零点几个百分点。"
+        "默认算今天;把「决策日」拨到历史日期就是**回看那天会买哪只**"
+        "——同一套 T-1 口径,连那天有没有 QVIX 信号一起报。")
+    if not _need_nav("今日候选"):
+        pass
     else:
-        sse_all = sse_df.copy()
-        sse_all["date"] = pd.to_datetime(sse_all["date"])
-        sse_all = sse_all.sort_values("date").reset_index(drop=True)
-
-        _sse_ranges = sse_view.SSE_RANGES
-        _c_rng, _c_bands, _c_vix = st.columns([4, 1, 1])
-        with _c_rng:
-            _rng = st.radio("时间区间", list(_sse_ranges.keys()),
-                            index=list(_sse_ranges).index(
-                                sse_view.SSE_RANGE_DEFAULT),
-                            horizontal=True, key="sse_range")
-        with _c_bands:
-            _show_bands = st.checkbox("标记跌超1%的交易日", value=False,
-                                      key="sse_bands",
-                                      help="长区间下标记较密，可关闭")
-        with _c_vix:
-            _show_vix = st.checkbox("VIX恐慌指数", value=True,
-                                    key="sse_vix",
-                                    help="50ETF期权QVIX（中国版VIX），右轴")
-
-        view = sse_view.window(sse_all, _sse_ranges[_rng])
-
-        _latest = sse_all.iloc[-1]
-        _chg = (_latest["close"] / view["close"].iloc[0] - 1.0) * 100.0
-        _peak = view["close"].cummax()
-        _mdd = float(((_peak - view["close"]) / _peak).max() * 100.0)
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("最新收盘", f"{_latest['close']:,.2f}",
-                  f"{_latest['pct']:+.2f}%（当日）")
-        k2.metric(f"{_rng}涨跌幅", f"{_chg:+.2f}%")
-        k3.metric(f"{_rng}最大回撤", f"{_mdd:.2f}%")
-        k4.metric("数据日期", _latest["date"].strftime("%Y-%m-%d"))
-
-        fig_sse = px.line(
-            view, x="date", y="close",
-            title=f"上证指数走势（{_rng}）",
-            labels={"date": "日期", "close": "收盘点位"},
-            height=420,
-        )
-        fig_sse.update_traces(
-            customdata=view[["pct"]],
-            hovertemplate="收盘 %{y:,.2f} · 日涨跌 %{customdata[0]:+.2f}%"
-                          "<extra></extra>")
-
-        # VIX恐慌指数（QVIX，自算）on a secondary right axis: levels (~15–40)
-        # are incomparable with index points, so it never shares the left
-        # scale. 数据源:qvix_self_history(上交所官方期权风险指标反推,
-        # 不是 optbbs——见 qvix_calc.py 顶部说明)。阈值线现算
-        # (见上方 load_qvix_thresholds)——分位组合已收敛到只剩标准的
-        # 2年90%一组,不再提供勾选,随所选标的直接画。
-        _qvix_hist = None
-        if _show_vix:
-            _q = load_qvix_self(fetcher.qvix_self_history_last_date())
-            if _q is not None and not _q.empty:
-                _qvix_hist = _q.copy()
-                _qvix_hist["date"] = pd.to_datetime(_qvix_hist["date"])
-                _qvix_hist = _qvix_hist[
-                    (_qvix_hist["date"] >= view["date"].min())
-                    & (_qvix_hist["date"] <= view["date"].max())]
-            if _qvix_hist is None or _qvix_hist.dropna(subset=["qvix"]).empty:
-                st.caption("⚠️ VIX恐慌指数数据暂不可用")
-                _qvix_hist = None
-        if _qvix_hist is not None:
-            _line = _qvix_hist.dropna(subset=["qvix"])
-            fig_sse.data[0].name = "上证指数"
-            fig_sse.data[0].showlegend = True
-            fig_sse.add_trace(go.Scatter(
-                x=_line["date"], y=_line["qvix"],
-                name="VIX恐慌指数(QVIX,自算)", yaxis="y2",
-                # mode 必须写死: 不写时 plotly 在点数 <20 时自动加点, 近1月
-                # 碰上长假(只剩十几个交易日)就突然冒出一串圆点。
-                mode="lines",
-                line=dict(color=_QVIX_COLOR, width=1.3),
-                hovertemplate="VIX %{y:.2f}<extra></extra>"))
-            # Default (right-side vertical) legend keeps clear of the
-            # 跌超1% annotations that sit above the plot area.
-            fig_sse.update_layout(
-                yaxis2=dict(title="VIX恐慌指数", overlaying="y", side="right",
-                            showgrid=False))
-            _thr_df = load_qvix_thresholds(
-                fetcher.qvix_self_history_last_date())
-            _t = None
-            if _thr_df is not None:
-                _t = _thr_df[
-                    (_thr_df["date"] >= view["date"].min())
-                    & (_thr_df["date"] <= view["date"].max())
-                ].dropna(subset=["thr"])
-            if _t is not None and not _t.empty:
-                fig_sse.add_trace(go.Scatter(
-                    x=_t["date"], y=_t["thr"],
-                    name="恐慌阈值(2年90%)", yaxis="y2", mode="lines",
-                    line=dict(color=_QVIX_COLOR, width=1.2, dash="dash"),
-                    hovertemplate="阈值 %{y:.2f}<extra></extra>"))
-                # 链失效日在曲线上只是个断点, 什么都看不见 —— 而它恰恰是最
-                # 恐慌的那几天(标的跌出期权链的挂牌行权价范围, 公式失效;
-                # 见 qvix_calc.CHAIN_BROKEN)。在阈值线的高度上打个 ×, 位置
-                # 不代表数值(那天没有数值), 只代表"这天在阈值之上"。
-                _bk = _qvix_hist[sse_view.chain_broken_mask(_qvix_hist)][
-                    ["date"]].merge(_t, on="date", how="inner")
-                if not _bk.empty:
-                    fig_sse.add_trace(go.Scatter(
-                        x=_bk["date"], y=_bk["thr"],
-                        name="链失效(按信号处理)", yaxis="y2",
-                        mode="markers",
-                        marker=dict(symbol="x", size=12, color=_QVIX_COLOR,
-                                    line=dict(width=2)),
-                        hovertemplate="那天算不出来——跌出期权链行权价范围,"
-                                      "公式失效,按信号处理<extra></extra>"))
-
-        if _show_bands:
-            _add_sse_drop_bands(fig_sse, sse_df,
-                                view["date"].min(), view["date"].max())
-        fig_sse.update_layout(
-            hovermode="x unified", hoverdistance=-1, spikedistance=-1)
-        _span_d = max((view["date"].max() - view["date"].min()).days, 1)
-        fig_sse.update_xaxes(
-            showspikes=True, spikemode="across", spikesnap="data",
-            spikedash="dot", spikethickness=1,
-            hoverformat="%Y-%m-%d", tickformat="%Y-%m-%d",
-            dtick=max(1, _span_d // 8) * 86400000)
-
-        fig_sse.update_yaxes(
-            showspikes=True, spikemode="across", spikesnap="data",
-            spikedash="dot", spikethickness=1)
-        st.plotly_chart(fig_sse, use_container_width=True)
-
-        # ── 四块明细:子标签页, 不用 expander ────────────────────────────
-        # expander 的毛病是可以同时展开: 两张宽表一起铺满视口后, 指针无论
-        # 落在哪都在 glide-data-grid 的横向滚动容器上, 整段滚轮手势被它吃掉,
-        # 页面滑不动(详见文件上方那段 wheel 补丁的分析)。子标签页从根上避开:
-        # 未选中的那几块 display:none, 视口里永远只有一张宽表, 指针总能落到
-        # 表外的空白处。顺序按用得多到少排, 第一个默认选中的就是策略复盘。
-        _tab_review, _tab_pick, _tab_runs, _tab_daily = st.tabs(
-            ["📜 策略复盘", "🎯 今天会买哪只", "🧪 历次对照回测", "📄 每日数据"])
-
-        # ── 策略复盘:买入近3月跌幅最大标的,基金/大盘双止损逐日盯盘
-        # (backtest_qvix.py) ── 结果为脚本离线跑批后硬编码(全市场近3月
-        # 涨跌幅重算无法在页面现算)。
-        # 2026-07-24 切换到当前标准参数: QVIX 2年90分位信号(window=490,
-        # pct=0.90) + 候选按近3月跌幅从深到浅排(ret_col="ret_3m",
-        # pick="bottom", 见 backtest_qvix.find_champion_on_date 同名参数
-        # 说明),取跌幅最大的一只——不再是选涨幅最高的"冠军"。起因:
-        # 逐信号日统计过候选池里"近3月涨幅前20名"和"跌幅前20名"买入后的
-        # 前瞻收益, 11次信号里有7次是跌幅最大的那批反弹更猛(恐慌信号
-        # 触发点本身就是刚经历一轮下跌, 涨得最猛的常是提前跑赢、比较
-        # 拥挤的仓位, 跌得最惨的反而容易报复性反弹)。
-        # 另加两道过滤: ①候选波动率比值(compute_beta)≥1.5(min_vol_ratio,
-        # 用户原话"我是来发财的,不是来保本的")——不设这道过滤时"跌幅
-        # 最大"选出过长期低波动的保守型基金(全历史年化波动率2.3%~4.6%,
-        # 当天排名垫底只是正常噪声、根本谈不上"超跌"); ②候选按跌幅
-        # 排完发现已经找不到真正下跌的(第一个非负值)就当天不操作,不
-        # 退而求其次买涨幅最小的凑数——这两条一起用之后,79个信号日
-        # 只有8次真正满足条件,但质量明显更高。相关系数过滤(min_corr,
-        # 中途试过0.5/0.6/0.7)最终判定对这套新逻辑没必要,已关闭。
-        # 此前"涨幅冠军+相关系数≥0.6""跌幅最大但不设波动率/跌幅耗尽
-        # 判定""跌幅最大但额外排除港股通"的复盘记录均已替换, 历史版本
-        # 见 git 历史——港股通/沪港深/恒生系列曾经额外排除(套用QDII的
-        # "跟踪境外市场,与大盘脱钩"逻辑), 2026-07-24复核撤销: 实测恒生
-        # 指数跟上证的日收益率相关系数常年0.4~0.74(整体0.544), 明显
-        # 高于纳斯达克(0.153)、黄金(0.099)这些真正弱相关的境外资产,
-        # "脱钩"假设不成立。
-        #
-        # 候选排名复用 fetcher.compute_metrics_asof——与本页「基金列表」的
-        # "截至日期"筛选完全同口径(按日收益率连乘计算区间收益,正确处理
-        # 分红除权,自带单日|收益率|>30%异常值过滤),严格早于当日截断(T日
-        # 决策只能看到T-1日收盘净值)。
-        # 止损逐交易日检查,双线在买入日锁定——基金线=阈值/5×波动率比值,
-        # 大盘线=阈值/5;波动率比值=基金日收益率std/大盘日收益率std(纯波动
-        # 对比,不按相关系数加权,且剔除单日|收益率|>35%的净值重置/份额折算
-        # 脏数据)。候选池剔除:QDII/海外指数型(跟踪境外市场且走额度受限
-        # 的QDII通道,与QVIX/大盘恐慌-反弹逻辑脱钩)、有持有期锁定的基金
-        # (名称含"N年/N个月/N天持有(期)""滚动持有""定期开放""封闭式"等,
-        # 锁定期内实际赎不出来, 回测里的卖出是假的)、"净值僵化-补涨"基金
-        # (排名窗口内连续≥5个交易日|日收益率|<0.05%紧接单日|收益率|>8%
-        # 补涨/补跌, 判断为净值长期未按市值更新、事后集中补记, 而非真实
-        # 动量)。连续接力同一只基金(上一腿卖出日=下一腿买入日且代码相同)
-        # 视为未真实离场,中间腿不收手续费,只在链条最后一腿按"链条首次
-        # 买入→该腿卖出"的累计持有天数收一次(而非按单腿天数)。数据
-        # 2018 年起(2015-2017 期权刚上市流动性薄、QVIX 计算噪声偏大,
-        # 已整段剔除, 见 fetcher.py)。
-        with _tab_review:
-            st.markdown(sse_view.REVIEW_INTRO)
-            # 5% 定线依据(2026-07 校准,别随手改):大盘线 = 恐慌阈值/5,常态
-            # 波动率(QVIX 20)下 ≈ 4 倍日σ;历史 12 次触发的固定线网格回测显示
-            # 3%~10% 中 5% 最优,4%~6% 为稳健平台。波动率口径自洽(近10年窗口):
-            # 线 = 5×近10年日σ = 5×1.03% ≈ 5%,交叉验证 QVIX 近10年中位
-            # 18.72÷4 = 4.7%;上证常态σ按 1/3/10 年窗口为 0.81/0.79/0.82,
-            # 中枢稳定故窗口不敏感。断裂检测:近1年σ÷近10年σ>2 即时代迁移
-            # 需重算。动态线(QVIX/实际σ×入场定死/每日跟随,k=2~6)无稳健
-            # 增益——恐慌日按入场波动率定线永远给宽线,反而丢掉恐慌后反弹守
-            # 利润的功能。重议条件:QVIX 中枢驻留 35+。
-            # 复盘明细读策略库里最新一次**标准策略**跑批(backtest_qvix.py
-            # 跑完自动落库, 见 fetcher.save_strategy_run)。以前这段统计
-            # 数字全是硬编码在这里的列表字面量:每次重跑回测都得把十几列
-            # 数字手抄一遍进页面, 抄错没人发现, 页面上的数和回测真正跑出来
-            # 的数也随时可能对不上(实测就对不上过)。现在回测落库、页面读库,
-            # 跑批推一次库页面自动跟着变, 不用改代码。
-            _bt_df, _bt_params, _bt_at, _bt_id = load_backtest_trades(
-                os.path.getmtime(fetcher.DB_PATH["rank"]))
-            if _bt_df is None or _bt_df.empty:
-                st.info("暂无回测明细——跑一次 `python3 backtest_qvix.py` "
-                        "会往策略库追加一条标准跑批, 页面随即显示。")
+        # ── 决策日可回拨(2026-08-28 加) ──────────────────────
+        # 以前写死 dt.date.today()。scan/probe 本来就收 asof、口径
+        # 全是 T-1, 换个日期算的就是那天收盘后该买哪只 —— 跟回测同
+        # 一条路径, 但回测只留结果, 这里能看见完整的淘汰路径。
+        # 下限 2020-01-01: QVIX 阈值是 490 个交易日的滚动分位, 库从
+        # 2018-01-02 起, 头两年热身期算不出阈值(首个有阈值的日子是
+        # 2019-12-16)。真选到算不出的日子, 下面那条 st.error 兜底。
+        _today = dt.date.today()
+        _c1, _c2 = st.columns([1, 2])
+        with _c1:
+            _asof = st.date_input(
+                "决策日", value=_today, min_value=dt.date(2020, 1, 1),
+                max_value=_today, key="today_pick_asof",
+                help="按这一天收盘后的口径算:只看**早于**这天的净值和"
+                     "当时已披露的季报规模,跟回测完全一致。拨到历史"
+                     "日期就是回看那天会买哪只、路上刷掉了谁。")
+        _is_today = _asof == _today
+        _when = "今天" if _is_today else f"{_asof} 那天"
+        with _c2:
+            st.write("")        # 跟 date_input 的标签行对齐
+            _go = st.button(f"算{_when}的候选", key="today_pick_go")
+        if _go:
+            with st.spinner("全市场重算近3月收益…约10秒"):
+                st.session_state["today_pick_res"] = today_pick.scan(_asof)
+        _tp = st.session_state.get("today_pick_res")
+        # 日期一改就绝不能再渲染上一次的结果: 表里每个数字都绑死在
+        # 某个 asof 上, 顶上挂着新日期、身子还是旧数据, 是这个页面
+        # 最容易骗到人的一种错。宁可空着让人再点一次。
+        if _tp is not None and _tp["asof"].date() != _asof:
+            st.info(f"决策日已改成 {_asof},而当前这批结果是按 "
+                    f"{_tp['asof'].date()} 算的,两者不能混着看"
+                    f"——点「算{_when}的候选」重算。")
+            _tp = None
+        if _tp is not None:
+            # 数据新鲜度校验: 这个功能最容易出的错不是算错, 是拿旧数据
+            # 算出一个看起来很正常的答案 —— 必须显式摆出来, 不能默认
+            # 它是新的。判据是 missing 不是 behind(见 data_freshness):
+            # 要的是**早于决策日**的最后一个交易日的净值, 库到了那天
+            # 就够。回看历史日期时库当然"不新", 但对那天的答案毫无影响,
+            # 拿 behind 判会天天报一个假警。
+            _missing = _tp.get("missing")
+            _need = _tp.get("need_date")
+            _nm = _tp.get("nav_max")
+            _sm = _tp.get("sse_max")
+            if _nm is None:
+                st.error("净值库是空的,没法算。")
+            elif _need is None:
+                st.warning(f"⚠️ 上证行情里没有早于 {_asof} 的交易日,"
+                           "这天算不出东西——换个日期。")
+            elif _missing:
+                st.warning(
+                    f"⚠️ 数据不够: {_when}要的是截至 {_need.date()} 的净值,"
+                    f"而净值库停在 {_nm.date()},**缺 {_missing} 个交易日**"
+                    f"(上证已到 {_sm.date()})。下面的结果按旧数据算,仅供"
+                    "参考——等每日跑批把净值补上(线上库最迟1小时换一次)"
+                    "再点一次。")
             else:
-                st.caption(sse_view.review_summary(_bt_df, _bt_id, _bt_at))
-                _review_df, _review_trigger = sse_view.review_table(
-                    _bt_df, fetcher.load_backtest_notes())
+                st.success(
+                    f"✅ 数据够: {_when}要的净值截至 {_need.date()},"
+                    f"净值库已到 {_nm.date()}")
 
-                def _trigger_cell_style(row):
-                    _cols = sse_view.trig_cols(_review_trigger[row.name])
-                    return [f"background-color: {sse_view.TRIG_BG[c]}; "
-                            "color: #1a1a1a" if c in _cols else ""
-                            for c in row.index]
-
-                st.dataframe(
-                    _review_df.style.apply(_trigger_cell_style, axis=1)
-                    .format(precision=2, na_rep=""),
-                    use_container_width=True, hide_index=True,
-                    height=(len(_review_df) + 1) * 35 + 3,
-                    # 除标的名(medium)和备注(large)外一律 small; 按实际列名
-                    # 现拼, 免得选基口径一换列名对不上、宽度配置整个失效。
-                    column_config={
-                        **{c: st.column_config.Column(width="small")
-                           for c in _review_df.columns},
-                        sse_view.TGT_COL: st.column_config.Column(width="medium"),
-                        "备注": st.column_config.Column(width="large"),
-                    })
-
-        # ── 今天会买哪只(2026-08-13 加, 按钮触发) ──────────────────────
-        # 只在点按钮时算: 要跑一次 compute_metrics_asof(全市场重算区间收益,
-        # 实测约 9s)加上逐只 compute_beta, 挂在首屏会把整页拖慢, 而这个功能
-        # 一天最多看一次。
-        # 不显示"QVIX 是否触发": 页面拿到的是昨收, 盘中实时值在本地跑
-        # qvix_now.py, 摆一个基于昨收的"未触发"反而误导。
-        with _tab_pick:
+            # 历史日期才报 QVIX 有没有触发。当天不报: 页面拿到的是昨收,
+            # 盘中实时值要跑 qvix_now.py, 摆一个基于昨收的"未触发"反而
+            # 误导。历史日期的收盘值是定局, 那天有没有信号恰恰是解读
+            # 结果的前提 —— 没信号的日子策略根本不买。
+            _thr_ok = (_tp.get("thr") is not None
+                       and not pd.isna(_tp["thr"]))
+            _q_ok = (_tp.get("qvix") is not None
+                     and not pd.isna(_tp["qvix"]))
+            if not _is_today and _thr_ok:
+                if _tp.get("broken"):
+                    # 链失效日: 没有值可报, 但那天恰恰是最恐慌的
+                    # 几天之一(见 qvix_calc.CHAIN_BROKEN)。
+                    st.success(
+                        f"🔔 {_tp['qdate'].date()} QVIX **算不出来**"
+                        "——标的跌到跑出期权链的挂牌行权价范围,公式在那天"
+                        "失效了。算不出来本身就是极端行情的证据,按**触发**"
+                        "处理(与回测口径一致)。")
+                elif _q_ok and _tp["hit"]:
+                    st.success(
+                        f"🔔 {_tp['qdate'].date()} QVIX {_tp['qvix']:.2f} "
+                        f">阈值 {_tp['thr']:.2f}——那天**触发了**买入信号。")
+                elif _q_ok:
+                    st.info(
+                        f"😴 {_tp['qdate'].date()} QVIX {_tp['qvix']:.2f} "
+                        f"≤阈值 {_tp['thr']:.2f}——那天**没有**信号,策略"
+                        "当天不买;下面这批只是「假如买会买哪只」。")
+            _std = _tp["std"]
             st.caption(
-                "从近3月跌幅最深的往下找, 一路上被规模/波动率刷掉的也列出来, "
-                "**走到选中那只就截止**——之后的候选策略压根没看过。想看某只"
-                "具体基金在这批候选里的位置, 用下面的「查基金代码」单查。"
-                "跌幅超上限的那批只报个数(它们被一条跟基金本身无关的规则一刀切掉, "
-                "逐只列会把表刷满)。口径与回测完全一致: 全部 T-1(净值当晚才公布)、"
-                "规模用当时已披露的最新季报。"
-                "「近3月窗口」列标出每只**实际**用的起止日: 终点是该基金早于"
-                "决策日的最后一个净值日,起点是终点往回**91个自然日**取最近的"
-                "净值日,"
-                "所以净值更新慢的基金窗口会整体前移。⚠️ 这跟支付宝/东财的"
-                "「近3月」不同——它们按**整3个自然月**取起点,差一个交易日就可能"
-                "差零点几个百分点。"
-                "默认算今天;把「决策日」拨到历史日期就是**回看那天会买哪只**"
-                "——同一套 T-1 口径,连那天有没有 QVIX 信号一起报。")
-            if not _need_nav("今日候选"):
-                pass
+                f"口径: 近3月跌幅最大 · 跌幅≤{_std['max_drop']:.0f}% · "
+                f"波动率比值≥{_std['min_vol_ratio']} · "
+                f"规模≥{_std['min_aum']}亿"
+                + (f"~{_std['max_aum']}亿" if _std["max_aum"] else "(无上限)")
+                + f" · 跌超上限的 {_tp['too_deep']} 只已跳过")
+            # 遍历路径和「查代码」共用这一张表: 查一只基金的意义就是
+            # 把它摆到今天这批候选里比, 表结构不一样就没法比。数据行
+            # 由 today_pick._row 统一产出(见那边说明)。
+            def _pick_table(rows):
+                return pd.DataFrame([{
+                    "": "★" if r["role"].startswith("★") else "",
+                    "跌幅榜": f"第{r['rank']}" if r["rank"] else "—",
+                    "基金": f"{r['name']} ({r['code']})",
+                    "近3月": (f"{r['ret3m']:+.2f}%"
+                             if r["ret3m"] is not None else "—"),
+                    "近3月窗口": (f"{r['win_start'][5:]}→{r['win_end'][5:]}"
+                               if r["win_start"] and r["win_end"] else "—"),
+                    "波动率比值": (f"{r['beta']:.2f}"
+                               if r["beta"] is not None else "—"),
+                    "规模(亿)": (f"{r['aum']:.2f}"
+                              if r["aum"] is not None else "—"),
+                    "结论": r["why"] or r["role"] or "通过",
+                } for r in rows])
+
+            if not _thr_ok:
+                st.error(
+                    f"{_asof} 这天算不出 QVIX 阈值(库里没有那天,或往前"
+                    f"不够 {_tp['std']['window']} 个交易日的历史)"
+                    "——换个日期。")
+            elif not _tp["rows"]:
+                st.info(f"{_when}没有跌幅带内的候选——按策略放弃当天。")
             else:
-                # ── 决策日可回拨(2026-08-28 加) ──────────────────────
-                # 以前写死 dt.date.today()。scan/probe 本来就收 asof、口径
-                # 全是 T-1, 换个日期算的就是那天收盘后该买哪只 —— 跟回测同
-                # 一条路径, 但回测只留结果, 这里能看见完整的淘汰路径。
-                # 下限 2020-01-01: QVIX 阈值是 490 个交易日的滚动分位, 库从
-                # 2018-01-02 起, 头两年热身期算不出阈值(首个有阈值的日子是
-                # 2019-12-16)。真选到算不出的日子, 下面那条 st.error 兜底。
-                _today = dt.date.today()
-                _c1, _c2 = st.columns([1, 2])
-                with _c1:
-                    _asof = st.date_input(
-                        "决策日", value=_today, min_value=dt.date(2020, 1, 1),
-                        max_value=_today, key="today_pick_asof",
-                        help="按这一天收盘后的口径算:只看**早于**这天的净值和"
-                             "当时已披露的季报规模,跟回测完全一致。拨到历史"
-                             "日期就是回看那天会买哪只、路上刷掉了谁。")
-                _is_today = _asof == _today
-                _when = "今天" if _is_today else f"{_asof} 那天"
-                with _c2:
-                    st.write("")        # 跟 date_input 的标签行对齐
-                    _go = st.button(f"算{_when}的候选", key="today_pick_go")
-                if _go:
-                    with st.spinner("全市场重算近3月收益…约10秒"):
-                        st.session_state["today_pick_res"] = today_pick.scan(_asof)
-                _tp = st.session_state.get("today_pick_res")
-                # 日期一改就绝不能再渲染上一次的结果: 表里每个数字都绑死在
-                # 某个 asof 上, 顶上挂着新日期、身子还是旧数据, 是这个页面
-                # 最容易骗到人的一种错。宁可空着让人再点一次。
-                if _tp is not None and _tp["asof"].date() != _asof:
-                    st.info(f"决策日已改成 {_asof},而当前这批结果是按 "
-                            f"{_tp['asof'].date()} 算的,两者不能混着看"
-                            f"——点「算{_when}的候选」重算。")
-                    _tp = None
-                if _tp is not None:
-                    # 数据新鲜度校验: 这个功能最容易出的错不是算错, 是拿旧数据
-                    # 算出一个看起来很正常的答案 —— 必须显式摆出来, 不能默认
-                    # 它是新的。判据是 missing 不是 behind(见 data_freshness):
-                    # 要的是**早于决策日**的最后一个交易日的净值, 库到了那天
-                    # 就够。回看历史日期时库当然"不新", 但对那天的答案毫无影响,
-                    # 拿 behind 判会天天报一个假警。
-                    _missing = _tp.get("missing")
-                    _need = _tp.get("need_date")
-                    _nm = _tp.get("nav_max")
-                    _sm = _tp.get("sse_max")
-                    if _nm is None:
-                        st.error("净值库是空的,没法算。")
-                    elif _need is None:
-                        st.warning(f"⚠️ 上证行情里没有早于 {_asof} 的交易日,"
-                                   "这天算不出东西——换个日期。")
-                    elif _missing:
-                        st.warning(
-                            f"⚠️ 数据不够: {_when}要的是截至 {_need.date()} 的净值,"
-                            f"而净值库停在 {_nm.date()},**缺 {_missing} 个交易日**"
-                            f"(上证已到 {_sm.date()})。下面的结果按旧数据算,仅供"
-                            "参考——等每日跑批把净值补上(线上库最迟1小时换一次)"
-                            "再点一次。")
-                    else:
-                        st.success(
-                            f"✅ 数据够: {_when}要的净值截至 {_need.date()},"
-                            f"净值库已到 {_nm.date()}")
+                _tpd = _pick_table(_tp["rows"])
+                st.dataframe(_tpd, use_container_width=True,
+                             hide_index=True,
+                             height=(len(_tpd) + 1) * 35 + 3)
+            if _tp["chosen"]:
+                st.markdown(
+                    f"**★ {_tp['names'].get(_tp['chosen'], _tp['chosen'])} "
+                    f"({_tp['chosen']})**　基金回撤控制线 "
+                    f"{_tp['fund_line']:.2f}%　大盘回撤线 "
+                    f"{_tp['sse_line']:.2f}%")
+            elif _tp["rows"]:
+                # 只在真走过一遍跌幅带时才说"走完也没有": rows 空的那
+                # 两种情况上面已经各报过一句, 这里再报一次是重复。
+                st.info("走完跌幅带也没有合格候选——按策略放弃当天,"
+                        "顺延到下一个信号日。")
 
-                    # 历史日期才报 QVIX 有没有触发。当天不报: 页面拿到的是昨收,
-                    # 盘中实时值要跑 qvix_now.py, 摆一个基于昨收的"未触发"反而
-                    # 误导。历史日期的收盘值是定局, 那天有没有信号恰恰是解读
-                    # 结果的前提 —— 没信号的日子策略根本不买。
-                    _thr_ok = (_tp.get("thr") is not None
-                               and not pd.isna(_tp["thr"]))
-                    _q_ok = (_tp.get("qvix") is not None
-                             and not pd.isna(_tp["qvix"]))
-                    if not _is_today and _thr_ok:
-                        if _tp.get("broken"):
-                            # 链失效日: 没有值可报, 但那天恰恰是最恐慌的
-                            # 几天之一(见 qvix_calc.CHAIN_BROKEN)。
-                            st.success(
-                                f"🔔 {_tp['qdate'].date()} QVIX **算不出来**"
-                                "——标的跌到跑出期权链的挂牌行权价范围,公式在那天"
-                                "失效了。算不出来本身就是极端行情的证据,按**触发**"
-                                "处理(与回测口径一致)。")
-                        elif _q_ok and _tp["hit"]:
-                            st.success(
-                                f"🔔 {_tp['qdate'].date()} QVIX {_tp['qvix']:.2f} "
-                                f">阈值 {_tp['thr']:.2f}——那天**触发了**买入信号。")
-                        elif _q_ok:
-                            st.info(
-                                f"😴 {_tp['qdate'].date()} QVIX {_tp['qvix']:.2f} "
-                                f"≤阈值 {_tp['thr']:.2f}——那天**没有**信号,策略"
-                                "当天不买;下面这批只是「假如买会买哪只」。")
-                    _std = _tp["std"]
-                    st.caption(
-                        f"口径: 近3月跌幅最大 · 跌幅≤{_std['max_drop']:.0f}% · "
-                        f"波动率比值≥{_std['min_vol_ratio']} · "
-                        f"规模≥{_std['min_aum']}亿"
-                        + (f"~{_std['max_aum']}亿" if _std["max_aum"] else "(无上限)")
-                        + f" · 跌超上限的 {_tp['too_deep']} 只已跳过")
-                    # 遍历路径和「查代码」共用这一张表: 查一只基金的意义就是
-                    # 把它摆到今天这批候选里比, 表结构不一样就没法比。数据行
-                    # 由 today_pick._row 统一产出(见那边说明)。
-                    def _pick_table(rows):
-                        return pd.DataFrame([{
-                            "": "★" if r["role"].startswith("★") else "",
-                            "跌幅榜": f"第{r['rank']}" if r["rank"] else "—",
-                            "基金": f"{r['name']} ({r['code']})",
-                            "近3月": (f"{r['ret3m']:+.2f}%"
-                                     if r["ret3m"] is not None else "—"),
-                            "近3月窗口": (f"{r['win_start'][5:]}→{r['win_end'][5:]}"
-                                       if r["win_start"] and r["win_end"] else "—"),
-                            "波动率比值": (f"{r['beta']:.2f}"
-                                       if r["beta"] is not None else "—"),
-                            "规模(亿)": (f"{r['aum']:.2f}"
-                                      if r["aum"] is not None else "—"),
-                            "结论": r["why"] or r["role"] or "通过",
-                        } for r in rows])
-
-                    if not _thr_ok:
-                        st.error(
-                            f"{_asof} 这天算不出 QVIX 阈值(库里没有那天,或往前"
-                            f"不够 {_tp['std']['window']} 个交易日的历史)"
-                            "——换个日期。")
-                    elif not _tp["rows"]:
-                        st.info(f"{_when}没有跌幅带内的候选——按策略放弃当天。")
-                    else:
-                        _tpd = _pick_table(_tp["rows"])
-                        st.dataframe(_tpd, use_container_width=True,
-                                     hide_index=True,
-                                     height=(len(_tpd) + 1) * 35 + 3)
-                    if _tp["chosen"]:
-                        st.markdown(
-                            f"**★ {_tp['names'].get(_tp['chosen'], _tp['chosen'])} "
-                            f"({_tp['chosen']})**　基金回撤控制线 "
-                            f"{_tp['fund_line']:.2f}%　大盘回撤线 "
-                            f"{_tp['sse_line']:.2f}%")
-                    elif _tp["rows"]:
-                        # 只在真走过一遍跌幅带时才说"走完也没有": rows 空的那
-                        # 两种情况上面已经各报过一句, 这里再报一次是重复。
-                        st.info("走完跌幅带也没有合格候选——按策略放弃当天,"
-                                "顺延到下一个信号日。")
-
-                    # ── 查任意代码(2026-08-18 加) ────────────────────────
-                    # 用途是跟支付宝/东财对账: 手上看到一只跌得很惨的基金,
-                    # 想知道这套口径为什么没选它 —— 是规则排掉的(QDII/持有期/
-                    # 跌幅超上限/规模不够), 还是根本没进池子(数据漏了)。所以
-                    # 「没进池子」那一栏必须说清是哪一种, 见 today_pick.probe。
-                    # ⚠️ 近3月口径跟支付宝不同: 这里是终点往回 91 个自然日,
-                    # 支付宝按整 3 个自然月, 差一个交易日就可能差零点几个点,
-                    # 「近3月窗口」列标的就是每只实际用的起止日, 对账看这个。
-                    _probe_in = st.text_input(
-                        "查基金代码(多个用逗号/空格分隔)", key="today_pick_probe",
-                        placeholder="例如 026834, 012710 016848",
-                        help=f"用{_when}这套完全相同的口径算一遍并摆进上面同一"
-                             "张表, 看它在跌幅榜第几名、卡在哪道门槛。用来跟"
-                             "支付宝的数字对账 —— 对不上先看「近3月窗口」那列。")
-                    if _probe_in.strip():
-                        _codes = [c for c in re.split(r"[,，\s]+", _probe_in.strip()) if c]
-                        with st.spinner("按同一口径现算…"):
-                            _pr = today_pick.probe(_asof, _codes, _tp)
-                        _prd = _pick_table(_pr)
-                        st.dataframe(_prd, use_container_width=True,
-                                     hide_index=True,
-                                     height=(len(_prd) + 1) * 35 + 3)
-                        st.caption(
-                            f"跟上面那张表同一套口径、同为 {_asof} 的数据。跌幅榜"
-                            f"名次的分母是那天**真跌**的 {_tp.get('n_drop', '—')} 只"
-                            "(涨的不在策略的遍历路径上, 混进分母只会让名次虚高)。")
-
-        # ── 历次回测跑批(2026-08-05):不是线上实盘规则,只挂上来做对比 ──
-        # backtest_qvix.py 每跑一次就往策略库追加一条(fetcher.save_strategy_run),
-        # 这里把非标准策略的那些按时间倒序列出来,选中哪条就展开哪条的明细。
-        # 以前是"一个方案一张固定表、同名整表覆盖",换个参数重跑就把上一次
-        # 冲掉了;现在每跑必留痕,回头想比哪两版都翻得到。
-        # 策略库是独立文件(fund_strategy.db),跟 400MB 的行情主库彻底分开,
-        # 见 fetcher.DB_LAYOUT 说明。
-        # 「备注」不给这些跑批挂:那份人工点评(backtest_notes)是对着标准策略
-        # 选出的基金写的,对照实验同一个买入日往往选的是另一只,挂过去
-        # 就是张冠李戴。
-        _runs = [r for r in load_strategy_runs(os.path.getmtime(fetcher.DB_PATH["strategy"]))
-                 if not r["is_standard"]]
-        with _tab_runs:
-            if not _runs:
-                st.caption("暂无对照跑批——`backtest_qvix.py` 跑一次非标准参数"
-                           "就会往策略库追加一条, 推库后这里能翻到。")
-            else:
-                st.caption(f"{len(_runs)} 次对照回测, 非线上实盘规则")
-                # 用下拉框而不是 radio: 跑批已经攒到二十几条, radio 会把每条
-                # 铺成一行、光选择器就占掉近 30 行, 把明细表推到离上面那张
-                # 标准策略表很远的地方, 想两张表对着看就得来回滚。下拉框收成
-                # 一行, 明细表紧跟在标准策略那张下面, 一屏内能对比。
-                _sel = st.selectbox(
-                    "选一次跑批看明细", [r["id"] for r in _runs],
-                    format_func=lambda i: sse_view.run_label(
-                        next(r for r in _runs if r["id"] == i)),
-                    key="strategy_run_pick_sel")
-                _x_df, _x_params, _x_at = load_strategy_run_detail(
-                    os.path.getmtime(fetcher.DB_PATH["strategy"]), _sel)
-                if _x_df is None or _x_df.empty:
-                    st.info("这次跑批没有明细。")
-                else:
-                    _x_cap, _x_view, _x_trig = sse_view.run_detail(
-                        _x_df, _x_params, _sel, _x_at)
-                    st.caption(_x_cap)
-
-                    def _x_style(row, _trig=_x_trig):
-                        _cols = sse_view.trig_cols(_trig[row.name])
-                        return [f"background-color: {sse_view.TRIG_BG[c]}; "
-                                "color: #1a1a1a" if c in _cols else ""
-                                for c in row.index]
-
-                    _x_cfg = {c: st.column_config.Column(width="small")
-                              for c in _x_view.columns}
-                    _x_cfg[sse_view.TGT_COL] = st.column_config.Column(width="medium")
-                    st.dataframe(
-                        _x_view.style.apply(_x_style, axis=1)
-                        .format(precision=2, na_rep=""),
-                        use_container_width=True, hide_index=True,
-                        height=(len(_x_view) + 1) * 35 + 3,
-                        column_config=_x_cfg)
-
-
-        with _tab_daily:
-            _sse_table = view.sort_values("date", ascending=False).reset_index(drop=True)
-            _tbl = pd.DataFrame({
-                "日期": _sse_table["date"].dt.strftime("%Y-%m-%d"),
-                "收盘点位": _sse_table["close"].round(2),
-                "日涨跌(%)": pd.to_numeric(_sse_table["pct"],
-                                         errors="coerce").round(2),
-            })
-            if _qvix_hist is not None:
-                _q = _qvix_hist.assign(
-                    日期=_qvix_hist["date"].dt.strftime("%Y-%m-%d"),
-                    **{"VIX恐慌指数": pd.to_numeric(_qvix_hist["qvix"],
-                                                errors="coerce").round(2)})
-                _tbl = _tbl.merge(_q[["日期", "VIX恐慌指数"]],
-                                  on="日期", how="left")
-            st.dataframe(_tbl, use_container_width=True, height=420)
+            # ── 查任意代码(2026-08-18 加) ────────────────────────
+            # 用途是跟支付宝/东财对账: 手上看到一只跌得很惨的基金,
+            # 想知道这套口径为什么没选它 —— 是规则排掉的(QDII/持有期/
+            # 跌幅超上限/规模不够), 还是根本没进池子(数据漏了)。所以
+            # 「没进池子」那一栏必须说清是哪一种, 见 today_pick.probe。
+            # ⚠️ 近3月口径跟支付宝不同: 这里是终点往回 91 个自然日,
+            # 支付宝按整 3 个自然月, 差一个交易日就可能差零点几个点,
+            # 「近3月窗口」列标的就是每只实际用的起止日, 对账看这个。
+            _probe_in = st.text_input(
+                "查基金代码(多个用逗号/空格分隔)", key="today_pick_probe",
+                placeholder="例如 026834, 012710 016848",
+                help=f"用{_when}这套完全相同的口径算一遍并摆进上面同一"
+                     "张表, 看它在跌幅榜第几名、卡在哪道门槛。用来跟"
+                     "支付宝的数字对账 —— 对不上先看「近3月窗口」那列。")
+            if _probe_in.strip():
+                _codes = [c for c in re.split(r"[,，\s]+", _probe_in.strip()) if c]
+                with st.spinner("按同一口径现算…"):
+                    _pr = today_pick.probe(_asof, _codes, _tp)
+                _prd = _pick_table(_pr)
+                st.dataframe(_prd, use_container_width=True,
+                             hide_index=True,
+                             height=(len(_prd) + 1) * 35 + 3)
+                st.caption(
+                    f"跟上面那张表同一套口径、同为 {_asof} 的数据。跌幅榜"
+                    f"名次的分母是那天**真跌**的 {_tp.get('n_drop', '—')} 只"
+                    "(涨的不在策略的遍历路径上, 混进分母只会让名次虚高)。")
