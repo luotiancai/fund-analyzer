@@ -1,9 +1,8 @@
-notify.log
 update.log
 __pycache__/
 .venv/
 .DS_Store
-# intraday_qvix.py 的产物, 只发到 Release, 不进仓库
+# qvix_now.py 算出的盘中实时值, 只在本机看, 不上传也不进仓库
 qvix_now.json
 
 # 通知配置: 里面是手机号, 不进仓库

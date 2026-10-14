@@ -61,9 +61,6 @@ _CST = ZoneInfo("Asia/Shanghai")
 _DATA_DIR = os.environ.get("FUND_ANALYZER_DATA") or os.path.join(
     os.path.expanduser("~"), ".local", "share", "fund-analyzer")
 os.makedirs(_DATA_DIR, exist_ok=True)
-CACHE_DB = os.path.join(_DATA_DIR, "fund_cache.db")
-_LEGACY_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "fund_cache.db")
 
 # ── 分库布局 ─────────────────────────────────────────────────────────────────
 # 一个 400MB 的 fund_cache.db 装下所有表, 是这个项目历史上大部分数据事故的
@@ -128,9 +125,6 @@ LAZY_DBS = tuple(name for name, _fn, _t, lazy in DB_LAYOUT if lazy)
 LAZY_NAV = False       # app.py 在云端两段式模式下置 True
 _ready_dbs = set()     # 已落地并接管的惰性库名(仅 LAZY_NAV 下有意义)
 
-_LEGACY_SINGLE_DB = CACHE_DB   # 分库前的 fund_cache.db, 由 split_dbs.py 迁移
-_IN_MIGRATION = False          # split_dbs.py 置 True, 免得它自己触发迁移提示
-
 
 def nav_ready() -> bool:
     """惰性库(净值/规模持仓)是否都已可用。本地恒为 True。"""
@@ -142,26 +136,6 @@ def db_ready(name: str) -> bool:
     return name not in LAZY_DBS or not LAZY_NAV or name in _ready_dbs
 
 
-def _migrate_db_location():
-    """One-time move of an existing fund_cache.db out of the project dir.
-
-    Uses the SQLite backup API (not a file copy) so pending WAL content is
-    carried over intact; the legacy file is then removed.
-    """
-    if os.path.exists(CACHE_DB) or not os.path.exists(_LEGACY_DB):
-        return
-    logger.warning("migrating fund_cache.db to %s (one-time, ~373MB)", _DATA_DIR)
-    src = sqlite3.connect(_LEGACY_DB)
-    dst = sqlite3.connect(CACHE_DB)
-    with dst:
-        src.backup(dst)
-    dst.close()
-    src.close()
-    for suffix in ("", "-wal", "-shm"):
-        try:
-            os.remove(_LEGACY_DB + suffix)
-        except OSError:
-            pass
 # 26h:榜单本质是每日数据,由 update_daily.py/「更新数据」按钮强制刷新;
 # 留 2h 余量给每日节奏。此前 1h 会让盘中任意交互触发的 rerun 穿透缓存、
 # 现场全量重拉榜单卡住页面几十秒,还把标签页顶回首页。
@@ -414,12 +388,6 @@ def init_db():
     建表本身已经由 _conn() 按 _DDL 完成(每个进程首次连接时), 这里只剩
     分库无关的收尾: WAL、列迁移、旧 JSON 净值迁移。
     """
-    if os.path.exists(_LEGACY_SINGLE_DB) and not _IN_MIGRATION:
-        # 分库前的单库还在: 说明这台机器没跑过 split_dbs.py。不自动迁移——
-        # 401MB 的库拆一次要几分钟, 悄悄在 import 时做会让人以为程序卡死。
-        logger.warning(
-            "检测到分库前的 %s, 新代码不会读它。跑 `python3 split_dbs.py` 迁移。",
-            _LEGACY_SINGLE_DB)
     conn = _conn()
     # WAL lets the app keep reading while the pipeline writes (and vice versa).
     # 每个 attached 库各自设置——journal_mode 是 per-database 的 pragma。
