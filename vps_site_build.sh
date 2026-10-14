@@ -50,6 +50,7 @@ echo "$NOW" > "$STAMP"
 #       server_tokens off;
 #       gzip on;
 #       gzip_types application/javascript;
+#       location ^~ /.well-known/acme-challenge/ { root /var/www/acme; default_type text/plain; }
 #       location = /index.html { add_header Cache-Control "no-cache"; }
 #       location ~ \.js$ { add_header Cache-Control "public, max-age=31536000, immutable"; }
 #       location ~ /\. { deny all; }
@@ -57,3 +58,9 @@ echo "$NOW" > "$STAMP"
 #
 # 443 被 xray(REALITY)占着, 所以走 80。不设密码: 页面上的数据本来就在公开
 # 仓库的 Release 里。
+#
+# ⚠️ 80 端口原来不是空着的: acme.sh 给 x-ui 面板续那张 IP 证书(shortlived,
+# 约5天一续)用的是 standalone 模式, 续的时候自己临时占 80。nginx 一常驻就
+# 续不上, 证书几天后过期。所以那张证书改成了 webroot 模式(Le_Webroot=
+# /var/www/acme, 原配置备份在 .conf.bak-standalone), 走上面那个
+# acme-challenge location。2026-10-14 用 staging 实签一次验证通过。
