@@ -36,6 +36,10 @@ $PY update_daily.py --qvix-only
 # gh upload 返回 0 但资产根本没变)。
 $PY push_dbs.py qvix
 
+# 上证页静态网页跟着刷新, 不等每小时那次(见 vps_site_build.sh)。挂了不影响
+# 上面已经推出去的 QVIX。
+"$BASE/repo/vps_site_build.sh" || echo "⚠️ 静态页生成失败"
+
 # ── cron(root, 时区 UTC)────────────────────────────────────────────────────
 #   0 23 * * 1-5  /opt/fund-analyzer/repo/vps_qvix_daily.sh >> /var/log/qvix-daily.log 2>&1
 #

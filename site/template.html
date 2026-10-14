@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>上证 · QVIX</title>
+<!-- 由 build_site.py 生成, 别直接改产物; 数据嵌在下面 id="data" 那段 JSON 里 -->
+<style>
+:root{--bg:#fff;--fg:#1f2328;--muted:#656d76;--line:#d8dee4;--card:#f6f8fa;--accent:#2f6fde;--sse:#3b6fd8;--drop:#e0454b}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e8eb;--muted:#9aa4af;--line:#2d333b;--card:#171b21;--accent:#4f8ff7;--sse:#6ea0ff;--drop:#ff6b70}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+main{max-width:1200px;margin:0 auto;padding:12px 16px 40px}
+h1{font-size:18px;margin:4px 0 2px}
+.fresh{color:var(--muted);font-size:12px}
+.seg{display:flex;gap:6px;overflow-x:auto;margin-top:12px;padding-bottom:2px;scrollbar-width:none}
+.seg::-webkit-scrollbar{display:none}
+.seg button{flex:none;border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:999px;padding:5px 12px;font-size:13px;cursor:pointer}
+.seg button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.opts{display:flex;flex-wrap:wrap;gap:4px 16px;margin:8px 0 0;font-size:13px;color:var(--muted)}
+.opts label{display:flex;align-items:center;gap:4px;cursor:pointer}
+.kpis{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:12px 0 4px}
+@media (min-width:720px){.kpis{grid-template-columns:repeat(4,1fr)}}
+.kpi{background:var(--card);border-radius:8px;padding:8px 10px;min-width:0}
+.kpi .l{color:var(--muted);font-size:12px}
+.kpi .v{font-size:20px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.3}
+.kpi .s{font-size:12px;color:var(--muted)}
+#chart{height:380px}
+@media (min-width:720px){#chart{height:440px}}
+.warn{color:var(--muted);font-size:12px}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-top:12px;overflow-x:auto;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tabs button{flex:none;background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);padding:8px 10px;font-size:14px;cursor:pointer}
+.tabs button.on{color:var(--fg);border-bottom-color:var(--accent);font-weight:600}
+.pane{display:none;padding-top:10px}
+.pane.on{display:block}
+.intro{margin:0 0 6px}
+.cap{color:var(--muted);font-size:12.5px;margin:6px 0 10px}
+.cap.clamp{display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
+.more{background:none;border:0;color:var(--accent);font-size:12.5px;padding:0;margin:-6px 0 10px;cursor:pointer}
+.tw{overflow:auto;border:1px solid var(--line);border-radius:6px;max-height:75vh;-webkit-overflow-scrolling:touch}
+table{border-collapse:separate;border-spacing:0;font-size:12.5px;font-variant-numeric:tabular-nums}
+th,td{padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap;text-align:right}
+th{position:sticky;top:0;background:var(--card);z-index:2;font-weight:600;color:var(--muted)}
+th.t,td.t{text-align:left}
+td.note{white-space:normal;min-width:26em;max-width:34em;text-align:left;cursor:pointer}
+td.note div{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+td.note.open div{display:block}
+th:first-child,td:first-child{position:sticky;left:0;z-index:1;background:var(--bg)}
+th:first-child{z-index:3;background:var(--card)}
+tr:last-child td{border-bottom:0}
+select{width:100%;font-size:13px;padding:7px;margin:4px 0 2px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px}
+.lbl{font-size:13px;color:var(--muted)}
+.foot{margin-top:24px;color:var(--muted);font-size:12px}
+code{font-size:12px}
+</style>
+</head>
+<body>
+<main>
+<h1>📈 上证指数 · QVIX</h1>
+<div class="fresh" id="fresh"></div>
+<div class="seg" id="ranges"></div>
+<div class="opts">
+  <label><input type="checkbox" id="vix" checked>VIX恐慌指数(右轴)</label>
+  <label><input type="checkbox" id="bands">标记跌超1%的交易日</label>
+</div>
+<div class="kpis" id="kpis"></div>
+<div id="chart"></div>
+<div class="warn" id="vixwarn"></div>
+<div class="tabs" id="tabs">
+  <button data-p="review" class="on">📜 策略复盘</button>
+  <button data-p="runs">🧪 历次对照回测</button>
+  <button data-p="daily">📄 每日数据</button>
+</div>
+<section class="pane on" id="p-review"></section>
+<section class="pane" id="p-runs"></section>
+<section class="pane" id="p-daily"></section>
+<div class="foot">「今天会买哪只」和基金详情要用净值库, 不在这一页, 去 Streamlit 版看。</div>
+</main>
+<script src="__ECHARTS__"></script>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+(function () {
+"use strict";
+const D = JSON.parse(document.getElementById("data").textContent);
+const S = D.sse, N = S.d.length, Q = D.qv || null;
+const T = S.d.map(d => Date.parse(d));          // UTC 零点, 只用来算天数差
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const f2 = v => v.toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const sg = v => (v >= 0 ? "+" : "") + v.toFixed(2);
+const localTs = d => new Date(d + "T00:00:00").getTime();   // echarts 按本地时区解析日期
+
+const state = {rng: D.rdef, vix: true, bands: false, tab: "review"};
+const RANGES = Object.fromEntries(D.ranges);
+
+$("fresh").textContent = "上证截至 " + S.d[N - 1]
+  + (Q ? " · QVIX截至 " + Q.d[Q.d.length - 1] : "")
+  + " · 页面生成于 " + D.gen + "(北京时间)";
+
+// ── 时间窗口: 保留锚点行(起点当天或之前最后一个收盘), 与 sse_view.window 同口径
+function startIdx(days) {
+  if (days == null) return 0;
+  const st = T[N - 1] - days * 864e5;
+  let i = -1;
+  for (let k = 0; k < N && T[k] <= st; k++) i = k;
+  return i < 0 ? 0 : i;
+}
+
+// ── 区间按钮 / 开关
+const seg = $("ranges");
+seg.innerHTML = D.ranges.map(([k]) =>
+  `<button data-r="${k}"${k === state.rng ? ' class="on"' : ""}>${k}</button>`).join("");
+seg.addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  state.rng = b.dataset.r;
+  seg.querySelectorAll("button").forEach(x => x.classList.toggle("on", x === b));
+  renderTop();
+});
+$("vix").addEventListener("change", e => { state.vix = e.target.checked; renderTop(); });
+$("bands").addEventListener("change", e => { state.bands = e.target.checked; renderTop(); });
+
+// ── 图
+const chart = echarts.init($("chart"));
+window.addEventListener("resize", () => chart.resize());
+
+function qvixIn(d0, d1) {
+  const line = [], thr = [], bk = [];
+  if (!Q) return {line, thr, bk};
+  for (let k = 0; k < Q.d.length; k++) {
+    const d = Q.d[k];
+    if (d < d0 || d > d1) continue;
+    if (Q.v[k] != null) line.push([d, Q.v[k]]);
+    if (Q.t[k] != null) {
+      thr.push([d, Q.t[k]]);
+      // 链失效日没有数值, 在阈值线高度上打 ×: 位置不代表数值, 只代表"这天在阈值之上"
+      if (Q.bk[k]) bk.push([d, Q.t[k]]);
+    }
+  }
+  return {line, thr, bk};
+}
+
+function renderChart(i0) {
+  const d0 = S.d[i0], d1 = S.d[N - 1];
+  const muted = css("--muted"), line = css("--line"), fg = css("--fg"), drop = css("--drop");
+  const qc = D.qcolor;
+  const sse = [];
+  for (let k = i0; k < N; k++) sse.push([S.d[k], S.c[k], S.p[k]]);
+
+  const series = [{
+    name: "上证指数", type: "line", data: sse, yAxisIndex: 0, showSymbol: false,
+    lineStyle: {width: 1.5, color: css("--sse")}, itemStyle: {color: css("--sse")},
+    emphasis: {disabled: true},
+  }];
+
+  let vixOk = false;
+  if (state.vix) {
+    const q = qvixIn(d0, d1);
+    vixOk = q.line.length > 0;
+    $("vixwarn").textContent = vixOk ? "" : "⚠️ VIX恐慌指数数据暂不可用";
+    if (vixOk) {
+      series.push({name: "VIX恐慌指数(QVIX,自算)", type: "line", data: q.line, yAxisIndex: 1,
+        showSymbol: false, lineStyle: {width: 1.3, color: qc}, itemStyle: {color: qc},
+        emphasis: {disabled: true}});
+      if (q.thr.length) series.push({name: "恐慌阈值(2年90%)", type: "line", data: q.thr,
+        yAxisIndex: 1, showSymbol: false, lineStyle: {width: 1.2, color: qc, type: "dashed"},
+        itemStyle: {color: qc}, emphasis: {disabled: true}});
+      if (q.bk.length) series.push({name: "链失效(按信号处理)", type: "scatter", data: q.bk,
+        yAxisIndex: 1, symbol: "path://M2,0L5,3L8,0L10,2L7,5L10,8L8,10L5,7L2,10L0,8L3,5L0,2Z",
+        symbolSize: 11, itemStyle: {color: qc}});
+    }
+  } else {
+    $("vixwarn").textContent = "";
+  }
+
+  if (state.bands) {
+    const areas = [];
+    for (let k = i0; k < N; k++) {
+      if (S.p[k] != null && S.p[k] <= -1.0) {
+        const t = localTs(S.d[k]);
+        areas.push([{xAxis: t - 432e5, label: {formatter: "沪指" + S.p[k].toFixed(1) + "%"}},
+                    {xAxis: t + 432e5}]);
+      }
+    }
+    series[0].markArea = {silent: true, data: areas,
+      itemStyle: {color: drop, opacity: 0.15},
+      label: {show: true, position: "top", rotate: 40, align: "left", verticalAlign: "middle",
+        color: drop, fontSize: 10, distance: 4}};
+  }
+
+  const spanDays = (T[N - 1] - T[i0]) / 864e5;
+  const fmt = spanDays <= 400 ? "{MM}-{dd}" : "{yyyy}-{MM}";
+  const wide = chart.getWidth() >= 600;
+  chart.setOption({
+    animation: false,
+    textStyle: {fontFamily: getComputedStyle(document.body).fontFamily},
+    grid: {left: 8, right: 8, top: state.bands ? 78 : (vixOk ? 48 : 16), bottom: 8, containLabel: true},
+    legend: {show: vixOk, top: 0, left: 0, itemWidth: 16, itemHeight: 8,
+      textStyle: {color: muted, fontSize: wide ? 12 : 11}},
+    tooltip: {
+      trigger: "axis", confine: true, axisPointer: {type: "cross", label: {show: false}},
+      formatter(ps) {
+        const day = (ps.find(p => p.seriesIndex === 0) || ps[0]).value[0];
+        const rows = [`<b>${day}</b>`];
+        for (const p of ps) {
+          if (p.value[0] !== day) continue;      // 稀疏序列(×)会吸附到别的日子, 只要当天的
+          const m = p.marker;
+          if (p.seriesIndex === 0) rows.push(`${m}收盘 ${f2(p.value[1])} · 日涨跌 ${p.value[2] == null ? "—" : sg(p.value[2]) + "%"}`);
+          else if (p.seriesName.startsWith("VIX")) rows.push(`${m}VIX ${p.value[1].toFixed(2)}`);
+          else if (p.seriesName.startsWith("恐慌")) rows.push(`${m}阈值 ${p.value[1].toFixed(2)}`);
+          else rows.push(`${m}那天算不出来——跌出期权链行权价范围,公式失效,按信号处理`);
+        }
+        return rows.join("<br>");
+      },
+    },
+    xAxis: {type: "time", boundaryGap: false,
+      axisLine: {lineStyle: {color: line}}, axisTick: {show: false},
+      axisLabel: {color: muted, hideOverlap: true, formatter: fmt},
+      splitLine: {show: false}},
+    yAxis: [
+      {type: "value", scale: true, splitLine: {lineStyle: {color: line}},
+        axisLabel: {color: muted, formatter: v => v.toLocaleString("en-US")}},
+      {type: "value", scale: true, show: vixOk, position: "right", splitLine: {show: false},
+        axisLabel: {color: qc}},
+    ],
+    series,
+  }, {notMerge: true});
+}
+
+function renderKpis(i0) {
+  const c = S.c, last = N - 1;
+  const chg = (c[last] / c[i0] - 1) * 100;
+  let peak = -Infinity, mdd = 0;
+  for (let k = i0; k <= last; k++) {
+    peak = Math.max(peak, c[k]);
+    mdd = Math.max(mdd, (peak - c[k]) / peak);
+  }
+  const card = (l, v, s) => `<div class="kpi"><div class="l">${l}</div><div class="v">${v}</div>${s ? `<div class="s">${s}</div>` : ""}</div>`;
+  $("kpis").innerHTML =
+    card("最新收盘", f2(c[last]), S.p[last] == null ? "" : sg(S.p[last]) + "%(当日)") +
+    card(state.rng + "涨跌幅", sg(chg) + "%") +
+    card(state.rng + "最大回撤", (mdd * 100).toFixed(2) + "%") +
+    card("数据日期", S.d[last]);
+}
+
+// ── 表格
+const NUMRE = /^[+-]?[\d.,]+%?$/;
+function tableHtml(t, noteCol) {
+  const numeric = t.cols.map((_, j) => t.rows.every(r => r[j] === "" || NUMRE.test(r[j])));
+  const cls = j => t.cols[j] === noteCol ? "note" : (numeric[j] ? "" : "t");
+  let h = '<div class="tw"><table><thead><tr>'
+    + t.cols.map((c, j) => `<th class="${cls(j) === "note" ? "t" : cls(j)}">${esc(c)}</th>`).join("")
+    + "</tr></thead><tbody>";
+  t.rows.forEach((r, i) => {
+    const hl = (t.hl && t.hl[i]) || [];
+    h += "<tr>" + r.map((v, j) => {
+      const bg = hl.includes(t.cols[j]) ? ` style="background:${D.bg[t.cols[j]]};color:#1a1a1a"` : "";
+      // 备注是几百字的人工点评, 默认只露两行, 点一下展开(Streamlit 版那列也是截断的)
+      const body = cls(j) === "note" ? `<div>${esc(v)}</div>` : esc(v);
+      return `<td class="${cls(j)}"${bg}>${body}</td>`;
+    }).join("") + "</tr>";
+  });
+  return h + "</tbody></table></div>";
+}
+
+// 长说明默认折到 4 行, 手机上不然表格要往下翻一屏才看得到
+function capHtml(html) {
+  return `<div class="cap clamp">${html}</div><button class="more">展开全文</button>`;
+}
+document.addEventListener("click", e => {
+  const note = e.target.closest("td.note");
+  if (note) { note.classList.toggle("open"); return; }
+  if (!e.target.classList.contains("more")) return;
+  const cap = e.target.previousElementSibling;
+  const open = cap.classList.toggle("clamp");
+  e.target.textContent = open ? "展开全文" : "收起";
+});
+function fixMoreButtons(root) {
+  root.querySelectorAll(".cap.clamp").forEach(c => {
+    const b = c.nextElementSibling;
+    if (b && b.classList.contains("more")) b.hidden = c.scrollHeight <= c.clientHeight + 2;
+  });
+}
+
+function renderReview() {
+  const R = D.review, el = $("p-review");
+  let h = `<p class="intro">${R.intro}</p>`;
+  if (R.empty) h += `<div class="cap">${R.empty}</div>`;
+  else h += capHtml(R.summary) + tableHtml(R.table, "备注");
+  el.innerHTML = h;
+  fixMoreButtons(el);
+}
+
+function renderRuns() {
+  const el = $("p-runs"), runs = D.runs;
+  if (!runs.length) {
+    el.innerHTML = '<div class="cap">暂无对照跑批——<code>backtest_qvix.py</code> 跑一次非标准参数就会往策略库追加一条, 推库后这里能翻到。</div>';
+    return;
+  }
+  el.innerHTML = `<div class="cap">${runs.length} 次对照回测, 非线上实盘规则</div>`
+    + '<div class="lbl">选一次跑批看明细</div><select id="runsel">'
+    + runs.map((r, i) => `<option value="${i}">${esc(r.label)}</option>`).join("")
+    + '</select><div id="rundetail"></div>';
+  const show = i => {
+    const r = runs[i], box = $("rundetail");
+    box.innerHTML = r.table ? capHtml(r.caption) + tableHtml(r.table) : `<div class="cap">${r.caption}</div>`;
+    fixMoreButtons(box);
+  };
+  $("runsel").addEventListener("change", e => show(+e.target.value));
+  show(0);
+}
+
+function renderDaily(i0) {
+  const vq = {};
+  const withVix = state.vix && Q;
+  if (withVix) Q.d.forEach((d, k) => { vq[d] = Q.v[k]; });
+  const cols = ["日期", "收盘点位", "日涨跌(%)"].concat(withVix ? ["VIX恐慌指数"] : []);
+  const rows = [];
+  for (let k = N - 1; k >= i0; k--) {
+    const r = [S.d[k], S.c[k].toFixed(2), S.p[k] == null ? "" : S.p[k].toFixed(2)];
+    if (withVix) r.push(vq[S.d[k]] == null ? "" : vq[S.d[k]].toFixed(2));
+    rows.push(r);
+  }
+  $("p-daily").innerHTML = tableHtml({cols, rows});
+}
+
+// ── 子标签页: 每日数据跟着区间变, 只在看得见的时候画
+let dailyDirty = true;
+$("tabs").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  state.tab = b.dataset.p;
+  document.querySelectorAll("#tabs button").forEach(x => x.classList.toggle("on", x === b));
+  document.querySelectorAll(".pane").forEach(p => p.classList.toggle("on", p.id === "p-" + state.tab));
+  if (state.tab === "daily" && dailyDirty) { renderDaily(startIdx(RANGES[state.rng])); dailyDirty = false; }
+  if (state.tab !== "daily") fixMoreButtons($("p-" + state.tab));
+});
+
+function renderTop() {
+  const i0 = startIdx(RANGES[state.rng]);
+  renderKpis(i0);
+  renderChart(i0);
+  if (state.tab === "daily") renderDaily(i0); else dailyDirty = true;
+}
+
+renderTop();
+renderReview();
+renderRuns();
+const mq = window.matchMedia("(prefers-color-scheme: dark)");
+(mq.addEventListener ? mq.addEventListener.bind(mq, "change") : mq.addListener.bind(mq))(renderTop);
+})();
+</script>
+</body>
+</html>
