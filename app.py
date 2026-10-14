@@ -1169,8 +1169,8 @@ with tab_sse:
         sse_all = sse_all.sort_values("date").reset_index(drop=True)
 
         _sse_ranges = {"近1月": 30, "近3月": 91, "近6月": 182,
-                       "近1年": 365, "近3年": 365 * 3, "近5年": 365 * 5,
-                       "近10年": 365 * 10, "全部": None}
+                       "近1年": 365, "近2年": 365 * 2, "近3年": 365 * 3,
+                       "近5年": 365 * 5, "近10年": 365 * 10, "全部": None}
         _c_rng, _c_bands, _c_vix = st.columns([4, 1, 1])
         with _c_rng:
             _rng = st.radio("时间区间", list(_sse_ranges.keys()), index=3,
@@ -1242,6 +1242,9 @@ with tab_sse:
             fig_sse.add_trace(go.Scatter(
                 x=_line["date"], y=_line["qvix"],
                 name="VIX恐慌指数(QVIX,自算)", yaxis="y2",
+                # mode 必须写死: 不写时 plotly 在点数 <20 时自动加点, 近1月
+                # 碰上长假(只剩十几个交易日)就突然冒出一串圆点。
+                mode="lines",
                 line=dict(color=_QVIX_COLOR, width=1.3),
                 hovertemplate="VIX %{y:.2f}<extra></extra>"))
             # Default (right-side vertical) legend keeps clear of the
@@ -1260,7 +1263,7 @@ with tab_sse:
             if _t is not None and not _t.empty:
                 fig_sse.add_trace(go.Scatter(
                     x=_t["date"], y=_t["thr"],
-                    name="恐慌阈值(2年90%)", yaxis="y2",
+                    name="恐慌阈值(2年90%)", yaxis="y2", mode="lines",
                     line=dict(color=_QVIX_COLOR, width=1.2, dash="dash"),
                     hovertemplate="阈值 %{y:.2f}<extra></extra>"))
                 # 链失效日在曲线上只是个断点, 什么都看不见 —— 而它恰恰是最
