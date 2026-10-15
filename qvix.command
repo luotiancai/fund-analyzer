@@ -2,6 +2,7 @@
 # 算一次盘中 QVIX, 结果直接打在屏幕上(纯本地, 不上传)。
 #   macOS: Finder 里双击(双击 .command 会开终端执行它)
 #   WSL:   ./qvix.command
+#   Windows: 双击 qvix.bat(它进 WSL 跑本文件)
 cd "$(dirname "$0")" || exit 1
 
 # venv 优先级同 run.sh:WSL 原生 ext4(~/.venvs)> 项目内 .venv > 系统 python3。
