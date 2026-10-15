@@ -7,3 +7,5 @@ qvix_now.json
 
 # 通知配置: 里面是手机号, 不进仓库
 qvix_notify.conf
+
+.claude/
