@@ -296,8 +296,11 @@ _DDL = {
     -- 没有恐慌就没有反弹可吃, 只能原地漂到止损。
     -- note 带 qvix_calc.CHAIN_BROKEN 前缀的那几天是"算不出来"而不是"没
     -- 数据"——公式被极端行情撑爆了, 消费方当信号日处理, 见那个常量的说明。
+    -- qvix_rt: 同一天 15:00 用**实时路径**(新浪买卖盘)算的收盘值, 只作展示
+    -- 和两条路径的对照, **不进信号判定、不进阈值** —— 见 update_qvix_rt_close。
     CREATE TABLE IF NOT EXISTS qvix.qvix_self_history (
-        date TEXT PRIMARY KEY, qvix REAL, note TEXT, threshold REAL);
+        date TEXT PRIMARY KEY, qvix REAL, note TEXT, threshold REAL,
+        qvix_rt REAL);
 """,
 
 "market": """
@@ -426,6 +429,11 @@ def init_db():
             conn.execute(f"ALTER TABLE qvix.qvix_self_history DROP COLUMN {col}")
         except sqlite3.OperationalError:
             pass  # 列不存在(已删/新库)、SQLite 太老、或 qvix 库还没挂上
+    # 2026-10-17: 加实时路径收盘值一列(见 update_qvix_rt_close)。
+    try:
+        conn.execute("ALTER TABLE qvix.qvix_self_history ADD COLUMN qvix_rt REAL")
+    except sqlite3.OperationalError:
+        pass  # 列已存在(新库/迁移过)或 qvix 库还没挂上
     _migrate_nav_blobs(conn)
     conn.commit()
     conn.close()
@@ -2256,6 +2264,63 @@ def update_qvix_self_daily() -> tuple:
                              .quantile(QVIX_THR_PCT))
         save_qvix_self_threshold(hist["date"].tolist(), hist["threshold"].tolist())
     return vix, note
+
+
+def update_qvix_rt_close() -> tuple:
+    """用**实时路径**(qvix_core.compute_qvix, 新浪买卖盘)补算"最近一个已收盘
+    交易日" 15:00 的 QVIX, 写进 qvix_self_history.qvix_rt。返回 (日期, 值或None)。
+
+    跟 qvix 列是两条路径算的同一个东西: qvix 列由上交所官方 IV 反推
+    BS 价格(能回算历史), 这一列是盘中 qvix_now.py 那套、收盘那一刻的值。
+    并排放着是为了看两者差多少 —— 盘中拿实时值比阈值, 而阈值是 qvix 列
+    算出来的, 两把尺子到底偏多少, 以前只能凭感觉。
+    **只作展示, 不进信号判定也不进阈值**: 混进去就真成两把尺子量一件事了。
+
+    时点: 收盘后到次日开盘前, 新浪返回的都是 15:00 那一刻的静态报价,
+    as_of 钉在 15:00 就能算出跟当天收盘时现算一模一样的数(2026-10-17 周六
+    中午实测重算 10-16 收盘 = 16.29, 跟当天 15:00 后本机算的完全一致)。
+    所以 VPS 早上 07:00 那次跑批顺手算前一天的就行, 不用另开一个 15:00 的
+    cron。代价是**补不了历史**: 新浪不给历史报价, 下一次开盘集合竞价(9:15)
+    一开始, 前一天的收盘盘口就没了 —— 漏一天就是永久空着, 不像 qvix 列那样
+    能自愈。
+
+    算不出来不写 None(不把以前算好的值冲掉), 只记日志。"""
+    now = datetime.now(_CST)
+    today = now.date()
+    days = _trading_days()
+    if not days:
+        return None, None
+    if today in days and now.time() >= _CLOSE:
+        target = today
+    elif today in days and now.time() >= dt_time(9, 15):
+        logger.info("QVIX 实时口径收盘值: 盘中, 报价已不是收盘盘口, 跳过")
+        return None, None
+    else:
+        prior = [d for d in days if d < today]
+        if not prior:
+            return None, None
+        target = max(prior)
+
+    import qvix_core
+    as_of = datetime(target.year, target.month, target.day, 15, 0, tzinfo=_CST)
+    try:
+        r = qvix_core.compute_qvix(as_of=as_of, fallback_rate=get_risk_free_rate())
+    except Exception as e:
+        logger.warning("QVIX 实时口径收盘值(%s)异常: %s", target, e)
+        return target.isoformat(), None
+    if r is None or r[0] is None:
+        logger.warning("QVIX 实时口径收盘值(%s)算不出来(新浪合约或报价没拿全)", target)
+        return target.isoformat(), None
+
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO qvix_self_history (date, qvix_rt) VALUES (?, ?) "
+        "ON CONFLICT(date) DO UPDATE SET qvix_rt=excluded.qvix_rt",
+        (target.isoformat(), r[0]))
+    conn.commit()
+    conn.close()
+    logger.info("QVIX 实时口径收盘值(%s) = %.2f", target, r[0])
+    return target.isoformat(), r[0]
 
 
 # ── Daily-batch pipeline ──────────────────────────────────────────────────────

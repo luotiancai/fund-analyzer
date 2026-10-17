@@ -82,6 +82,9 @@ def collect() -> dict:
         out["qv"] = {"d": hist["date"].astype(str).tolist(),
                      "v": [_num(v, 2) for v in hist["qvix"]],
                      "t": [_num(v, 3) for v in thr["thr"]],
+                     # 实时路径收盘值(只作展示), 老库没有这列就全空
+                     "r": [_num(v, 2) for v in hist.get("qvix_rt",
+                                                        [None] * len(hist))],
                      "bk": [1 if b else 0
                             for b in sse_view.chain_broken_mask(hist)]}
 

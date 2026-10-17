@@ -313,14 +313,17 @@ function renderRuns() {
 }
 
 function renderDaily(i0) {
-  const vq = {};
+  const vq = {}, vr = {};
   const withVix = state.vix && Q;
-  if (withVix) Q.d.forEach((d, k) => { vq[d] = Q.v[k]; });
-  const cols = ["日期", "收盘点位", "日涨跌(%)"].concat(withVix ? ["VIX恐慌指数"] : []);
+  // 实时口径收盘值(新浪买卖盘 15:00 现算, 只作对照): 2026-10 才开始攒, 更早的日子是空的
+  if (withVix) Q.d.forEach((d, k) => { vq[d] = Q.v[k]; if (Q.r) vr[d] = Q.r[k]; });
+  const f2 = x => x == null ? "" : x.toFixed(2);
+  const cols = ["日期", "收盘点位", "日涨跌(%)"]
+    .concat(withVix ? ["VIX恐慌指数", "VIX实时口径收盘"] : []);
   const rows = [];
   for (let k = N - 1; k >= i0; k--) {
     const r = [S.d[k], S.c[k].toFixed(2), S.p[k] == null ? "" : S.p[k].toFixed(2)];
-    if (withVix) r.push(vq[S.d[k]] == null ? "" : vq[S.d[k]].toFixed(2));
+    if (withVix) r.push(f2(vq[S.d[k]]), f2(vr[S.d[k]]));
     rows.push(r);
   }
   $("p-daily").innerHTML = tableHtml({cols, rows});

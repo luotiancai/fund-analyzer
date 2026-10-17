@@ -98,6 +98,15 @@ def run_qvix_only() -> list:
     else:
         log.info("   没有新补上的值(凌晨那次已经算好了,或接口这会儿还是不通)")
 
+    # 实时路径(新浪买卖盘)的收盘值, 只作展示/对照, 见 fetcher.update_qvix_rt_close。
+    # 必须赶在下一次开盘前算: 新浪没有历史盘口, 错过就永久空着。失败不影响上面。
+    try:
+        d, v = fetcher.update_qvix_rt_close()
+        if v is not None:
+            log.info("   QVIX(实时口径收盘, %s) %.2f", d, v)
+    except Exception as e:
+        log.warning("   QVIX 实时口径收盘值失败(不影响日度值): %s", e)
+
     _emit_gha_output(changed=str(bool(filled)).lower(),
                      filled=",".join(filled))
     return filled
