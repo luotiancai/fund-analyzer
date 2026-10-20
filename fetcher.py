@@ -1914,14 +1914,22 @@ def _trading_days() -> Optional[set]:
 #   00:00~09:30  昨天的收盘值(今天还没开始交易)
 #   09:30~11:30  实时现算
 #   11:30~13:00  定格在 11:30(上午收盘值)
-#   13:00~15:00  实时现算
+#   13:00~14:57  实时现算
+#   14:57~15:00  不给数(收盘集合竞价)
 #   15:00~24:00  定格在 15:00(今日收盘值)
+# 收盘集合竞价 14:57~15:00 跟开盘那段一样只有申报、没有连续成交, 新浪给的
+# 买卖盘不是正常盘口。2026-10-20 14:59:48 手动现算得 12.17, 15:00 后拿收盘
+# 盘口重算是 15.80(前一天 16.39) —— 差 3.6, 像是虚值档买价被报成 0、触发
+# term_variance 的"连续两个零买价截断"砍掉一段虚值。这 3 分钟算出来的数
+# 不可信, 也没有可以替它的值(上午/收盘那两档是盘口定格, 这里是盘口失真),
+# 所以这一档只提示等 15:00, 不给数。
 # 定格靠给 qvix_calc.compute_qvix 传 as_of 实现:报价本来就是静态的,只要
 # 把"剩余到期时间"也钉在同一刻,同一批报价就永远算出同一个数,不会出现
 # 下午2点看和晚上10点看不一致。非交易日全天走"昨天的收盘值"。
 _OPEN = dt_time(9, 30)
 _NOON_CLOSE = dt_time(11, 30)
 _NOON_OPEN = dt_time(13, 0)
+_CLOSE_AUCTION = dt_time(14, 57)
 _CLOSE = dt_time(15, 0)
 
 
@@ -1939,8 +1947,9 @@ def is_trading_day(day=None) -> bool:
 def qvix_phase(now: Optional[datetime] = None) -> tuple:
     """当下该取哪个数 → (档位, as_of)。
 
-    档位∈{"live","noon","close","prev"};as_of 是要钉住的时刻
-    ("live" 为 None=用当下,"prev" 也是 None=不现算、直接读库)。"""
+    档位∈{"live","noon","auction","close","prev"};as_of 是要钉住的时刻
+    ("live" 为 None=用当下,"prev" 也是 None=不现算、直接读库,
+    "auction" 为 None=收盘集合竞价、不能算也没有可替的值)。"""
     now = now or datetime.now(_CST)
     if not is_trading_day(now.date()):
         return "prev", None
@@ -1951,8 +1960,10 @@ def qvix_phase(now: Optional[datetime] = None) -> tuple:
         return "live", None
     if t < _NOON_OPEN:
         return "noon", now.replace(hour=11, minute=30, second=0, microsecond=0)
-    if t < _CLOSE:
+    if t < _CLOSE_AUCTION:
         return "live", None
+    if t < _CLOSE:
+        return "auction", None
     return "close", now.replace(hour=15, minute=0, second=0, microsecond=0)
 
 

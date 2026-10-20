@@ -160,8 +160,8 @@ def _notify_fail(msg: str) -> None:
          'buttons {"知道了"} default button 1 with icon caution', timeout=None)
 
 
-_PHASE_CN = {"live": "实时", "noon": "上午收盘", "close": "今日收盘",
-             "prev": "上一交易日收盘"}
+_PHASE_CN = {"live": "实时", "noon": "上午收盘", "auction": "收盘集合竞价",
+             "close": "今日收盘", "prev": "上一交易日收盘"}
 
 
 def _latest(col: str):
@@ -251,6 +251,16 @@ def main() -> int:
         # 收盘后回看用这个口径才跟页面一致, 别改成 shift。
         _print_box(val, f"{_PHASE_CN['prev']} {day}")
         return 0
+    if phase == "auction":
+        # 14:57~15:00 盘口失真, 算出来的数不可信(见 fetcher 档位表)。也不写
+        # qvix_now.json —— 那里留着的上一个值好歹是真的。定时任务 14:40 跑
+        # 本来碰不到这 3 分钟, 但机器在 14:40 睡着、14:57 后醒来时 launchd
+        # 会补跑, 那时照样弹窗说清楚, 免得人以为今天跑过了。
+        msg = "收盘集合竞价中(14:57~15:00), 盘口不是正常报价, 不算。15:00 后再跑。"
+        log.warning(msg)
+        if notify:
+            _notify_fail(msg + "\n\n15:00 后双击 qvix.command 即可拿到今日收盘值。")
+        return 1
     try:
         r = qvix_core.compute_qvix(as_of=as_of,
                                    fallback_rate=fetcher.get_risk_free_rate())
