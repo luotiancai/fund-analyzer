@@ -18,6 +18,7 @@ Pipeline (fetcher.run_pipeline):
   仅重算:    python3 update_daily.py --recompute-only
   仅补QVIX:  python3 update_daily.py --qvix-only   (VPS 专用, 见 run_qvix_only)
   仅刷规模:   python3 update_daily.py --scales-only (规模覆盖范围扩大后补全用)
+  跳过规模:   python3 update_daily.py --no-scales   (云端跑批用, 规模另起一步)
   cron:      0 18 * * 1-5  cd /path/to/fund-analyzer && python3 update_daily.py >> update.log 2>&1
 """
 
@@ -121,6 +122,9 @@ def main():
     parser.add_argument("--scales-only", action="store_true",
                         help="只刷基金季度规模,不跑净值/指数/QVIX"
                              "(规模覆盖范围扩大后的一次性补全用)")
+    parser.add_argument("--no-scales", action="store_true",
+                        help="完整跑批但跳过规模刷新(云端跑批把规模拆到最后单独跑,"
+                             "免得季报到期那天拖住上证)")
     args = parser.parse_args()
 
     t0 = time.time()
@@ -154,12 +158,13 @@ def main():
 
         # 基金季度规模刷新(供选基/回测的规模门槛用)。cache-first, 7天内
         # 已抓的跳过, 平时几乎零网络; 只有新基金/过期的才真抓。
-        try:
-            n = fetcher.refresh_scale_hist(
-                progress=lambda p, d, t: _log_progress(p, d, t))
-            log.info("   基金规模刷新完成(本次实抓 %d 只)", n)
-        except Exception as e:
-            log.warning("   基金规模刷新失败(不影响主流程): %s", e)
+        if not args.no_scales:
+            try:
+                n = fetcher.refresh_scale_hist(
+                    progress=lambda p, d, t: _log_progress(p, d, t))
+                log.info("   基金规模刷新完成(本次实抓 %d 只)", n)
+            except Exception as e:
+                log.warning("   基金规模刷新失败(不影响主流程): %s", e)
 
     # ── 指数刷新 ────────────────────────────────────────────────────────────
     # 上证指数刷新照旧(app 侧无过期时间,只在这里force_refresh才变)。

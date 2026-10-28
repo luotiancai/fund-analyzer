@@ -79,25 +79,33 @@ jobs:
             fi
           done
 
+      # 规模单独放最后、单独回传: 季报到期那天要抓一万多只(2小时+), 以前跟
+      # 净值/上证一起跑完才统一上传, 2026-10-28 上证静态页因此空等到 9 点多。
+      # scales-only 只刷规模,别的一概不碰;定时触发没有 inputs,默认 full。
       - name: 跑批(增量补净值 + 重算指标 + 刷新上证)
-        # scales-only 只刷规模,别的一概不碰;定时触发没有 inputs,默认 full。
-        run: |
-          if [ "${{ github.event.inputs.mode }}" = "scales-only" ]; then
-            python update_daily.py --scales-only
-          else
-            python update_daily.py
-          fi
-      - name: 压缩并回传各个库
+        if: github.event.inputs.mode != 'scales-only'
+        run: python update_daily.py --no-scales
+      - name: 压缩并回传 净值/榜单/行情
         # 一个库一个资产, 各自独立。只传跑批真正写过的那几个 —— 不碰
         # strategy(本地回测发)、cache(缓存)。
+        if: github.event.inputs.mode != 'scales-only'
         run: |
           cd "$FUND_ANALYZER_DATA"
-          for db in fund_rank market fund_nav fund_scale; do
+          up=""
+          for db in fund_rank market fund_nav; do
             [ -f "$db.db" ] || { echo "::warning::缺 $db.db, 不传"; continue; }
-            gzip -9 -c "$db.db" > "$db.db.gz"
+            gzip -9 -c "$db.db" > "$db.db.gz" && up="$up $db.db.gz"
           done
-          ls -lh ./*.db.gz
+          ls -lh $up
           gh release create data --title "数据快照" \
             --notes "每日跑批产物,应用启动时自动拉取,请勿手动改动" \
             --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
-          gh release upload data ./*.db.gz --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload data $up --clobber --repo "$GITHUB_REPOSITORY"
+      - name: 刷新基金规模
+        run: python update_daily.py --scales-only
+      - name: 压缩并回传 规模
+        run: |
+          cd "$FUND_ANALYZER_DATA"
+          gzip -9 -c fund_scale.db > fund_scale.db.gz
+          ls -lh fund_scale.db.gz
+          gh release upload data fund_scale.db.gz --clobber --repo "$GITHUB_REPOSITORY"
