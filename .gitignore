@@ -9,3 +9,6 @@ qvix_now.json
 qvix_notify.conf
 
 .claude/
+
+# 临时回归验证脚本，仅本地保留
+/tests/test_holdings.py
