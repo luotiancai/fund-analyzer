@@ -1380,7 +1380,6 @@ def _em_f10_holdings_raw(code: str, year: str, typ: str) -> Optional[pd.DataFram
     nothing.
     """
     from bs4 import BeautifulSoup
-    from akshare.utils import demjson
     try:
         r = requests.get(
             _EM_F10_URL,
@@ -1388,8 +1387,15 @@ def _em_f10_holdings_raw(code: str, year: str, typ: str) -> Optional[pd.DataFram
                     "year": year, "month": "", "rt": "0.9"},
             headers={"Referer": f"https://fundf10.eastmoney.com/ccmx_{code}.html"},
             timeout=20)
-        data = demjson.decode(r.text[r.text.find("{"):-1])
-        html = data["content"]
+        r.raise_for_status()
+        # The wrapper is JS (unquoted keys), but content is a JSON string.
+        # Decode only that value; AKShare's internal demjson module was removed.
+        match = re.search(r'\bcontent\s*:\s*', r.text)
+        if match is None:
+            raise ValueError("F10 holdings response missing content")
+        html, _ = json.JSONDecoder().raw_decode(r.text[match.end():])
+        if not isinstance(html, str):
+            raise ValueError("F10 holdings content is not a string")
         soup = BeautifulSoup(html, "lxml")
         labels = [h.text.split("\xa0\xa0")[1]
                   for h in soup.find_all("h4", attrs={"class": "t"})]
