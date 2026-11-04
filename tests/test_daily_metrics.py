@@ -75,6 +75,14 @@ class DailyMetricsTests(unittest.TestCase):
         self.assertNotIn("ann_return", stored)
         self.assertNotIn("volatility", stored)
 
+    def test_holdings_loads_requested_year_and_preserves_etf_passthrough(self):
+        year = fetcher.datetime.now().year
+        with patch.object(fetcher, "resolve_target_etf", side_effect=[("510000", "测试ETF"), None]), \
+                patch.object(fetcher, "_fetch_holdings_year", return_value=pd.DataFrame()) as fetch_year:
+            result = fetcher.fetch_holdings("000001", start_year=year)
+        fetch_year.assert_called_once_with("510000", str(year))
+        self.assertTrue(result.empty)
+
 
 if __name__ == "__main__":
     unittest.main()

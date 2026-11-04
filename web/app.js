@@ -162,7 +162,7 @@ $('compare-button').onclick=async()=>{
     const entries=[];const asof=state.filter.result.asof;const ends={'1':'-03-31','2':'-06-30','3':'-09-30','4':'-12-31'};
     for(const fund of selected){
       if(state.tokens['compare-output']!==token)return;
-      const result=await resultTask({operation:'holdings',code:fund.code});
+      const result=await resultTask({operation:'holdings',code:fund.code,start_year:Math.max(2020,Number(asof.slice(0,4))-1)});
       const rows=result.rows.filter(r=>r.quarter.slice(0,4)+ends[r.quarter.slice(-1)]<=asof);
       const quarter=rows.length?rows[0].quarter:null;entries.push({fund,quarter,source:result.source,rows:rows.filter(r=>r.quarter===quarter)});
     }
@@ -182,7 +182,7 @@ function renderDetail(result){
   html+='<div class="chart-card"><div class="toolbar" id="chart-ranges">'+[['1m','近1月'],['3m','近3月'],['6m','近6月'],['1y','近1年'],['all','全部']].map(([key,label])=>`<button type="button" data-range="${key}">${label}</button>`).join('')+'</div><div id="chart-tip" class="chart-tip"></div><svg class="chart" id="nav-chart" role="img" aria-label="单位净值走势图"></svg></div>';
   html+='<h3>季度规模</h3>'+table(result.scales,[{key:'quarter_end',label:'报告日期'},{key:'aum',label:'期末净资产(亿)',render:v=>num(v)},{key:'publish_date',label:'估算披露日期'}]);
   html+='<details><summary>净值历史（'+result.nav.length+' 个数据点）</summary>'+table([...result.nav].reverse(),[{key:'date',label:'净值日期'},{key:'nav',label:'单位净值',render:v=>num(v,4)},{key:'acc_nav',label:'累计净值',render:v=>num(v,4)},{key:'daily_ret_pct',label:'日增长(%)',render:v=>num(v)}])+'</details>';
-  $('detail-output').innerHTML=html;$('holdings-panel').hidden=false;$('holdings-output').innerHTML='';
+  $('detail-output').innerHTML=html;$('holdings-panel').hidden=false;$('holdings-output').innerHTML='';$('holdings-history-button').hidden=true;
   state.chart={rows:result.nav,range:'1y'};
   $('chart-ranges').onclick=e=>{const button=e.target.closest('[data-range]');if(button)drawChart(button.dataset.range);};
   drawChart('1y');
@@ -212,16 +212,19 @@ function drawChart(range){
 }
 let resizeTimer;window.addEventListener('resize',()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>state.chart&&drawChart(state.chart.range),100);});
 const holdingColumns=[{key:'kind',label:'类型',text:true},{key:'代码',label:'代码'},{key:'名称',label:'名称',text:true},{key:'占净值比例',label:'占净值比例(%)',render:v=>num(v)},{key:'持股数',label:'持股数(万股)',render:v=>num(v)},{key:'持仓市值',label:'市值(万元)',render:v=>num(v)}];
-$('holdings-button').onclick=()=>{
+function loadHoldings(startYear){
   if(!state.detailCode)return;
-  task({operation:'holdings',code:state.detailCode},'holdings-output',result=>{
+  task({operation:'holdings',code:state.detailCode,start_year:startYear},'holdings-output',result=>{
+    $('holdings-history-button').hidden=startYear===2020;
     const quarters=[...new Set(result.rows.map(r=>r.quarter))];
     if(!quarters.length){$('holdings-output').innerHTML=notice('该基金暂无披露的重仓持仓。');return;}
     $('holdings-output').innerHTML=(result.source?notice('联接基金，重仓穿透至 '+result.source.join(' ')):'')+'<div id="hold-quarters" class="quarter-tabs">'+quarters.map(q=>`<button type="button" data-quarter="${esc(q)}">${esc(q)}</button>`).join('')+'</div><div id="quarter-table"></div>';
     const show=q=>{$('quarter-table').innerHTML=table(result.rows.filter(r=>r.quarter===q),holdingColumns);$('hold-quarters').querySelectorAll('button').forEach(b=>b.classList.toggle('active',b.dataset.quarter===q));};
     $('hold-quarters').onclick=e=>{const b=e.target.closest('[data-quarter]');if(b)show(b.dataset.quarter);};show(quarters[0]);
   });
-};
+}
+$('holdings-button').onclick=()=>loadHoldings(Number((state.today||new Date().toISOString()).slice(0,4)));
+$('holdings-history-button').onclick=()=>loadHoldings(2020);
 
 async function refreshStatus(){
   try{

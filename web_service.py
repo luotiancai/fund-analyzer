@@ -20,18 +20,19 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from web_common import CACHE, CST, FILES, snapshot, today, write_json
+from web_cache import prepared_result
 
 log = logging.getLogger("fund-web")
 HERE = Path(__file__).resolve().parent
 WORKER = HERE / "web_tasks.py"
 CODE_VERSION = hashlib.sha256(b"".join((HERE / name).read_bytes() for name in (
-    "web_service.py", "web_tasks.py", "fetcher.py", "today_pick.py", "backtest_qvix.py"))).hexdigest()[:16]
+    "web_service.py", "web_tasks.py", "web_cache.py", "fetcher.py", "today_pick.py", "backtest_qvix.py"))).hexdigest()[:16]
 JOB_TIMEOUT = int(os.environ.get("FUND_WEB_JOB_TIMEOUT", "240"))
 
 
 class Task(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    operation: Literal["pick", "probe", "filter", "detail", "holdings"]
+    operation: Literal["pick", "probe", "filter", "detail", "holdings", "prepare"]
     asof: Optional[dt.date] = None
     code: Optional[str] = Field(default=None, pattern=r"^[0-9]{6}$")
     codes: list[str] = Field(default_factory=list, max_length=20)
@@ -40,11 +41,14 @@ class Task(BaseModel):
     min_ret: Optional[float] = Field(default=0, ge=-100, le=100000)
     max_dd: Optional[float] = Field(default=20, ge=0, le=100)
     min_aum: float = Field(default=0, ge=0, le=100000)
+    start_year: Optional[int] = Field(default=None, ge=2020)
 
     @model_validator(mode="after")
     def valid(self):
         if self.asof and not (dt.date(2020, 1, 1) <= self.asof <= today()):
             raise ValueError("日期须在 2020-01-01 至今天之间")
+        if self.start_year and self.start_year > today().year:
+            raise ValueError("持仓年份不能晚于今年")
         if self.operation in ("detail", "holdings") and not self.code:
             raise ValueError("请输入六位基金代码")
         if self.operation == "probe" and (not self.codes or any(
@@ -56,8 +60,9 @@ class Task(BaseModel):
 
     def arguments(self):
         if self.operation in ("detail", "holdings"):
-            return {"code": self.code}
-        if self.operation in ("pick", "probe"):
+            return {"code": self.code, **({"start_year": self.start_year or today().year}
+                                         if self.operation == "holdings" else {})}
+        if self.operation in ("pick", "probe", "prepare"):
             args = {"asof": (self.asof or today()).isoformat()}
             if self.operation == "probe":
                 args["codes"] = list(dict.fromkeys(self.codes))
@@ -70,10 +75,13 @@ class Task(BaseModel):
 class Jobs:
     def __init__(self):
         self.queue = asyncio.Queue(maxsize=8)
+        self.network_queue = asyncio.Queue(maxsize=4)
         self.active = set()
         self.lock = asyncio.Lock()
         self.current = None
+        self.network_current = None
         self.runner = None
+        self.network_runner = None
 
     def folder(self, job_id):
         return CACHE / "jobs" / job_id
@@ -110,7 +118,15 @@ class Jobs:
                 if (state["status"] == "error" and time.time() - state["updated_at"] < 10
                         and not (state.get("error") or "").startswith("服务已")):
                     return state
-            if self.queue.full():
+            cached = prepared_result(path, CODE_VERSION, task.operation, args)
+            if cached is not None:
+                folder.mkdir(parents=True, exist_ok=True)
+                write_json(folder / "result.json", cached)
+                state = self.update(job_id, status="completed", operation=task.operation,
+                                    generation=manifest["version"], error=None, finished_at=time.time())
+                return {**state, "cached": True}
+            queue = self.network_queue if task.operation == "holdings" else self.queue
+            if queue.full():
                 raise HTTPException(429, "计算队列已满，请稍后重试", headers={"Retry-After": "10"})
             folder.mkdir(parents=True, exist_ok=True)
             write_json(folder / "request.json", {"snapshot": str(path),
@@ -118,28 +134,36 @@ class Jobs:
             state = self.update(job_id, status="queued", operation=task.operation,
                                 generation=manifest["version"], error=None)
             self.active.add(job_id)
-            self.queue.put_nowait(job_id)
+            queue.put_nowait(job_id)
             return {**state, "cached": False}
 
-    async def work(self):
+    async def work(self, network=False):
+        queue = self.network_queue if network else self.queue
         while True:
-            job_id = await self.queue.get()
+            job_id = await queue.get()
             folder = self.folder(job_id)
+            process = None
             try:
+                if self.state(job_id)["status"] == "completed":
+                    continue
                 self.update(job_id, status="running", started_at=time.time())
                 with (folder / "stderr.log").open("wb") as stderr:
-                    self.current = await asyncio.create_subprocess_exec(
+                    process = await asyncio.create_subprocess_exec(
                         sys.executable, str(WORKER), str(folder / "request.json"),
                         str(folder / "result.json"), stdout=asyncio.subprocess.DEVNULL,
                         stderr=stderr,
                         env={**os.environ, "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"})
+                    if network:
+                        self.network_current = process
+                    else:
+                        self.current = process
                     try:
-                        await asyncio.wait_for(self.current.wait(), timeout=JOB_TIMEOUT)
+                        await asyncio.wait_for(process.wait(), timeout=JOB_TIMEOUT)
                     except asyncio.TimeoutError:
-                        self.current.kill()
-                        await self.current.wait()
+                        process.kill()
+                        await process.wait()
                         raise RuntimeError("计算超时，请缩小查询范围后重试")
-                if self.current.returncode != 0:
+                if process.returncode != 0:
                     stderr = (folder / "stderr.log").read_text(errors="replace")[-8000:]
                     log.error("job %s failed: %s", job_id, stderr)
                     last = stderr.strip().splitlines()[-1] if stderr.strip() else ""
@@ -157,13 +181,16 @@ class Jobs:
                 log.exception("job %s", job_id)
                 self.update(job_id, status="error", error=str(exc))
             finally:
-                if self.current and self.current.returncode is None:
-                    self.current.kill()
-                    await self.current.wait()
-                self.current = None
+                if process and process.returncode is None:
+                    process.kill()
+                    await process.wait()
+                if network:
+                    self.network_current = None
+                else:
+                    self.current = None
                 self.active.discard(job_id)
-                self.queue.task_done()
-                if self.queue.empty():
+                queue.task_done()
+                if not self.active:
                     try:
                         self.prune()
                     except OSError:
@@ -208,12 +235,13 @@ async def lifespan(app):
         if state.get("status") in ("queued", "running"):
             jobs.update(path.parent.name, status="error", error="服务已更新，请重新提交查询")
     jobs.runner = asyncio.create_task(jobs.work())
+    jobs.network_runner = asyncio.create_task(jobs.work(network=True))
     try:
         yield
     finally:
         jobs.runner.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await jobs.runner
+        jobs.network_runner.cancel()
+        await asyncio.gather(jobs.runner, jobs.network_runner, return_exceptions=True)
 
 
 app = FastAPI(title="基金分析仪", docs_url=None, redoc_url=None,
@@ -245,7 +273,8 @@ def status():
         _status_cache = (path.name, {**manifest["summary"], "types": types,
                                     "version": manifest["version"], "code_version": CODE_VERSION})
     return {**_status_cache[1], "today": today().isoformat(),
-            "queued": jobs.queue.qsize(), "computing": bool(jobs.current)}
+            "queued": jobs.queue.qsize() + jobs.network_queue.qsize(),
+            "computing": bool(jobs.current or jobs.network_current)}
 
 
 @app.get("/api/v1/health")
@@ -253,7 +282,8 @@ def health():
     try:
         path, manifest = snapshot()
         ready = (all((path / filename).is_file() for filename in FILES.values())
-                 and jobs is not None and jobs.runner is not None and not jobs.runner.done())
+                 and jobs is not None and jobs.runner is not None and not jobs.runner.done()
+                 and jobs.network_runner is not None and not jobs.network_runner.done())
     except (FileNotFoundError, RuntimeError):
         ready = False
     return Response(content='{"ok":' + str(ready).lower() + '}',
@@ -272,6 +302,12 @@ def get_job(job_id: str, page: int = Query(1, ge=1), page_size: int = Query(100,
     if len(job_id) != 64 or any(c not in "0123456789abcdef" for c in job_id):
         raise HTTPException(404, "任务不存在")
     state = jobs.state(job_id)
+    if state["status"] in ("queued", "running") and state["operation"] in ("pick", "probe"):
+        request = json.loads((jobs.folder(job_id) / "request.json").read_text())
+        result = prepared_result(Path(request["snapshot"]), request["code_version"],
+                                 state["operation"], request["args"])
+        if result is not None:
+            return {**state, "status": "completed", "cached": True, "result": result}
     if state["status"] == "completed":
         result = json.loads((jobs.folder(job_id) / "result.json").read_text())
         if state["operation"] == "filter":

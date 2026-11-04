@@ -1593,7 +1593,8 @@ def resolve_target_etf(code: str, name: Optional[str] = None
         conn.close()
 
 
-def fetch_holdings(code: str, force_refresh: bool = False) -> Optional[pd.DataFrame]:
+def fetch_holdings(code: str, force_refresh: bool = False,
+                   start_year: Optional[int] = None) -> Optional[pd.DataFrame]:
     """Quarterly top holdings from HOLDINGS_START_Q (2020Q4) to the latest
     disclosed quarter, cache-first.
 
@@ -1607,8 +1608,8 @@ def fetch_holdings(code: str, force_refresh: bool = False) -> Optional[pd.DataFr
     """
     target = resolve_target_etf(code)
     if target:
-        return fetch_holdings(target[0], force_refresh)
-    years = [str(y) for y in range(HOLDINGS_START_YEAR, datetime.now().year + 1)]
+        return fetch_holdings(target[0], force_refresh, start_year=start_year)
+    years = [str(y) for y in range(start_year or HOLDINGS_START_YEAR, datetime.now().year + 1)]
     frames, any_data = [], False
     conn = _conn()
     for year in years:

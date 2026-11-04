@@ -5,12 +5,12 @@ import json
 import math
 import os
 from pathlib import Path
-import shutil
 import sqlite3
 import sys
 import time
 
 from web_common import CACHE, FILES, write_json
+from web_cache import lookup_cache, prepared_result
 
 
 def clean(value):
@@ -32,27 +32,23 @@ def clean(value):
 
 
 def configure(path, code_version="local"):
-    # Only private overlays receive lazy holdings/ETF caches. Never write the
-    # snapshots, the QVIX producer's data directory, or a GitHub Release.
+    # All authority data stays read-only. Upstream lookups use one persistent
+    # cache, shared across releases and daily data generations.
     os.environ["FUND_ANALYZER_DATA"] = str(CACHE / "runtime" / (path.name + "-" + code_version))
     import fetcher
     runtime = Path(fetcher._DATA_DIR)
-    for name in ("rank", "scale"):
-        dest = runtime / FILES[name]
-        if not dest.exists():
-            tmp = dest.with_suffix(".tmp")
-            shutil.copyfile(path / FILES[name], tmp)
-            os.replace(tmp, dest)
+    lookups = lookup_cache(path)
 
     def connection():
         c = sqlite3.connect(":memory:", uri=True, timeout=15)
         c.row_factory = sqlite3.Row
         try:
+            c.execute("ATTACH DATABASE ? AS lookups", (str(lookups),))
             for name, filename, _, _ in fetcher.DB_LAYOUT:
-                if name in ("nav", "market", "qvix"):
+                if name in FILES:
                     target = (path / filename).as_uri() + "?mode=ro&immutable=1"
                 else:
-                    target = str(runtime / filename)
+                    target = ":memory:"
                 c.execute(f"ATTACH DATABASE ? AS {name}", (target,))
                 if name in ("cache", "strategy"):
                     c.executescript(fetcher._DDL[name])
@@ -111,6 +107,29 @@ def pick(fetcher, connection, path, asof):
     result = clean(today_pick.scan(asof))
     write_json(cached, result)
     return result
+
+
+def prepare_probes(fetcher, funds, connection, result, asof):
+    """Materialize all diagnostic rows once, for direct indexed HTTP lookups."""
+    import today_pick
+    dest = Path(fetcher._DATA_DIR) / ("probe-" + asof + ".db")
+    if dest.exists():
+        return
+    codes = set(funds["code"]) | set(result.get("cand", {}))
+    with contextlib.closing(connection()) as c:
+        codes.update(r[0] for r in c.execute("SELECT DISTINCT code FROM fund_scale_hist"))
+    rows = clean(today_pick.probe(asof, sorted(codes), result))
+    tmp = dest.with_suffix(".db.tmp")
+    if tmp.exists():
+        tmp.unlink()
+    with contextlib.closing(sqlite3.connect(tmp)) as c:
+        c.execute("CREATE TABLE probes (code TEXT PRIMARY KEY,data TEXT NOT NULL) WITHOUT ROWID")
+        c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+        c.executemany("INSERT INTO probes VALUES (?,?)", [
+            (r["code"], json.dumps(r, ensure_ascii=False, allow_nan=False)) for r in rows])
+        c.execute("INSERT INTO meta VALUES ('n_drop',?)", (str(result.get("n_drop", 0)),))
+        c.commit()
+    os.replace(tmp, dest)
 
 
 def filter_funds(fetcher, funds, connection, args):
@@ -187,8 +206,10 @@ def detail(fetcher, funds, connection, code):
                 scales=scales, source=source)
 
 
-def holdings(fetcher, code):
-    frame = fetcher.fetch_holdings(code)
+def holdings(fetcher, code, start_year):
+    frame = fetcher.fetch_holdings(code, start_year=start_year)
+    if frame is not None and frame.empty and start_year > fetcher.HOLDINGS_START_YEAR:
+        frame = fetcher.fetch_holdings(code, start_year=start_year - 1)
     source = fetcher.resolve_target_etf(code)
     if frame is None:
         raise ValueError("持仓数据源暂时不可用，请稍后重试。")
@@ -204,10 +225,16 @@ def run(request):
     fetcher, funds, connection = configure(path, request.get("code_version", "local"))
     args = request["args"]
     op = request["operation"]
-    if op in ("pick", "probe"):
+    if op in ("pick", "probe", "prepare"):
         result = pick(fetcher, connection, path, args["asof"])
+        if op == "prepare":
+            prepare_probes(fetcher, funds, connection, result, args["asof"])
+            return {"prepared": True, "asof": args["asof"]}
         if op == "probe":
             import today_pick
+            cached = prepared_result(path, request.get("code_version", "local"), op, args)
+            if cached is not None:
+                return cached
             return dict(rows=today_pick.probe(args["asof"], args["codes"], result),
                         asof=args["asof"], n_drop=result.get("n_drop"))
         result["chosen_name"] = result.get("names", {}).get(result.get("chosen"))
@@ -217,7 +244,7 @@ def run(request):
     if op == "detail":
         return detail(fetcher, funds, connection, args["code"])
     if op == "holdings":
-        return holdings(fetcher, args["code"])
+        return holdings(fetcher, args["code"], args["start_year"])
     raise ValueError("未知任务")
 
 

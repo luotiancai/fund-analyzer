@@ -1,5 +1,6 @@
 """Migration checks: unchanged financial math, immutable data, real HTTP jobs."""
 import contextlib
+import asyncio
 import hashlib
 import json
 import os
@@ -73,6 +74,25 @@ PATH = fixture()
 
 
 class CalculationTests(unittest.TestCase):
+    def test_upstream_holdings_cache_survives_code_and_data_generations(self):
+        from web_cache import lookup_cache
+        cached = lookup_cache(PATH)
+        row = {"quarter": f"{today().year}Q1", "kind": "股票", "代码": "600001", "名称": "测试持仓",
+               "占净值比例": 5., "持股数": 1., "持仓市值": 2.}
+        with contextlib.closing(sqlite3.connect(cached)) as c:
+            c.execute("INSERT OR REPLACE INTO fund_holdings VALUES (?,?,?,?)",
+                      ("000002", str(today().year), json.dumps([row]), time.time()))
+            c.commit()
+        for version in ("first-code", "second-code"):
+            request = ROOT / f"holding-{version}.json"
+            output = ROOT / f"holding-{version}-result.json"
+            write_json(request, dict(snapshot=str(PATH), code_version=version, operation="holdings",
+                                     args=dict(code="000002", start_year=today().year)))
+            subprocess.run([sys.executable, "web_tasks.py", str(request), str(output)],
+                           check=True, capture_output=True, timeout=15,
+                           cwd=Path(__file__).resolve().parents[1])
+            self.assertEqual(json.loads(output.read_text())["rows"][0]["名称"], "测试持仓")
+        self.assertEqual(lookup_cache(ROOT / "snapshots" / "new-generation"), cached)
     def test_low_memory_matches_original_returns_and_boundaries(self):
         for asof in (today().isoformat(), "2026-06-15", "2025-01-01"):
             for cols in ({"ret_3m"}, {"ret_1m", "ret_1y"}):
@@ -212,6 +232,34 @@ class HttpTests(unittest.TestCase):
         _, probe = self.wait(dict(operation="probe", codes=["000002"]))
         row = next(r for r in selected["rows"] if r["code"] == "000002")
         self.assertAlmostEqual(probe["rows"][0]["ret3m"], row["ret3m"], places=9)
+
+    def test_prepared_probes_bypass_full_analysis_queue_and_slow_holdings(self):
+        import web_service
+        self.wait(dict(operation="prepare"))
+        before = web_service.jobs.queue.qsize()
+        with patch.object(web_service.jobs.queue, "full", return_value=True), \
+                patch.object(web_service.jobs, "network_current", object()):
+            r = self.client.post("/api/v1/jobs", json=dict(
+                operation="probe", codes=["000003", "000002", "999999"]))
+        self.assertEqual(r.status_code, 202)
+        self.assertEqual(r.json()["status"], "completed")
+        self.assertTrue(r.json()["cached"])
+        result = self.client.get("/api/v1/jobs/" + r.json()["id"]).json()["result"]
+        self.assertEqual([row["code"] for row in result["rows"]], ["000003", "000002", "999999"])
+        self.assertIn("榜单里没有", result["rows"][2]["why"])
+        self.assertEqual(web_service.jobs.queue.qsize(), before)
+
+    def test_holding_request_uses_separate_queue_when_analysis_is_full(self):
+        import web_service
+        async def submit():
+            isolated = web_service.Jobs()
+            for i in range(8):
+                isolated.queue.put_nowait(str(i))
+            result = await isolated.submit(web_service.Task(operation="holdings", code="000003"))
+            self.assertEqual(isolated.network_queue.qsize(), 1)
+            self.assertEqual(isolated.queue.qsize(), 8)
+            self.assertEqual(result["status"], "queued")
+        asyncio.run(submit())
 
     def test_new_generation_invalidates_completed_cache(self):
         task = dict(operation="detail", code="000002")

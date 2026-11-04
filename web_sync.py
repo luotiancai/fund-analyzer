@@ -173,7 +173,7 @@ def sync():
 def warm():
     request = urllib.request.Request(
         "http://127.0.0.1:8010/api/v1/jobs",
-        data=json.dumps({"operation": "pick", "asof": today().isoformat()}).encode(),
+        data=json.dumps({"operation": "prepare", "asof": today().isoformat()}).encode(),
         headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=10) as response:

@@ -19,9 +19,14 @@ install -m 644 "$RELEASE/deploy/fund-web-location.inc" /etc/nginx/fund-web-locat
 
 # Preserve a concrete rollback target before touching nginx or switching code.
 PREVIOUS=$(readlink -f "$BASE/current" || true)
+"$BASE/venv/bin/python" "$RELEASE/web_sync.py"
+# Prepare read caches before activation; the existing release keeps serving.
+systemd-run --quiet --wait --pipe --collect --unit="fund-web-prepare-$(basename "$RELEASE")" \
+    -p User=fund-web -p Group=fund-web -p MemoryMax=320M -p CPUQuota=75% \
+    -p RuntimeMaxSec=240 -E FUND_WEB_ROOT="$STATE" \
+    "$BASE/venv/bin/python" "$RELEASE/web_prepare.py"
 ln -s "$RELEASE" "$BASE/.current-$$"
 mv -Tf "$BASE/.current-$$" "$BASE/current"
-"$BASE/venv/bin/python" "$BASE/current/web_sync.py"
 systemctl daemon-reload
 systemctl enable --now fund-web.service
 systemctl restart fund-web.service
