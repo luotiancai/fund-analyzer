@@ -1,0 +1,31 @@
+[Unit]
+Description=Fund Analyzer HTTP service
+After=network.target
+
+[Service]
+Type=simple
+User=fund-web
+Group=fund-web
+WorkingDirectory=/opt/fund-web/current
+Environment=FUND_WEB_ROOT=/var/lib/fund-web
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+ExecStart=/opt/fund-web/venv/bin/uvicorn web_service:app --host 127.0.0.1 --port 8010 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+KillMode=control-group
+MemoryHigh=320M
+MemoryMax=384M
+MemorySwapMax=64M
+CPUQuota=100%
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/fund-web/cache
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

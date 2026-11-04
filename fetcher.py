@@ -252,13 +252,10 @@ _DDL = {
         last_date TEXT
     );
     -- 表名是历史遗留: 建表时它只存夏普, 后来长出了 mdd/ret 各四列, 2026-08-07
-    -- 夏普三列(sharpe/sharpe_6m/sharpe_1y)又被整个拿掉。现在装的是年化收益、
-    -- 年化波动率、分区间最大回撤和分区间收益率。没改名是为了不动云端 release
-    -- 里那份 fund_rank.db。
+    -- 夏普三列已移除;年化收益/年化波动率改为详情页按需计算,不再落库。
+    -- 这里只存分区间最大回撤、分区间收益率及数据点数量。保留旧表名兼容资产。
     CREATE TABLE IF NOT EXISTS rank.fund_sharpe (
         code        TEXT PRIMARY KEY,
-        ann_return  REAL,
-        volatility  REAL,
         data_points INTEGER,
         saved_at    REAL NOT NULL
     );
@@ -410,11 +407,12 @@ def init_db():
             conn.execute(f"ALTER TABLE rank.fund_sharpe ADD COLUMN {col} REAL")
         except sqlite3.OperationalError:
             pass  # column already exists
-    # 反向迁移(2026-08-07): 夏普不再看, 把存量库里的三列丢掉。新建的库压根
-    # 没有这些列, 所以 OperationalError 是正常路径而非异常。DROP COLUMN 需要
+    # 删除停用字段:夏普(2026-08-07)、全历史年化收益/波动率(2026-11-04,
+    # 详情页保留按需计算)。新建库没有这些列,所以 OperationalError 是正常
+    # 路径而非异常。DROP COLUMN 需要
     # SQLite 3.35+(Python 3.12 自带的远高于此); 真跑在老 SQLite 上就跳过,
     # 残留列没人读也没人写, 留着只占地方不出错。
-    for col in ("sharpe", "sharpe_6m", "sharpe_1y"):
+    for col in ("sharpe", "sharpe_6m", "sharpe_1y", "ann_return", "volatility"):
         try:
             conn.execute(f"ALTER TABLE rank.fund_sharpe DROP COLUMN {col}")
         except sqlite3.OperationalError:
@@ -1223,16 +1221,15 @@ def fetch_nav(code: str) -> Optional[pd.DataFrame]:
 
 # ── 指标计算 ──────────────────────────────────────────────────────────────────
 
-def _save_metrics_row(code: str, ann_return: float, volatility: float,
-                 n: int, mdd: dict, rets: dict):
+def _save_metrics_row(code: str, n: int, mdd: dict, rets: dict):
     conn = _conn()
     conn.execute(
         "INSERT OR REPLACE INTO fund_sharpe "
-        "(code, ann_return, volatility, data_points, "
+        "(code, data_points, "
         " mdd_1m, mdd_3m, mdd_6m, mdd_1y, "
         " ret_1m, ret_3m, ret_6m, ret_1y, saved_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (code, ann_return, volatility, n,
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (code, n,
          mdd.get("mdd_1m"), mdd.get("mdd_3m"), mdd.get("mdd_6m"), mdd.get("mdd_1y"),
          rets.get("ret_1m"), rets.get("ret_3m"), rets.get("ret_6m"), rets.get("ret_1y"),
          time.time()),
@@ -1242,13 +1239,15 @@ def _save_metrics_row(code: str, ann_return: float, volatility: float,
 
 
 def _metrics_from_nav(nav_df: pd.DataFrame,
-                      cols: Optional[set] = None) -> Optional[dict]:
+                      cols: Optional[set] = None,
+                      include_annualized: bool = True) -> Optional[dict]:
     """Compute annualized return / volatility + per-period max-drawdown and
     return from an already-fetched NAV DataFrame. Pure (no I/O).
 
     `cols` 给出时只算这些区间列(如 {"ret_1y","mdd_1y"}),并跳过全期年化——
-    快照筛选只用所选区间,砍掉无关窗口能省近半耗时;None 保持全量
-    (recompute_all 落库用)。"""
+    快照筛选只用所选区间。None 计算所有区间及数据点数量;
+    include_annualized=True 额外计算详情页展示用的年化指标,每日批处理关闭。
+    """
     df = nav_df.copy()
     df["date"] = pd.to_datetime(df["date"])
     df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
@@ -1280,6 +1279,8 @@ def _metrics_from_nav(nav_df: pd.DataFrame,
         return {**mdd, **rets}
 
     n = len(returns)
+    if not include_annualized:
+        return {"data_points": n, **mdd, **rets}
     span = (df["date"].iloc[-1] - df["date"].iloc[0]).days
     res = _annualized(returns, span)
     if res is None:
@@ -1294,14 +1295,14 @@ def _metrics_from_nav(nav_df: pd.DataFrame,
 
 def _save_metrics(code: str, m: dict):
     _save_metrics_row(
-        code, m["ann_return"], m["volatility"], m["data_points"],
+        code, m["data_points"],
         {k: m[k] for k in ("mdd_1m", "mdd_3m", "mdd_6m", "mdd_1y")},
         {k: m[k] for k in ("ret_1m", "ret_3m", "ret_6m", "ret_1y")},
     )
 
 
 def compute_metrics_for_fund(code: str) -> Optional[dict]:
-    """Fetch NAV (network/cache), compute metrics, persist, and return them."""
+    """详情按需计算全部指标;仅持久化区间指标和数据点数量。"""
     nav_df = fetch_nav(code)
     if nav_df is None:
         return None
@@ -2342,7 +2343,7 @@ def update_qvix_rt_close() -> tuple:
 
 # ── Daily-batch pipeline ──────────────────────────────────────────────────────
 # Used by update_daily.py: backfill once, then each day append the latest NAV
-# point (from the bulk fund-list call) and recompute 年化/回撤/收益率 for all.
+# point (from the bulk fund-list call) and recompute 回撤/收益率 for all.
 
 
 def list_nav_codes() -> set:
@@ -2588,7 +2589,7 @@ def append_incremental(list_df: pd.DataFrame,
 
 
 def recompute_all(progress_callback: Optional[Callable] = None) -> int:
-    """Recompute 年化/回撤/区间收益 for every stored fund from its stored NAV.
+    """Recompute 回撤/区间收益 for every stored fund from its stored NAV.
 
     No network for NAV — pure CPU over cached NAV. All reads/writes share one
     connection and a single commit, so 20k funds finish in seconds.
@@ -2600,18 +2601,18 @@ def recompute_all(progress_callback: Optional[Callable] = None) -> int:
         done += 1
         try:
             nav_df = _load_nav_df(code, conn)
-            m = _metrics_from_nav(nav_df) if not nav_df.empty else None
+            m = _metrics_from_nav(nav_df, include_annualized=False) if not nav_df.empty else None
         except Exception as e:
             logger.debug("recompute parse error %s: %s", code, e)
             m = None
         if m is not None:
             conn.execute(
                 "INSERT OR REPLACE INTO fund_sharpe "
-                "(code, ann_return, volatility, data_points, "
+                "(code, data_points, "
                 " mdd_1m, mdd_3m, mdd_6m, mdd_1y, "
                 " ret_1m, ret_3m, ret_6m, ret_1y, saved_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (code, m["ann_return"], m["volatility"], m["data_points"],
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (code, m["data_points"],
                  m["mdd_1m"], m["mdd_3m"], m["mdd_6m"], m["mdd_1y"],
                  m["ret_1m"], m["ret_3m"], m["ret_6m"], m["ret_1y"], time.time()),
             )
@@ -2635,7 +2636,7 @@ def recompute_all(progress_callback: Optional[Callable] = None) -> int:
     return saved
 
 
-def _asof_returns_vectorized(conn, asof: str, cols: set):
+def _asof_returns_vectorized(conn, asof: str, cols: set, codes=None):
     """compute_metrics_asof 的向量化快路: 只算区间收益列(cols ⊆ RETURN_DAYS)。
 
     逐只路径(下面那个 for 循环)的耗时**不在 SQL 上**: 实测 5722 只共 13.0s,
@@ -2653,9 +2654,10 @@ def _asof_returns_vectorized(conn, asof: str, cols: set):
       · effective_daily_ret 的第一行拿不到环比(shift 出 NaN), 但切片第一行
         必然早于任何一只的窗口锚点, 影响不到结果。
     """
+    code_clause = " AND code IN (" + ",".join("?" for _ in codes) + ")" if codes else ""
     ends = conn.execute(
         "SELECT code, MAX(date) AS e, COUNT(*) AS n FROM fund_nav_daily "
-        "WHERE date < ? GROUP BY code", (asof,)).fetchall()
+        "WHERE date < ?" + code_clause + " GROUP BY code", (asof, *(codes or []))).fetchall()
     if not ends:
         return {}, set()
     need = max(RETURN_DAYS[c] for c in cols) + ANCHOR_GRACE_DAYS + 5
@@ -2664,8 +2666,8 @@ def _asof_returns_vectorized(conn, asof: str, cols: set):
     full_n = {r["code"]: r["n"] for r in ends}
     big = pd.read_sql_query(
         "SELECT code, date, nav, daily_ret_pct, acc_nav FROM fund_nav_daily "
-        "WHERE date < ? AND date >= ? ORDER BY code, date",
-        conn, params=(asof, slice_start))
+        "WHERE date < ? AND date >= ?" + code_clause + " ORDER BY code, date",
+        conn, params=(asof, slice_start, *(codes or [])))
     if big.empty:
         return {}, set(full_n)
 
@@ -2740,7 +2742,8 @@ def _asof_returns_vectorized(conn, asof: str, cols: set):
 
 def compute_metrics_asof(asof: str,
                          progress_callback: Optional[Callable] = None,
-                         cols: Optional[set] = None) -> dict:
+                         cols: Optional[set] = None,
+                         low_memory: bool = False) -> dict:
     """Every fund's metrics as an observer ON `asof` could have seen them.
 
     Truncates each fund's history to rows STRICTLY BEFORE `asof` (ISO
@@ -2751,6 +2754,7 @@ def compute_metrics_asof(asof: str,
     omitted. Returns {code: metrics-dict}.
 
     `cols` 只算指定区间列(见 _metrics_from_nav),筛选快照用。
+    `low_memory` 分批读取,供 1GB VPS 的后台任务使用;计算口径不变。
     """
     conn = _conn()
     codes = [r["code"] for r in conn.execute("SELECT code FROM fund_nav_meta")]
@@ -2758,7 +2762,15 @@ def compute_metrics_asof(asof: str,
     # 快路, 实测 13.0s → 见 _asof_returns_vectorized。回撤列还没向量化(窗口内
     # cummax 麻烦), 带 mdd_* 的调用(筛选页的「截至日期」)照旧逐只算。
     if cols and all(c in RETURN_DAYS for c in cols):
-        fast, fallback = _asof_returns_vectorized(conn, asof, set(cols))
+        if low_memory:
+            fast, fallback = {}, set()
+            for start in range(0, len(codes), 100):
+                batch, slow = _asof_returns_vectorized(
+                    conn, asof, set(cols), codes=codes[start:start + 100])
+                fast.update(batch)
+                fallback.update(slow)
+        else:
+            fast, fallback = _asof_returns_vectorized(conn, asof, set(cols))
         codes = [c for c in codes if c in fallback]     # 剩这些逐只补算
         out = dict(fast)
         for i, code in enumerate(codes):
@@ -2802,14 +2814,14 @@ def compute_metrics_asof(asof: str,
 
 
 def load_all_precomputed() -> dict:
-    """Every precomputed 年化/回撤/区间收益 row, keyed by code, ignoring TTL.
+    """Every precomputed 回撤/区间收益 row, keyed by code, ignoring TTL.
 
     Lets the app show metrics instantly on load; freshness is the daily
     pipeline's responsibility (surfaced via last_update_time()).
     """
     conn = _conn()
     rows = conn.execute(
-        "SELECT code, ann_return, volatility, data_points, "
+        "SELECT code, data_points, "
         "mdd_1m, mdd_3m, mdd_6m, mdd_1y, "
         "ret_1m, ret_3m, ret_6m, ret_1y FROM fund_sharpe"
     ).fetchall()
@@ -2911,7 +2923,7 @@ def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
     """Full daily pipeline shared by the CLI script and the in-app button:
     ① refresh fund list → ② backfill funds missing history → ③ append the
     list's latest NAV point / range-fetch bigger gaps → ④ recompute
-    年化/回撤/区间收益 for all (skippable via do_recompute=False when metrics
+    回撤/区间收益 for all (skippable via do_recompute=False when metrics
     are computed lazily at filter time instead).
 
     `progress(phase, done, total)` is invoked throughout for a UI bar / logging.

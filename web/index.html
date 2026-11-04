@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>基金分析仪</title>
+  <link rel="stylesheet" href="./app.css?v=1">
+  <script src="./app.js?v=1" defer></script>
+</head>
+<body>
+<main>
+  <header><div><a class="eyebrow" href="/">上证 · QVIX ↗</a><h1>基金分析仪</h1></div><span class="badge">基金研究</span></header>
+  <div id="data-status" class="muted" role="status">正在读取数据状态…</div>
+  <nav class="tabs" aria-label="功能切换">
+    <button class="active" data-pane="pick" aria-selected="true">今日候选</button>
+    <button data-pane="filter" aria-selected="false">基金筛选</button>
+    <button data-pane="detail" aria-selected="false">基金详情</button>
+  </nav>
+
+  <section id="pane-pick" class="pane">
+    <div class="section-title"><div><h2>今天会买哪只</h2><p>沿近 3 月跌幅榜逐只检查，展示走到选中基金为止的路径。</p></div></div>
+    <form id="pick-form" class="toolbar">
+      <label>决策日<input type="date" id="pick-date" min="2020-01-01" required></label>
+      <button class="primary" type="submit">计算候选</button>
+    </form>
+    <details class="help"><summary>计算口径</summary><p>与标准策略回测一致，只使用决策日前的净值；近 3 月按实际净值终点往回 91 个自然日取窗口，规模取当时已披露的季报，合并 A/C 等份额。与支付宝按整 3 个自然月计算的收益可能略有差异。当天不展示实时买入信号；历史日期展示当时的 QVIX 信号。</p></details>
+    <div id="pick-output" aria-live="polite"><div class="empty">选择日期，查看候选及淘汰原因。</div></div>
+    <div id="probe-panel" hidden>
+      <h3>查一只基金为什么没选中</h3>
+      <form id="probe-form" class="toolbar"><label class="grow">基金代码<input id="probe-codes" placeholder="例如 026834, 012710 016848" maxlength="160" required></label><button type="submit">检查</button></form>
+      <div id="probe-output" aria-live="polite"></div>
+    </div>
+  </section>
+
+  <section id="pane-filter" class="pane" hidden>
+    <div class="section-title"><div><h2>筛选基金</h2><p>按收益、回撤和规模筛选，支持回看历史日期。</p></div></div>
+    <form id="filter-form" class="filter-grid">
+      <label class="wide">基金类型<select id="filter-types" multiple size="3" aria-label="基金类型，不选则全部"></select><small>不选则全部；已排除债券和固收类。</small></label>
+      <label>时间区间<select id="filter-period"><option value="1m">近 1 月</option><option value="3m">近 3 月</option><option value="6m">近 6 月</option><option value="1y" selected>近 1 年</option></select></label>
+      <label>最低收益（%）<input id="filter-ret" type="number" min="-100" max="100000" step="0.1" value="0" placeholder="不限"></label>
+      <label>最大回撤（%）<input id="filter-dd" type="number" min="0" max="100" step="0.1" value="20" placeholder="不限"></label>
+      <label>最低规模（亿）<input id="filter-aum" type="number" min="0" max="100000" step="0.1" value="0"></label>
+      <label>截至日期<input id="filter-date" type="date" min="2020-01-01"><small>留空使用最新指标；历史日期只用此前净值。</small></label>
+      <div class="form-action"><button class="primary" type="submit">开始筛选</button></div>
+    </form>
+    <div id="filter-output" aria-live="polite"><div class="empty">设置条件后，点击开始筛选。</div></div>
+    <div id="filter-controls" class="toolbar" hidden>
+      <button id="filter-prev" type="button">上一页</button><span id="filter-page"></span><button id="filter-next" type="button">下一页</button>
+      <label>每页<select id="filter-size"><option>50</option><option selected>100</option><option>200</option><option>500</option></select></label>
+      <a id="filter-download" class="button" download>导出全部 CSV</a>
+      <button id="compare-button" type="button" disabled>查看已选持仓</button>
+    </div>
+    <div id="compare-output" aria-live="polite"></div>
+  </section>
+
+  <section id="pane-detail" class="pane" hidden>
+    <div class="section-title"><div><h2>基金详情</h2><p>净值走势、风险收益指标、季度规模及重仓持仓。</p></div></div>
+    <form id="detail-form" class="toolbar"><label>基金代码<input id="detail-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="例如 026834" required></label><button class="primary" type="submit">查询</button></form>
+    <div id="detail-output" aria-live="polite"><div class="empty">输入六位基金代码。</div></div>
+    <div id="holdings-panel" hidden><div class="toolbar"><h3>重仓持仓</h3><button id="holdings-button" type="button">加载持仓</button></div><div id="holdings-output" aria-live="polite"></div></div>
+  </section>
+  <footer>净值和指标由每日跑批更新。数据日期见页首。</footer>
+</main>
+</body>
+</html>

@@ -81,7 +81,7 @@ def _threshold(asof: pd.Timestamp):
     return r["date"], r["close"], r["thr"], qvix_calc.is_chain_broken(r["note"])
 
 
-def data_freshness(conn, asof=None):
+def data_freshness(conn, asof=None, nav_max=None):
     """(净值库最新日, 上证最新日, 落后几个交易日, 该决策日要的最后净值日, 缺几个交易日)。
 
     这个功能最容易出的错不是算错, 是**拿旧数据算出一个看起来很正常的答案**
@@ -98,8 +98,9 @@ def data_freshness(conn, asof=None):
     说"不新"是对的, 但那天要的净值早就齐了, 拿 behind 判会天天报一个假警;
     反过来 asof=今天、库停在几天前, missing 才会如实报出缺几天。
     """
-    nav_max = conn.execute(
-        "SELECT MAX(date) d FROM fund_nav_daily").fetchone()["d"]
+    if nav_max is None:
+        nav_max = conn.execute(
+            "SELECT MAX(date) d FROM fund_nav_daily").fetchone()["d"]
     sse = B.load_cached_json(conn, "sse")
     sse_max = sse["date"].max()
     if not nav_max:

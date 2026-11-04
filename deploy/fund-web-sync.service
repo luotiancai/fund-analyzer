@@ -1,0 +1,15 @@
+[Unit]
+Description=Synchronize Fund Analyzer read-only data snapshots
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=FUND_WEB_ROOT=/var/lib/fund-web
+Environment=GH_CONFIG_DIR=/root/.config/gh
+ExecStart=/opt/fund-web/venv/bin/python /opt/fund-web/current/web_sync.py --warm
+TimeoutStartSec=1200
+Nice=10
+IOSchedulingClass=idle
+MemoryHigh=96M
+MemoryMax=160M
