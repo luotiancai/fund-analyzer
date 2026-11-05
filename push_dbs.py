@@ -3,7 +3,7 @@
 
     python3 push_dbs.py scale              # 只推规模库
     python3 push_dbs.py rank market        # 推多个
-    python3 push_dbs.py --all              # 除 cache 外全推
+    python3 push_dbs.py --all              # 全部数据及策略库
     python3 push_dbs.py nav --force        # 跳过安全检查(想清楚再用)
     python3 push_dbs.py scale --dry-run    # 只做检查, 不上传
     python3 push_dbs.py nav --skip-verify  # 不回读验证(省一次下载, 别常用)
@@ -47,9 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cloud_assets   # noqa: E402
 import fetcher        # noqa: E402
 
-# cache 库不参与推送: 筛选结果缓存, 丢了自动重算, 推上去只是给别人塞一份
-# 无用的历史查询。
-PUSHABLE = tuple(n for n, _f, _t, _l in fetcher.DB_LAYOUT if n != "cache")
+PUSHABLE = tuple(n for n, _f, _t in fetcher.DB_LAYOUT)
 
 
 def _counts(path: str, tables) -> dict:
@@ -202,7 +200,7 @@ def main():
     if bad:
         raise SystemExit(f"未知的库: {', '.join(bad)}\n可推的: {', '.join(PUSHABLE)}")
 
-    tables_of = {n: t for n, _f, t, _l in fetcher.DB_LAYOUT}
+    tables_of = {n: t for n, _f, t in fetcher.DB_LAYOUT}
     remote_times = cloud_assets.asset_times()
 
     ok_names = []

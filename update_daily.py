@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Daily batch: keep NAV history fresh and recompute 回撤/收益率 for all funds.
 
-The Streamlit app only *reads* the precomputed metrics, so all the slow network
-work lives here and runs out of band. The same pipeline is also exposed as the
-in-app「🔄 更新数据」button via fetcher.run_pipeline().
+The web service only reads published snapshots; slow network updates run here
+through fetcher.run_pipeline().
 
 Pipeline (fetcher.run_pipeline):
   ① 拉取基金列表(1 次批量调用,带回全部基金的最新净值点)
@@ -24,7 +23,6 @@ Pipeline (fetcher.run_pipeline):
 
 import argparse
 import logging
-import os
 import time
 
 import fetcher
@@ -53,20 +51,6 @@ def _qvix_dates_with_value() -> set:
     if hist is None:
         return set()
     return set(hist[hist["qvix"].notna()]["date"].astype(str))
-
-
-def _emit_gha_output(**kv) -> None:
-    """把结果写给 GitHub Actions 的 step outputs。本地跑时 GITHUB_OUTPUT
-    不存在,什么也不做——脚本本身不该因为"没在CI里"就报错。"""
-    path = os.environ.get("GITHUB_OUTPUT")
-    if not path:
-        return
-    try:
-        with open(path, "a") as f:
-            for k, v in kv.items():
-                f.write("%s=%s\n" % (k, v))
-    except Exception as e:      # 写不进去不该让整个补跑算失败
-        log.warning("写 GITHUB_OUTPUT 失败(不影响补跑结果): %s", e)
 
 
 def run_qvix_only() -> list:
@@ -108,8 +92,6 @@ def run_qvix_only() -> list:
     except Exception as e:
         log.warning("   QVIX 实时口径收盘值失败(不影响日度值): %s", e)
 
-    _emit_gha_output(changed=str(bool(filled)).lower(),
-                     filled=",".join(filled))
     return filled
 
 

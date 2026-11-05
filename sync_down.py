@@ -19,10 +19,8 @@ QVIX 也得整段拉, 于是实际上从来不同步, 本地库一路飘。现�
 日常(默认那组)从 62MB 降到约 2.2MB。再加条件下载: 记住上次拿到的版本戳,
 远端没变直接跳过、零流量。
 
-注意本地和云端**权威方不同的库**不在默认组里:
-  · strategy 是你本地跑回测写的 —— 拉下来会盖掉你还没推的跑批;
-  · cache 是缓存, 拉了没意义。
-要拉这些得显式点名。
+strategy 是你本地跑回测写的, 不在默认组里:
+拉下来会盖掉你还没推的跑批, 要拉它得显式点名。
 
 ⚠️ **market 平时以云端为准**(上证行情由线上每日跑批产出; qvix/threshold
 2026-08-28 起拆去 qvix.db, 由 VPS 写), 但只要你本地往 market 里回填过历史,
@@ -43,7 +41,7 @@ import fetcher        # noqa: E402
 # 的话照拉不误; 万一在本机回填过 QVIX 历史, 规矩跟 market 一样 ——
 # 先 push_dbs.py qvix 推上去再拉, 否则整库替换会把没推的那批冲掉。
 DAILY = ("qvix", "market", "rank")
-# --all 再加上大库。strategy/cache 任何时候都不自动拉(见 docstring)。
+# --all 再加上大库。strategy 任何时候都不自动拉(见 docstring)。
 ALL = DAILY + ("scale", "nav")
 
 
@@ -51,7 +49,7 @@ def status():
     remote = cloud_assets.asset_times()
     stamps = cloud_assets._stamps()
     print(f"{'库':10}{'本地文件':>12}{'云端资产':>12}  云端更新于        状态")
-    for name, fn, _t, _l in fetcher.DB_LAYOUT:
+    for name, fn, _t in fetcher.DB_LAYOUT:
         p = fetcher.DB_PATH[name]
         loc = f"{os.path.getsize(p)/1048576:.1f}MB" if os.path.exists(p) else "—"
         r = remote.get(cloud_assets.ASSET_OF[name])

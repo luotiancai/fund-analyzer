@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cloud_assets   # noqa: E402
 import fetcher        # noqa: E402
 
-# 默认拉的小库(合计约 2MB)。大库(nav/scale)要 --full。cache 不看。
+# 默认拉的小库(合计约 2MB)。大库(nav/scale)要 --full。
 SMALL_DBS = ("rank", "qvix", "market", "strategy")
 BIG_DBS = ("nav", "scale")
 
@@ -83,7 +83,7 @@ def report(conn, full: bool):
     times = cloud_assets.asset_times()
     if not times:
         print("  (取不到 Release 资产列表, gh 登录了吗?)")
-    for name, fn, _t, _l in fetcher.DB_LAYOUT:
+    for name, fn, _t in fetcher.DB_LAYOUT:
         info = times.get(cloud_assets.ASSET_OF[name])
         if not info:
             print(f"  {fn:22} —(云端没有)")

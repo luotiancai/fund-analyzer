@@ -44,13 +44,13 @@ def configure(path, code_version="local"):
         c.row_factory = sqlite3.Row
         try:
             c.execute("ATTACH DATABASE ? AS lookups", (str(lookups),))
-            for name, filename, _, _ in fetcher.DB_LAYOUT:
+            for name, filename, _ in fetcher.DB_LAYOUT:
                 if name in FILES:
                     target = (path / filename).as_uri() + "?mode=ro&immutable=1"
                 else:
                     target = ":memory:"
                 c.execute(f"ATTACH DATABASE ? AS {name}", (target,))
-                if name in ("cache", "strategy"):
+                if name == "strategy":
                     c.executescript(fetcher._DDL[name])
             return c
         except Exception:

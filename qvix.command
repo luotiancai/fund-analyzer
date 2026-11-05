@@ -5,7 +5,7 @@
 #   Windows: 双击 qvix.bat(它进 WSL 跑本文件)
 cd "$(dirname "$0")" || exit 1
 
-# venv 优先级同 run.sh:WSL 原生 ext4(~/.venvs)> 项目内 .venv > 系统 python3。
+# venv 优先级:WSL 原生 ext4(~/.venvs)> 项目内 .venv > 系统 python3。
 # 原来这里写死 python3, 在 WSL 下直接 ModuleNotFoundError: numpy —— 依赖都
 # 装在 venv 里, 系统 python3 是干净的(Ubuntu 还有 EXTERNALLY-MANAGED 拦着
 # 往系统装)。macOS 上如果依赖本来就装在系统 python3, 会落到最后那档, 行为

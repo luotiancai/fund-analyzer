@@ -30,9 +30,8 @@ from web_common import FILES, write_json, today
 Path(os.environ["FUND_ANALYZER_DATA"]).mkdir(parents=True, exist_ok=True)
 fetcher._DATA_DIR = os.environ["FUND_ANALYZER_DATA"]
 fetcher.DB_PATH = {name: str(Path(fetcher._DATA_DIR) / filename)
-                   for name, filename, _, _ in fetcher.DB_LAYOUT}
+                   for name, filename, _ in fetcher.DB_LAYOUT}
 fetcher._schema_ready = False
-fetcher.LAZY_NAV = False
 
 
 def fixture():

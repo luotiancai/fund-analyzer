@@ -56,8 +56,7 @@ _CST = ZoneInfo("Asia/Shanghai")
 
 # The DB lives on the WSL-native filesystem (ext4), NOT the project dir: the
 # project sits on /mnt/c where every SQLite I/O crosses the 9p protocol —
-# 10-100x slower, which made each Streamlit rerun spend ~10s just opening and
-# reading the cache. Override with FUND_ANALYZER_DATA if needed.
+# 10-100x slower. Override with FUND_ANALYZER_DATA if needed.
 _DATA_DIR = os.environ.get("FUND_ANALYZER_DATA") or os.path.join(
     os.path.expanduser("~"), ".local", "share", "fund-analyzer")
 os.makedirs(_DATA_DIR, exist_ok=True)
@@ -72,23 +71,21 @@ os.makedirs(_DATA_DIR, exist_ok=True)
 #   · 云端那份库是每日跑批"下载→改→传回"一路继承的, 本地 DROP 掉的表在它
 #     里面永远删不掉(线上至今留着 4 张策略拆库前的僵尸表)。
 #
-# 所以按「谁写它 + 多久变一次 + 首屏要不要等」把表分到独立文件里, 每个文件
+# 所以按「谁写它 + 多久变一次」把表分到独立文件里, 每个文件
 # 是一条独立的发布线, 互相盖不到:
 #
-#   库          文件               权威写入方      更新节奏   首屏
-#   rank        fund_rank.db       每日跑批        日          要
-#   market      market.db          跑批+本地QVIX   日          要
-#   strategy    fund_strategy.db   本地回测        手动        要
-#   cache       cache.db           线上 app        随时        丢了自动重建
-#   nav         fund_nav.db        每日跑批        日          不要(233MB)
-#   scale       fund_scale.db      每日跑批        季          不要(13.7MB)
-#
-# lazy=True 的两个是"点进基金详情才用"的大表, 云端首屏之后才后台拉。
+#   库          文件               权威写入方      更新节奏
+#   rank        fund_rank.db       每日跑批        日
+#   qvix        qvix.db            VPS             日
+#   market      market.db          每日跑批        日
+#   strategy    fund_strategy.db   本地回测        手动
+#   nav         fund_nav.db        每日跑批        日
+#   scale       fund_scale.db      每日跑批        季
 DB_LAYOUT = (
-    # (库名, 文件名, 表, 是否惰性加载)
+    # (库名, 文件名, 表)
     ("rank", "fund_rank.db",
      ("fund_list", "fund_sharpe", "fund_nav_meta", "app_meta",
-      "fund_index_code", "etf_target_map"), False),
+      "fund_index_code", "etf_target_map")),
     # qvix 单独一个库, 而且排在 market 前面 —— 两条都是刻意的。
     # 单独一个库: 它的权威写入方不再是云端跑批, 而是国内那台 VPS。上交所的
     # 期权风险指标接口挡 GitHub runner 的境外 IP(2026-08-28 实测: 同一时刻
@@ -100,45 +97,20 @@ DB_LAYOUT = (
     # 排在 market 前面: 迁移期线上那份 market.db 里还留着一张同名的
     # qvix_self_history, 而不带库名的表名解析是按 ATTACH 顺序走的(先挂的先
     # 命中, 实测过), 排前面保证读写都落在新库上, 旧那张只是死重量。
-    ("qvix", "qvix.db", ("qvix_self_history",), False),
+    ("qvix", "qvix.db", ("qvix_self_history",)),
     ("market", "market.db",
-     ("index_daily_cache",), False),
+     ("index_daily_cache",)),
     ("strategy", "fund_strategy.db",
-     ("strategy_runs", "backtest_notes"), False),
-    ("cache", "cache.db",
-     ("filter_results",), False),
+     ("strategy_runs", "backtest_notes")),
     ("nav", "fund_nav.db",
-     ("fund_nav_daily",), True),
+     ("fund_nav_daily",)),
     ("scale", "fund_scale.db",
-     ("fund_scale_hist", "fund_scale_miss", "fund_holdings"), True),
+     ("fund_scale_hist", "fund_scale_miss", "fund_holdings")),
 )
-DB_PATH = {name: os.path.join(_DATA_DIR, fn) for name, fn, _t, _l in DB_LAYOUT}
-LAZY_DBS = tuple(name for name, _fn, _t, lazy in DB_LAYOUT if lazy)
-
-# 云端两段式:app.py 置 True 后, 惰性库在下载落地前不 ATTACH 真文件, 而是挂
-# 一个同名的 :memory: 空库(见 _conn)。为什么不直接 ATTACH 那个还不存在的
-# 路径:SQLite 会就地建一个空文件, 之后 os.path.exists 恒为真, "下载好了没"
-# 就再也判断不出来了。也不能在 main 里建空占位表——SQLite 解析不带库名的表
-# 名是 temp→main→attached, main 里留个同名空表会把 ATTACH 上来的真表整个
-# 遮蔽掉(线上那 4 张僵尸表正在这么遮蔽 backtest_notes)。挂内存空库两头都
-# 避开了: 查得到表(返回空结果, 页面不炸), 又不留下任何文件痕迹。
-LAZY_NAV = False       # app.py 在云端两段式模式下置 True
-_ready_dbs = set()     # 已落地并接管的惰性库名(仅 LAZY_NAV 下有意义)
+DB_PATH = {name: os.path.join(_DATA_DIR, fn) for name, fn, _t in DB_LAYOUT}
 
 
-def nav_ready() -> bool:
-    """惰性库(净值/规模持仓)是否都已可用。本地恒为 True。"""
-    return not LAZY_NAV or set(LAZY_DBS) <= _ready_dbs
-
-
-def db_ready(name: str) -> bool:
-    """单个库是否可用。非惰性库恒为 True。"""
-    return name not in LAZY_DBS or not LAZY_NAV or name in _ready_dbs
-
-
-# 26h:榜单本质是每日数据,由 update_daily.py/「更新数据」按钮强制刷新;
-# 留 2h 余量给每日节奏。此前 1h 会让盘中任意交互触发的 rerun 穿透缓存、
-# 现场全量重拉榜单卡住页面几十秒,还把标签页顶回首页。
+# 26h:榜单本质是每日数据,由 update_daily.py 强制刷新;留 2h 余量给每日节奏。
 FUND_LIST_TTL = 26 * 3600
 NAV_TTL = 86400         # 24 hours
 NAV_START = "2018-01-01"  # NAV history is kept from this date onward
@@ -176,56 +148,14 @@ def _conn():
     global _schema_ready
     conn = sqlite3.connect(":memory:", check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
-    placeholders = []
-    for name, _fn, _tables, lazy in DB_LAYOUT:
-        if lazy and LAZY_NAV and name not in _ready_dbs:
-            # 云端首屏: 大库还没下下来。挂一个同名的内存空库并建空表, 查询
-            # 返回空结果而不是 "no such table" 把页面炸掉。不去 ATTACH 那个
-            # 还不存在的路径 —— SQLite 会就地建出空文件, 之后
-            # os.path.exists 恒为真, "下载好了没" 就再也判断不出来了。
-            conn.execute(f"ATTACH DATABASE ':memory:' AS {name}")
-            placeholders.append(name)
-            continue
+    for name, _fn, _tables in DB_LAYOUT:
         conn.execute(f"ATTACH DATABASE ? AS {name}", (DB_PATH[name],))
-    # 内存占位库每次都是新的, 必须每次建表; 真实文件库只在进程内首次建。
-    for name in placeholders:
-        conn.executescript(_DDL[name])
     if not _schema_ready:
-        for name, _fn, _tables, lazy in DB_LAYOUT:
-            if name not in placeholders:
-                conn.executescript(_DDL[name])
+        for name, _fn, _tables in DB_LAYOUT:
+            conn.executescript(_DDL[name])
         conn.commit()
         _schema_ready = True
     return conn
-
-
-def adopt_db(name: str):
-    """惰性库下载落地后让它接管, 并把该库的派生索引建回去。
-
-    idx_nav_date 不随快照下发(它占 120MB, 是净值库的三成, 却是纯派生数据):
-    4.9M 行现建实测 1~2 秒, 比多下 17MB(gz)划算。
-
-    不再需要"删掉 main 里的占位表"那一步了 —— 占位表现在挂在一个每次连接
-    都重建的内存库里, 换成真文件后自然就没了(见 _conn)。
-    """
-    _ready_dbs.add(name)
-    conn = _conn()
-    try:
-        if name == "nav":
-            # 必须写成 nav.idx_nav_date:CREATE INDEX 不带库名一律建在 main,
-            # 而 SQLite 要求索引和表同库,表在 nav 库里的话会直接报 no such
-            # table(读表名的 temp→main→attached 解析顺序在这儿不适用)。
-            conn.execute("CREATE INDEX IF NOT EXISTS nav.idx_nav_date "
-                         "ON fund_nav_daily(date)")
-            conn.commit()
-    finally:
-        conn.close()
-    logger.info("db adopted: %s → %s", name, DB_PATH[name])
-
-
-def adopt_nav_db():
-    """兼容旧名字(app.py 老版本会调它)。"""
-    adopt_db("nav")
 
 
 # ── 建表语句(按库归位)────────────────────────────────────────────────────────
@@ -321,19 +251,6 @@ _DDL = {
 """,
 
 
-"cache": """
-    -- Top rows (200) of each distinct filter run, keyed by a hash of the
-    -- filter params (+ metrics version in live mode), so repeating a
-    -- filter is a read instead of a recompute — across restarts too.
-    -- 纯缓存: 丢了自动重算, 所以这个库不参与"别覆盖"的那套小心翼翼。
-    CREATE TABLE IF NOT EXISTS cache.filter_results (
-        key      TEXT PRIMARY KEY,
-        params   TEXT NOT NULL,
-        data     TEXT NOT NULL,
-        saved_at REAL NOT NULL
-    );
-""",
-
 "nav": """
     -- One row per fund per day: appends are single-row INSERTs instead of
     -- rewriting a whole per-fund JSON blob (the old fund_nav design, which
@@ -391,12 +308,11 @@ def init_db():
     conn = _conn()
     # WAL lets the app keep reading while the pipeline writes (and vice versa).
     # 每个 attached 库各自设置——journal_mode 是 per-database 的 pragma。
-    for name, _fn, _t, _l in DB_LAYOUT:
-        if db_ready(name):
-            try:
-                conn.execute(f"PRAGMA {name}.journal_mode=WAL")
-            except sqlite3.DatabaseError as e:
-                logger.debug("WAL on %s failed: %s", name, e)
+    for name, _fn, _t in DB_LAYOUT:
+        try:
+            conn.execute(f"PRAGMA {name}.journal_mode=WAL")
+        except sqlite3.DatabaseError as e:
+            logger.debug("WAL on %s failed: %s", name, e)
     # Add per-period max-drawdown / return columns (migration for existing DBs).
     # Returns are recomputed locally from stored NAV because the EastMoney rank
     # list's 近X收益率 columns lag its own nav_date in the morning (nav/日增长率
@@ -500,23 +416,6 @@ def get_risk_free_rate(force_refresh: bool = False) -> float:
     except Exception as e:
         logger.debug("risk-free rate fetch failed: %s", e)
     return value if value is not None else RISK_FREE_RATE
-
-
-def clear_all_caches():
-    """Wipe every cache table: fund list, NAV history, computed 指标.
-
-    Used by the sidebar "清空所有缓存" button so a code/口径 change can be picked
-    up cleanly — afterwards the list re-fetches and 指标 recompute on the next
-    ⚡ run rather than being served stale from cache.
-    """
-    conn = _conn()
-    conn.execute("DELETE FROM fund_list")
-    conn.execute("DELETE FROM fund_nav_daily")
-    conn.execute("DELETE FROM fund_nav_meta")
-    conn.execute("DELETE FROM fund_sharpe")
-    conn.execute("DELETE FROM fund_holdings")
-    conn.commit()
-    conn.close()
 
 
 # Look-back windows in CALENDAR days, matching how EastMoney defines 近1月/3月/
@@ -1154,7 +1053,7 @@ def refresh_scale_hist(codes: Optional[list] = None,
 
     额外用 recheck 窗口(20天)兜底极少数"永远缺最新季报"的基金(如刚成立还
     没出过季报的), 免得每天都去重抓它们。返回实际发生网络抓取的只数。由
-    update_daily.py 每日调用(不放进 run_pipeline, 免得拖慢 in-app 更新按钮)。"""
+    update_daily.py 每日调用, 与净值和指标刷新分开执行。"""
     if codes is None:
         codes = sorted(scale_universe())
     # 自愈:披露滞后口径变过(如 _SCALE_PUB_LAG 调整)时, 库里存量行的
@@ -1221,23 +1120,6 @@ def fetch_nav(code: str) -> Optional[pd.DataFrame]:
 
 # ── 指标计算 ──────────────────────────────────────────────────────────────────
 
-def _save_metrics_row(code: str, n: int, mdd: dict, rets: dict):
-    conn = _conn()
-    conn.execute(
-        "INSERT OR REPLACE INTO fund_sharpe "
-        "(code, data_points, "
-        " mdd_1m, mdd_3m, mdd_6m, mdd_1y, "
-        " ret_1m, ret_3m, ret_6m, ret_1y, saved_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (code, n,
-         mdd.get("mdd_1m"), mdd.get("mdd_3m"), mdd.get("mdd_6m"), mdd.get("mdd_1y"),
-         rets.get("ret_1m"), rets.get("ret_3m"), rets.get("ret_6m"), rets.get("ret_1y"),
-         time.time()),
-    )
-    conn.commit()
-    conn.close()
-
-
 def _metrics_from_nav(nav_df: pd.DataFrame,
                       cols: Optional[set] = None,
                       include_annualized: bool = True) -> Optional[dict]:
@@ -1291,74 +1173,6 @@ def _metrics_from_nav(nav_df: pd.DataFrame,
         "ann_return": ann_return, "volatility": ann_vol,
         "data_points": n, **mdd, **rets,
     }
-
-
-def _save_metrics(code: str, m: dict):
-    _save_metrics_row(
-        code, m["data_points"],
-        {k: m[k] for k in ("mdd_1m", "mdd_3m", "mdd_6m", "mdd_1y")},
-        {k: m[k] for k in ("ret_1m", "ret_3m", "ret_6m", "ret_1y")},
-    )
-
-
-def compute_metrics_for_fund(code: str) -> Optional[dict]:
-    """详情按需计算全部指标;仅持久化区间指标和数据点数量。"""
-    nav_df = fetch_nav(code)
-    if nav_df is None:
-        return None
-    m = _metrics_from_nav(nav_df)
-    if m is not None:
-        _save_metrics(code, m)
-    return m
-
-
-# ── Persistent filter-result cache ───────────────────────────────────────────
-
-# 全部筛选结果加起来最多占这么多字节(JSON 原文,约等于建库体积)。
-FILTER_CACHE_BYTES = 64 * 1024 * 1024
-
-
-def save_filter_result(key: str, meta: dict, df: pd.DataFrame):
-    """Store one filter run's rows + its params/total under `key`."""
-    conn = _conn()
-    conn.execute(
-        "INSERT OR REPLACE INTO filter_results (key, params, data, saved_at) "
-        "VALUES (?, ?, ?, ?)",
-        (key, json.dumps(meta, ensure_ascii=False),
-         df.to_json(orient="split", force_ascii=False), time.time()))
-    # Keep the table bounded. 一条结果现在存的是全部匹配行(动辄近万行、
-    # 几百 KB),只按条数封顶会把库撑大(整库还要 gzip 传到 Release),
-    # 所以再加一道总字节上限:按时间倒序累计,超过 FILTER_CACHE_BYTES 的
-    # 老结果丢掉。最新一条(rn = 1)无论多大都保留,否则刚存的会被自己删掉。
-    conn.execute(
-        "DELETE FROM filter_results WHERE key NOT IN ("
-        "  SELECT key FROM ("
-        "    SELECT key,"
-        "      ROW_NUMBER() OVER (ORDER BY saved_at DESC) AS rn,"
-        "      SUM(LENGTH(data)) OVER (ORDER BY saved_at DESC"
-        "        ROWS UNBOUNDED PRECEDING) AS cum"
-        "    FROM filter_results"
-        "  ) WHERE rn = 1 OR (rn <= 200 AND cum <= ?)"
-        ")", (FILTER_CACHE_BYTES,))
-    conn.commit()
-    conn.close()
-
-
-def load_filter_result(key: str):
-    """(df, meta, saved_at) for a stored filter run, or None.
-
-    dtype inference is disabled on read so fund codes keep leading zeros.
-    """
-    conn = _conn()
-    row = conn.execute(
-        "SELECT params, data, saved_at FROM filter_results WHERE key = ?",
-        (key,)).fetchone()
-    conn.close()
-    if not row:
-        return None
-    df = pd.read_json(io.StringIO(row["data"]), orient="split",
-                      dtype=False, convert_dates=False)
-    return df, json.loads(row["params"]), row["saved_at"]
 
 
 # ── Quarterly top holdings ───────────────────────────────────────────────────
@@ -1666,7 +1480,7 @@ INDEX_START = "2015-01-01"
 
 def _fetch_with_timeout(fn, timeout=8):
     """akshare 这两个指数源(pd.read_csv 直连 http)不带超时参数,源站一旦
-    卡住会挂起几分钟不报错,把整个 Streamlit rerun 一起拖死。用后台线程
+    卡住会挂起几分钟不报错,拖住调用方。用后台线程
     强制掐表,超时立刻放弃转走"陈旧缓存兜底"这条已有路径。
 
     用 threading.Thread(daemon=True) 而非 ThreadPoolExecutor:后者的 worker
@@ -1733,50 +1547,6 @@ def fetch_sse_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
         conn.execute(
             "INSERT OR REPLACE INTO index_daily_cache (key, data, saved_at) "
             "VALUES ('sse', ?, ?)",
-            (df.to_json(orient="split", force_ascii=False), time.time()))
-        conn.commit()
-    elif row:   # refresh failed → stale cache beats nothing
-        df = _from_row(row)
-    conn.close()
-    return df
-
-
-def fetch_qvix_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
-    """VIX恐慌指数（50ETF期权QVIX，中国版VIX）daily close, cache-first.
-
-    No time-based expiry — same contract as fetch_sse_daily: only refreshed
-    when force_refresh=True (the daily 跑批). Columns: date (ISO str), close.
-    CBOE VIX has no akshare source here, so the A股 analog (optbbs QVIX) is
-    used.
-    """
-    conn = _conn()
-    row = conn.execute(
-        "SELECT data, saved_at FROM index_daily_cache WHERE key='qvix'"
-    ).fetchone()
-
-    def _from_row(r):
-        return pd.read_json(io.StringIO(r["data"]), orient="split",
-                            dtype=False, convert_dates=False)
-
-    if row and not force_refresh:
-        conn.close()
-        return _from_row(row)
-
-    df = None
-    try:
-        raw = _fetch_with_timeout(ak.index_option_50etf_qvix)
-        df = pd.DataFrame({
-            "date": pd.to_datetime(raw["date"]).dt.strftime("%Y-%m-%d"),
-            "close": pd.to_numeric(raw["close"], errors="coerce"),
-        }).dropna(subset=["date", "close"])
-        df = df[df["date"] >= INDEX_START].reset_index(drop=True)
-    except Exception as e:
-        logger.debug("QVIX fetch failed: %s", e)
-
-    if df is not None and not df.empty:
-        conn.execute(
-            "INSERT OR REPLACE INTO index_daily_cache (key, data, saved_at) "
-            "VALUES ('qvix', ?, ?)",
             (df.to_json(orient="split", force_ascii=False), time.time()))
         conn.commit()
     elif row:   # refresh failed → stale cache beats nothing
@@ -1874,20 +1644,6 @@ def fetch_vhsi_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
         df = _from_row(row)
     conn.close()
     return df
-
-
-def index_daily_saved_at(key: str) -> Optional[float]:
-    """Unix time index_daily_cache[key] ('sse' or 'qvix') was last written,
-    or None if never fetched. Used as an st.cache_data cache-busting key so
-    the app picks up a fresh 跑批 write immediately rather than on a timer."""
-    conn = _conn()
-    row = conn.execute(
-        "SELECT saved_at FROM index_daily_cache WHERE key = ?", (key,)
-    ).fetchone()
-    conn.close()
-    return row["saved_at"] if row else None
-
-
 
 
 _TRADE_CAL_CACHE = {"at": 0.0, "days": None}
@@ -1992,17 +1748,6 @@ def save_qvix_self_history(rows: list) -> None:
         [(r["date"], r.get("qvix"), r.get("note")) for r in rows])
     conn.commit()
     conn.close()
-
-
-def qvix_self_history_last_date() -> Optional[str]:
-    """qvix_self_history 里最新一条的日期(字符串),给 app.py 当
-    st.cache_data 的缓存key用——新一天数据写进来,这个值就变,缓存自然
-    失效,不用等TTL。没有数据时返回 None。"""
-    conn = _conn()
-    row = conn.execute(
-        "SELECT MAX(date) AS d FROM qvix_self_history").fetchone()
-    conn.close()
-    return row["d"] if row and row["d"] else None
 
 
 def load_qvix_self_history() -> Optional[pd.DataFrame]:
@@ -2211,7 +1956,7 @@ def load_backtest_notes() -> dict:
 # 阈值口径:滚动窗口(交易日)、最小样本、分位。50 和 300 两条序列共用同一
 # 套参数,各自在自己的序列上滚 —— 集中在这里,免得两处各写一遍慢慢漂开。
 # 2026-07-27 起生产口径从 720/0.95(3年95分位)对齐到 490/0.90(2年90分位)
-# ——与 2026-07-24 定档的标准策略(backtest_qvix.py 头部快照)及 app.py
+# ——与 2026-07-24 定档的标准策略(backtest_qvix.py 头部快照)及上证页
 # 展示线同口径,不然 notify 邮件报的阈值偏高 ~1.6个点,QVIX 落在两阈值之间
 # 时会漏信号。
 # min_periods=475(=490×0.97):阈值要接近满窗口才给值,不足宁可空着也不用
@@ -2223,8 +1968,7 @@ QVIX_THR_WINDOW, QVIX_THR_MINP, QVIX_THR_PCT = 490, 475, 0.90
 
 def update_qvix_self_daily() -> tuple:
     """收盘后重算"最近一个已收盘交易日"的自算QVIX,写入 qvix_self_history
-    并重算滚动2年90分位阈值。update_daily.py(06:00)和 notify_qvix.py
-    (14:40)都调这个,取代原来基于 optbbs 的 fetch_qvix_daily(force_refresh=True)。
+    并重算滚动2年90分位阈值。由 update_daily.py --qvix-only 调用。
 
     目标日期不是"今天"——06:00 时今天还没开盘,14:40 时今天还没收盘,
     两边其实都是在补"上一个交易日"的数据,天然幂等(UPSERT),
@@ -2624,16 +2368,12 @@ def recompute_all(progress_callback: Optional[Callable] = None) -> int:
     # Record WHICH data these metrics were computed from — the newest NAV
     # trading date and how many funds carry it — so metrics_stale() compares
     # data versions, not wall-clock timestamps ("今天的数据算今天的,明天的
-    # 数据来了才失效"). The timestamp marker is kept separately for display.
-    # Deliberately NOT derived from MAX(fund_sharpe.saved_at): the detail tab
-    # persists single rows via compute_metrics_for_fund, which would make the
-    # whole table look fresh after viewing one fund.
+    # 数据来了才失效").
     date_num, at_date = _nav_data_version(conn)
     conn.close()
     if date_num is not None:
         _set_meta("metrics_nav_date", date_num)
         _set_meta("metrics_nav_date_rows", at_date)
-    _set_meta("metrics_recomputed_at", time.time())
     return saved
 
 
@@ -2817,8 +2557,8 @@ def compute_metrics_asof(asof: str,
 def load_all_precomputed() -> dict:
     """Every precomputed 回撤/区间收益 row, keyed by code, ignoring TTL.
 
-    Lets the app show metrics instantly on load; freshness is the daily
-    pipeline's responsibility (surfaced via last_update_time()).
+    Lets the web service read metrics immediately; freshness is checked
+    separately through metrics_stale().
     """
     conn = _conn()
     rows = conn.execute(
@@ -2828,22 +2568,6 @@ def load_all_precomputed() -> dict:
     ).fetchall()
     conn.close()
     return {r["code"]: {k: r[k] for k in r.keys() if k != "code"} for r in rows}
-
-
-def last_update_time() -> Optional[float]:
-    """Unix time of the last FULL metrics recompute, or None if never.
-
-    Prefers the recompute_all marker; MAX(fund_sharpe.saved_at) is only a
-    legacy fallback (pre-marker DBs) — it overstates freshness because the
-    detail tab persists individual rows, bumping the max after one lookup.
-    """
-    t, _ = _get_meta("metrics_recomputed_at")
-    if t is not None:
-        return t
-    conn = _conn()
-    row = conn.execute("SELECT MAX(saved_at) AS t FROM fund_sharpe").fetchone()
-    conn.close()
-    return row["t"] if row and row["t"] else None
 
 
 def _nav_data_version(conn) -> tuple:
@@ -2870,8 +2594,8 @@ def metrics_stale() -> bool:
     newest date — i.e. filtering on the precomputed 回撤/收益率 would use the
     previous day's values.
 
-    A missing marker (pre-marker DBs) counts as stale, so the first filter
-    after upgrading recomputes once and plants the markers.
+    A missing marker counts as stale; the web service waits for the daily
+    pipeline to recompute and publish a consistent snapshot.
     """
     conn = _conn()
     date_num, at_date = _nav_data_version(conn)
@@ -2881,21 +2605,6 @@ def metrics_stale() -> bool:
     met_date, _ = _get_meta("metrics_nav_date")
     met_rows, _ = _get_meta("metrics_nav_date_rows")
     return met_date != date_num or met_rows != at_date
-
-
-def fund_list_saved_at() -> Optional[float]:
-    """Unix time the fund list snapshot (returns, incl. ret_1m/3m/6m/1y) was
-    last saved, or None if never fetched.
-
-    The in-app update button refreshes the fund list every run but skips
-    recompute_all() (do_recompute=False), so last_update_time() alone doesn't
-    move — callers needing a cache key that reflects *any* data refresh
-    (not just a metrics recompute) should combine this with last_update_time().
-    """
-    conn = _conn()
-    row = conn.execute("SELECT saved_at FROM fund_list WHERE id = 1").fetchone()
-    conn.close()
-    return row["saved_at"] if row else None
 
 
 def _backfill_codes(codes: list, workers: int = MAX_WORKERS,
@@ -2919,15 +2628,13 @@ def _backfill_codes(codes: list, workers: int = MAX_WORKERS,
 
 
 def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
-                 workers: int = MAX_WORKERS,
-                 do_recompute: bool = True) -> dict:
-    """Full daily pipeline shared by the CLI script and the in-app button:
+                 workers: int = MAX_WORKERS) -> dict:
+    """Full daily pipeline used by update_daily.py:
     ① refresh fund list → ② backfill funds missing history → ③ append the
     list's latest NAV point / range-fetch bigger gaps → ④ recompute
-    回撤/区间收益 for all (skippable via do_recompute=False when metrics
-    are computed lazily at filter time instead).
+    回撤/区间收益 for all.
 
-    `progress(phase, done, total)` is invoked throughout for a UI bar / logging.
+    `progress(phase, done, total)` is invoked throughout for progress logging.
     Returns a summary dict.
     """
     def _p(phase, done, total):
@@ -2963,9 +2670,7 @@ def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
     # visible to the next filter's check automatically (and a run that
     # appended nothing new leaves metrics valid).
 
-    saved = 0
-    if do_recompute:
-        saved = recompute_all(progress_callback=lambda d, t: _p("重算指标", d, t))
+    saved = recompute_all(progress_callback=lambda d, t: _p("重算指标", d, t))
 
     return {
         "funds": len(all_codes),

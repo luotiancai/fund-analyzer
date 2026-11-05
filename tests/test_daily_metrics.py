@@ -18,8 +18,8 @@ class DailyMetricsTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="fund-daily-metrics-")
         self.addCleanup(self.tmp.cleanup)
         paths = {name: str(Path(self.tmp.name) / filename)
-                 for name, filename, _, _ in fetcher.DB_LAYOUT}
-        for name, value in (("DB_PATH", paths), ("_schema_ready", False), ("LAZY_NAV", False)):
+                 for name, filename, _ in fetcher.DB_LAYOUT}
+        for name, value in (("DB_PATH", paths), ("_schema_ready", False)):
             p = patch.object(fetcher, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -65,15 +65,16 @@ class DailyMetricsTests(unittest.TestCase):
         self.assertEqual(fetcher.load_all_precomputed(), before)
 
     def test_detail_returns_annualized_values_without_persisting_them(self):
-        with patch.object(fetcher, "fetch_nav", return_value=self.nav), \
+        import web_tasks
+        before = fetcher.load_all_precomputed()
+        with patch.object(fetcher, "_load_nav_df", return_value=self.nav), \
                 patch.object(fetcher, "_annualized", wraps=fetcher._annualized) as annualized:
-            result = fetcher.compute_metrics_for_fund("000001")
+            result = web_tasks.detail(fetcher, pd.DataFrame({"code": ["000001"]}),
+                                      fetcher._conn, "000001")["metrics"]
         annualized.assert_called_once()
         self.assertIsNotNone(result["ann_return"])
         self.assertIsNotNone(result["volatility"])
-        stored = fetcher.load_all_precomputed()["000001"]
-        self.assertNotIn("ann_return", stored)
-        self.assertNotIn("volatility", stored)
+        self.assertEqual(fetcher.load_all_precomputed(), before)
 
     def test_holdings_loads_requested_year_and_preserves_etf_passthrough(self):
         year = fetcher.datetime.now().year

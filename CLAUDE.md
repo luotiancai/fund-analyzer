@@ -30,10 +30,11 @@ nav 库压缩后 61MB。用户常走手机流量, 但**流量不构成拿旧数�
 | `rank` / `market` / `nav` / `scale` | 云端每日跑批 | **纯消费**, 随时可被整文件覆盖 |
 | `qvix` | **国内那台 VPS** 每日跑 | **纯消费**, 随时可被整文件覆盖 |
 | `strategy`(回测跑批/点评) | **本地**跑回测 | 本地自产, **只推不拉** |
-| `cache` | 线上 app | 缓存, 不发布 |
 
-`sync_down.py` 默认组**不含** strategy/cache, 就是这个原因: 拉下来会盖掉
+`sync_down.py` 默认组**不含** strategy, 就是这个原因: 拉下来会盖掉
 本地还没推的跑批。
+
+网站查询和持仓缓存位于 `/var/lib/fund-web/cache`, 不发布到 Release。
 
 ⚠️ **多台电脑的坑**: 两台机器都能跑回测往 strategy 库追加跑批。在 B 机器上
 跑回测之前, 先 `python3 sync_down.py strategy` 显式拉一次, 否则 B 推库时
@@ -54,13 +55,15 @@ connection reset)。不是接口没数据, 也不是笼统封境外 —— VPS �
 谁把对方盖掉, 就是 2026-08-05 那类事故。跑批的 workflow 里那个库列表**没有
 qvix.db, 别给它加回去**。
 
-## 三、验证前端
+## 三、网站入口与验证
 
-本机没装 Chrome 扩展, 用本地 playwright 无头跑:
+基金分析网站使用 `web_service.py` + `web/`, 部署见 `deploy/README.md`。
+本地使用已同步的快照启动:
 
 ```bash
-python3 -m streamlit run app.py --server.port 8599 --server.headless true
+FUND_WEB_ROOT=/path/to/fund-web uvicorn web_service:app --host 127.0.0.1 --port 8010
 ```
 
-`st.dataframe` 是 canvas 渲染的, 表格内容**不在** `inner_text` 里, 断言要么
-截图看, 要么去查 caption/标题这类真 DOM 文本。
+查询服务与数据指标检查使用 `python3 -m unittest discover -s tests -v`。
+上证页由 `build_site.py` + `sse_view.py` + `site/template.html` 生成,
+VPS 的 `vps_site_build.sh` 仍在使用这条链路。

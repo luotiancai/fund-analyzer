@@ -1,11 +1,7 @@
-"""上证页(行情图 + 策略复盘 + 对照回测)的数据整理, 不依赖 streamlit。
+"""上证静态页(行情图 + 策略复盘 + 对照回测)的数据整理。
 
-app.py(Streamlit)和 build_site.py(BWG 上的静态页)共用这一份: 复盘那段
-统计说明、列顺序、止损染色都在这里只写一次, 两个前端只管画。以前这些全写
-在 app.py 的页面代码里, 再抄一份给静态页, 两边迟早对不上。
-
-返回的说明文字是 markdown 片段(只用 **粗体** 和 `代码`), Streamlit 直接
-渲染, 静态页用 md_inline() 转成 HTML。
+供 build_site.py 使用, 集中维护统计说明、列顺序和止损染色。
+说明文字使用 **粗体** 和 `代码`, 由 md_inline() 转成 HTML。
 """
 
 import datetime as dt
@@ -56,16 +52,6 @@ def md_inline(s: str) -> str:
     s = html.escape(s, quote=False)
     s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
     return re.sub(r"`(.+?)`", r"<code>\1</code>", s)
-
-
-def window(sse_all: pd.DataFrame, days):
-    """按自然日切窗口, 保留锚点行(窗口起点当天或之前最后一个收盘), 区间
-    涨跌按真正的基点算 —— 与 _window_by_date 同口径。"""
-    if days is None:
-        return sse_all
-    start = sse_all["date"].max() - pd.Timedelta(days=days)
-    older = sse_all[sse_all["date"] <= start]
-    return sse_all.loc[older.index[-1]:] if not older.empty else sse_all
 
 
 def qvix_thresholds(hist: pd.DataFrame):
@@ -121,7 +107,7 @@ def chain_broken_mask(qvix_hist: pd.DataFrame) -> pd.Series:
 # 高于纳斯达克(0.153)、黄金(0.099)这些真正弱相关的境外资产,
 # "脱钩"假设不成立。
 #
-# 候选排名复用 fetcher.compute_metrics_asof——与 Streamlit「基金列表」的
+# 候选排名复用 fetcher.compute_metrics_asof——与基金筛选页的
 # "截至日期"筛选完全同口径(按日收益率连乘计算区间收益,正确处理
 # 分红除权,自带单日|收益率|>30%异常值过滤),严格早于当日截断(T日
 # 决策只能看到T-1日收盘净值)。

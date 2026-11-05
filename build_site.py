@@ -4,14 +4,12 @@
     python3 build_site.py --out /opt/fund-analyzer/site
 
 跑在 BWG 上, 由 vps_site_build.sh 每小时调一次, nginx 直接发这个目录。
-为什么不用 Streamlit: 那边每点一下都把整份 app.py 重跑一遍、再经 websocket
-把整张图传回来, 手机上又卡又慢; 而这几块数据一天只变一次、只看不改, 预先
-生成好就够了 —— 切时间区间这类交互全在浏览器里做, 不回服务器。
+数据按日更新, 预先生成; 切时间区间这类交互全在浏览器里做, 不回服务器。
 
 只读 market / qvix / strategy 三个小库(加起来 2MB 不到), 1GB 的 BWG 跑得动。
-「今天会买哪只」和基金详情要净值库(解开 385MB), 不在这里, 留在 Streamlit。
+「今天会买哪只」和基金详情由 /fund/ 的轻量服务提供。
 
-统计说明、列顺序、止损染色都来自 sse_view.py, 跟 Streamlit 版共用一份。
+统计说明、列顺序、止损染色都来自 sse_view.py。
 """
 
 import argparse
@@ -39,7 +37,7 @@ ECHARTS_URL = (f"https://cdn.jsdelivr.net/npm/echarts@{ECHARTS_VER}"
 
 
 def _cell(v):
-    """跟 Streamlit 版 Styler.format(precision=2, na_rep="") 同口径。"""
+    """表格数值保留两位小数, 缺失值显示为空。"""
     if v is None:
         return ""
     if isinstance(v, float):

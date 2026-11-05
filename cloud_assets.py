@@ -25,8 +25,7 @@ CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "fund-analyzer-peek"
 _STAMP_FILE = os.path.join(CACHE_DIR, "asset-stamps.json")
 
 # 库名 → 资产名。fund_rank.db → fund_rank.db.gz
-ASSET_OF = {name: fn + ".gz" for name, fn, _t, _l in fetcher.DB_LAYOUT}
-DB_OF_ASSET = {v: k for k, v in ASSET_OF.items()}
+ASSET_OF = {name: fn + ".gz" for name, fn, _t in fetcher.DB_LAYOUT}
 
 
 def log(msg):
