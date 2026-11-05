@@ -5,12 +5,12 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>基金分析仪</title>
-  <link rel="stylesheet" href="./app.css?v=1">
+  <link rel="stylesheet" href="./app.css?v=2">
   <script src="./app.js?v=1" defer></script>
 </head>
 <body>
 <main>
-  <header><div><a class="eyebrow" href="/">上证 · QVIX ↗</a><h1>基金分析仪</h1></div><span class="badge">基金研究</span></header>
+  <header class="page-head"><h1>📊 基金分析仪</h1><a class="site-link" href="/">上证 · QVIX <span aria-hidden="true">→</span></a></header>
   <div id="data-status" class="muted" role="status">正在读取数据状态…</div>
   <nav class="tabs" aria-label="功能切换">
     <button class="active" data-pane="pick" aria-selected="true">今日候选</button>
@@ -20,7 +20,7 @@
 
   <section id="pane-pick" class="pane">
     <div class="section-title"><div><h2>今天会买哪只</h2><p>沿近 3 月跌幅榜逐只检查，展示走到选中基金为止的路径。</p></div></div>
-    <form id="pick-form" class="toolbar">
+    <form id="pick-form" class="toolbar query-form">
       <label>决策日<input type="date" id="pick-date" min="2020-01-01" required></label>
       <button class="primary" type="submit">计算候选</button>
     </form>
@@ -28,7 +28,7 @@
     <div id="pick-output" aria-live="polite"><div class="empty">选择日期，查看候选及淘汰原因。</div></div>
     <div id="probe-panel" hidden>
       <h3>查一只基金为什么没选中</h3>
-      <form id="probe-form" class="toolbar"><label class="grow">基金代码<input id="probe-codes" placeholder="例如 026834, 012710 016848" maxlength="160" required></label><button type="submit">检查</button></form>
+      <form id="probe-form" class="toolbar query-form"><label class="grow">基金代码<input id="probe-codes" placeholder="例如 026834, 012710 016848" maxlength="160" required></label><button type="submit">检查</button></form>
       <div id="probe-output" aria-live="polite"></div>
     </div>
   </section>
@@ -56,7 +56,7 @@
 
   <section id="pane-detail" class="pane" hidden>
     <div class="section-title"><div><h2>基金详情</h2><p>净值走势、风险收益指标、季度规模及重仓持仓。</p></div></div>
-    <form id="detail-form" class="toolbar"><label>基金代码<input id="detail-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="例如 026834" required></label><button class="primary" type="submit">查询</button></form>
+    <form id="detail-form" class="toolbar query-form"><label>基金代码<input id="detail-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="例如 026834" required></label><button class="primary" type="submit">查询</button></form>
     <div id="detail-output" aria-live="polite"><div class="empty">输入六位基金代码。</div></div>
     <div id="holdings-panel" hidden><div class="toolbar"><h3>重仓持仓</h3><button id="holdings-button" type="button">加载最新持仓</button><button id="holdings-history-button" type="button" hidden>加载历史持仓（2020 年至今）</button></div><div id="holdings-output" aria-live="polite"></div></div>
   </section>
