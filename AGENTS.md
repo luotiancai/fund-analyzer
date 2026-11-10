@@ -1,4 +1,4 @@
-# 给 Claude Code 的项目规矩
+# 基金分析仪项目规则
 
 这份文件跟着 git 走, 换一台电脑照样生效 —— 写在这里的是**跨机器都成立**的
 约定, 只对某一台机器成立的东西不要往这里写。
@@ -6,7 +6,7 @@
 ## 一、算任何东西之前, 先把线上库拉下来
 
 ```bash
-python3 sync_down.py --all      # market/rank/scale/nav, 条件下载, 远端没变零流量
+python3 sync_down.py --all      # qvix/market/rank/scale/nav，远端有变化才下载
 ```
 
 **当天没拉过就先拉, 拉过了就不用再拉。** 不许走"本地库停在几天前 → 照算 →
@@ -27,8 +27,8 @@ nav 库压缩后 61MB。用户常走手机流量, 但**流量不构成拿旧数�
 
 | 库 | 权威写入方 | 本地怎么用 |
 |---|---|---|
-| `rank` / `market` / `nav` / `scale` | 云端每日跑批 | **纯消费**, 随时可被整文件覆盖 |
-| `qvix` | **国内那台 VPS** 每日跑 | **纯消费**, 随时可被整文件覆盖 |
+| `rank` / `nav` / `scale` | GitHub Actions 基金跑批 | **纯消费**, 随时可被整文件覆盖 |
+| `market` / `qvix` | VPS 的早间跑批 | **纯消费**, 随时可被整文件覆盖 |
 | `strategy`(回测跑批/点评) | **本地**跑回测 | 本地自产, **只推不拉** |
 
 `sync_down.py` 默认组**不含** strategy, 就是这个原因: 拉下来会盖掉
@@ -50,10 +50,9 @@ connection reset)。不是接口没数据, 也不是笼统封境外 —— VPS �
 通; 封的是被爬虫用烂的 runner 地址段。换个时间点重试解决不了, 原来那个
 `qvix-retry.yml`(早上6点在 GitHub 上补跑)因此一并删了。
 
-所以 QVIX 从 `market.db` 拆进独立的 `qvix.db`, 由 VPS 独占写入。**一张表
-一个写入方** —— 跟 index_daily_cache 挤在一个库里的话, 跑批和 VPS 谁后推
-谁把对方盖掉, 就是 2026-08-05 那类事故。跑批的 workflow 里那个库列表**没有
-qvix.db, 别给它加回去**。
+QVIX 最初拆到独立的 `qvix.db`，是为避免两个写入方整库覆盖。现在 VPS 在
+同一次跑批更新 `market.db` 和 `qvix.db`，继续分别发布。GitHub Actions 的
+发布列表只包含基金库。具体时间和部署入口见 [部署说明](deploy/README.md)。
 
 ## 三、网站入口与验证
 

@@ -2,7 +2,7 @@
 # QVIX 和上证日线每日跑批, 由 VPS 的 cron 调用。
 #
 # 为什么这活儿不在 GitHub Actions 上跑: 上交所的期权风险指标接口挡 runner
-# 的地址段, 见 CLAUDE.md「为什么 qvix 不归云端跑批管」。换时间点重试解决
+# 的地址段, 见 AGENTS.md「为什么 qvix 不归云端跑批管」。换时间点重试解决
 # 不了, 原来那个 qvix-retry.yml 已经删了。
 #
 # 只发布 qvix.db 和 market.db。净值等基金库在这台 VPS 上只有空表, 切勿用 --all 发布。
