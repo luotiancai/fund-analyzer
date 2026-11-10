@@ -8,10 +8,10 @@
 --------
 
 - GitHub Actions 的 `update-daily.yml` 刷新基金净值、指标和季度规模。
-- VPS 的 `vps_market_daily.sh` 每周一至周五北京时间 18:10 刷新上证、恒生和
-  VHSI 日线，重建上证页，并将 `market.db` 发布到 Release。首次部署先运行
-  `sync_down.py market` 取回历史行情，再安装脚本头部的 cron。
-- 原有 QVIX cron 继续发布 `qvix.db`。上证页定时任务每小时 20 分检查是否需要重建。
+- VPS 的 `vps_qvix_daily.sh` 每周二至周六北京时间 07:00 更新前一交易日的
+  QVIX 和上证日线，发布 `qvix.db` 与 `market.db` 后重建上证页。首次部署
+  先运行 `sync_down.py market` 取回历史行情，再安装脚本末尾的 cron。
+- 上证页定时任务每小时 20 分检查是否需要重建。
 - `fund-web-sync.timer` 每 15 分钟检查 Release，仅下载变更的文件。校验
   SQLite 完整性、净值/指标版本及下载前后资产版本后，原子切换整个快照。
 - API 和计算任务只读快照；持仓和 ETF 映射使用跨版本保留的独立缓存，绝不推回 Release。

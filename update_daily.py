@@ -16,7 +16,7 @@ Pipeline (fetcher.run_pipeline):
   手动:     python3 update_daily.py
   仅重算:    python3 update_daily.py --recompute-only
   仅补QVIX:  python3 update_daily.py --qvix-only   (VPS 专用, 见 run_qvix_only)
-  仅刷指数:   python3 update_daily.py --market-only (VPS 专用)
+  仅刷上证:   python3 update_daily.py --market-only (VPS 专用)
   仅刷规模:   python3 update_daily.py --scales-only (规模覆盖范围扩大后补全用)
   跳过规模:   python3 update_daily.py --no-scales   (云端跑批用, 规模另起一步)
   cron:      0 18 * * 1-5  cd /path/to/fund-analyzer && python3 update_daily.py >> update.log 2>&1
@@ -103,7 +103,7 @@ def main():
     parser.add_argument("--qvix-only", action="store_true",
                         help="只补自算QVIX,不跑基金净值/指数(VPS 上每日跑这条)")
     parser.add_argument("--market-only", action="store_true",
-                        help="只刷新上证/恒生/VHSI 日线(VPS 专用)")
+                        help="只刷新上证日线(VPS 专用)")
     parser.add_argument("--scales-only", action="store_true",
                         help="只刷基金季度规模,不跑净值/指数/QVIX"
                              "(规模覆盖范围扩大后的一次性补全用)")
@@ -113,10 +113,8 @@ def main():
 
     t0 = time.time()
     if args.market_only:
-        log.info("刷新指数缓存(上证/恒生/VHSI)…")
+        log.info("刷新上证日线…")
         sse = fetcher.fetch_sse_daily(force_refresh=True)
-        fetcher.fetch_hsi_daily(force_refresh=True)
-        fetcher.fetch_vhsi_daily(force_refresh=True)
         if sse is None or sse.empty:
             raise SystemExit("上证日线为空")
         last = sse.iloc[-1]

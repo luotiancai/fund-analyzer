@@ -233,7 +233,7 @@ _DDL = {
 "market": """
     -- 外部指数/波动率日线缓存, 一个 key 一整块 JSON。key: sse(上证)、
     -- hsi/vhsi(恒生及其波动率)、ixic/vix、au9999/gvz、qvix(外部源)。
-    -- sse/hsi/vhsi 每日跑批刷新, 其余按 TTL 惰性拉。
+    -- sse 由 VPS 每日跑批刷新。
     CREATE TABLE IF NOT EXISTS market.index_daily_cache (
         key TEXT PRIMARY KEY, data TEXT, saved_at REAL);
 """,
@@ -1511,7 +1511,7 @@ def fetch_sse_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     """上证指数 daily history from NAV_START, cache-first.
 
     No time-based expiry — the cache is only refreshed when
-    force_refresh=True, which the VPS market batch uses after close.
+    force_refresh=True, which the VPS morning batch uses for the prior close.
     Columns: date (ISO str), close, pct (daily % change).
     Serves stale cache when the refresh fails; None only with no cache at all.
     """
