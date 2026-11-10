@@ -3,8 +3,7 @@ name: 每日数据跑批
 on:
   schedule:
     # 18:37 UTC = 北京次日 02:37:周二至周六凌晨跑。前一交易日 15:00 收盘,
-    # 到凌晨2点半已过去11个半小时——基金净值(通常当晚20:00~23:00公布)和上证
-    # 日线都已发布。早上打开页面时数据早就就绪, 不会撞上跑批还没跑完的空窗。
+    # 到凌晨2点半已过去11个半小时, 基金净值(通常当晚20:00~23:00公布)已发布。
     # 周日/周一凌晨对应周六/周日, 没有新净值, 不跑。
     #
     # 分钟数必须错开整点: 原来写的 0 17 命中了 GitHub 全球调度高峰, 实测每次
@@ -56,19 +55,10 @@ jobs:
       - name: 安装跑批依赖
         run: pip install --quiet requests pandas numpy akshare
       - name: 取回上次的各个库(Release tag `data`)
-        # 数据按 fetcher.DB_LAYOUT 分成若干独立的库, 每个库一个资产。以前是
-        # 一个 400MB 的 fund_cache.db 打包所有表, 发布单元跟更新节奏对不上,
-        # 推一次策略结果能把跑批攒五天的行情盖回去(2026-08-05)。
-        # cache(筛选结果缓存)不取: 跑批不读它, 丢了应用自己重算。
-        # strategy 也不取: 权威写入方是本地回测, 跑批只读不写, 取回来再传
-        # 回去只会平白增加覆盖它的机会。
+        # 只同步基金库。market 和 qvix 由 VPS 独占发布, strategy 由本地回测发布。
         run: |
-          # 列表里**没有 qvix.db**, 这是刻意的: 它的权威写入方是国内那台
-          # VPS(上交所接口挡 runner 的境外 IP, 见 fetcher.DB_LAYOUT)。跑批
-          # 既不读它也不写它, 更不能传它 —— 传了就是拿一份空库盖掉 VPS 的
-          # 成果。
           mkdir -p "$FUND_ANALYZER_DATA"
-          for db in fund_rank market fund_nav fund_scale; do
+          for db in fund_rank fund_nav fund_scale; do
             if gh release download data --pattern "$db.db.gz" \
                  --output "$db.db.gz" --repo "$GITHUB_REPOSITORY"; then
               gunzip -c "$db.db.gz" > "$FUND_ANALYZER_DATA/$db.db"
@@ -79,20 +69,17 @@ jobs:
             fi
           done
 
-      # 规模单独放最后、单独回传: 季报到期那天要抓一万多只(2小时+), 以前跟
-      # 净值/上证一起跑完才统一上传, 2026-10-28 上证静态页因此空等到 9 点多。
+      # 规模单独放最后、单独回传, 避免季报到期时拖慢净值发布。
       # scales-only 只刷规模,别的一概不碰;定时触发没有 inputs,默认 full。
-      - name: 跑批(增量补净值 + 重算指标 + 刷新上证)
+      - name: 跑批(增量补净值 + 重算指标)
         if: github.event.inputs.mode != 'scales-only'
         run: python update_daily.py --no-scales
-      - name: 压缩并回传 净值/榜单/行情
-        # 一个库一个资产, 各自独立。只传跑批真正写过的那几个 —— 不碰
-        # strategy(本地回测发)、cache(缓存)。
+      - name: 压缩并回传 净值/榜单
         if: github.event.inputs.mode != 'scales-only'
         run: |
           cd "$FUND_ANALYZER_DATA"
           up=""
-          for db in fund_rank market fund_nav; do
+          for db in fund_rank fund_nav; do
             [ -f "$db.db" ] || { echo "::warning::缺 $db.db, 不传"; continue; }
             gzip -9 -c "$db.db" > "$db.db.gz" && up="$up $db.db.gz"
           done

@@ -16,6 +16,7 @@ Pipeline (fetcher.run_pipeline):
   手动:     python3 update_daily.py
   仅重算:    python3 update_daily.py --recompute-only
   仅补QVIX:  python3 update_daily.py --qvix-only   (VPS 专用, 见 run_qvix_only)
+  仅刷指数:   python3 update_daily.py --market-only (VPS 专用)
   仅刷规模:   python3 update_daily.py --scales-only (规模覆盖范围扩大后补全用)
   跳过规模:   python3 update_daily.py --no-scales   (云端跑批用, 规模另起一步)
   cron:      0 18 * * 1-5  cd /path/to/fund-analyzer && python3 update_daily.py >> update.log 2>&1
@@ -101,15 +102,28 @@ def main():
                         help="跳过下载,只用已存净值重算回撤/收益率")
     parser.add_argument("--qvix-only", action="store_true",
                         help="只补自算QVIX,不跑基金净值/指数(VPS 上每日跑这条)")
+    parser.add_argument("--market-only", action="store_true",
+                        help="只刷新上证/恒生/VHSI 日线(VPS 专用)")
     parser.add_argument("--scales-only", action="store_true",
                         help="只刷基金季度规模,不跑净值/指数/QVIX"
                              "(规模覆盖范围扩大后的一次性补全用)")
     parser.add_argument("--no-scales", action="store_true",
-                        help="完整跑批但跳过规模刷新(云端跑批把规模拆到最后单独跑,"
-                             "免得季报到期那天拖住上证)")
+                        help="跑基金净值和指标,跳过规模刷新")
     args = parser.parse_args()
 
     t0 = time.time()
+    if args.market_only:
+        log.info("刷新指数缓存(上证/恒生/VHSI)…")
+        sse = fetcher.fetch_sse_daily(force_refresh=True)
+        fetcher.fetch_hsi_daily(force_refresh=True)
+        fetcher.fetch_vhsi_daily(force_refresh=True)
+        if sse is None or sse.empty:
+            raise SystemExit("上证日线为空")
+        last = sse.iloc[-1]
+        log.info("   上证 %s 收 %.2f(%+.2f%%)",
+                 last["date"], last["close"], last["pct"])
+        return
+
     fetcher.init_db()
 
     if args.scales_only:
@@ -147,27 +161,6 @@ def main():
                 log.info("   基金规模刷新完成(本次实抓 %d 只)", n)
             except Exception as e:
                 log.warning("   基金规模刷新失败(不影响主流程): %s", e)
-
-    # ── 指数刷新 ────────────────────────────────────────────────────────────
-    # 上证指数刷新照旧(app 侧无过期时间,只在这里force_refresh才变)。
-    #
-    # **QVIX 不在这里算了**(2026-08-28 移走)。上交所的期权风险指标接口挡
-    # GitHub runner 的境外 IP:同一时刻本机和国内 VPS 都拿得到 656 条合约,
-    # runner 上三次重试全失败。QVIX 因此拆成独立的 qvix.db、权威写入方改成
-    # 国内那台 VPS(见 fetcher.DB_LAYOUT)。跑批既不下载 qvix.db 也不发布它,
-    # 在这儿硬算只有害处:每天往表里留一行空值,而那行空值又会被 VPS 那侧
-    # "补最近15天空值"的自愈逻辑当成活儿反复重试。
-    log.info("刷新指数缓存(上证/恒生/VHSI)…")
-    try:
-        sse = fetcher.fetch_sse_daily(force_refresh=True)
-        fetcher.fetch_hsi_daily(force_refresh=True)
-        fetcher.fetch_vhsi_daily(force_refresh=True)
-        if sse is not None:
-            s_last = sse.iloc[-1]
-            log.info("   上证 %s 收 %.0f(%+.2f%%)",
-                     s_last["date"], s_last["close"], s_last["pct"])
-    except Exception as e:
-        log.warning("   指数刷新失败(不影响基金跑批): %s", e)
 
     log.info("✅ 完成,总耗时 %.1f 分钟", (time.time() - t0) / 60)
 

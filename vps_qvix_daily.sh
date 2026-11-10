@@ -5,10 +5,7 @@
 # 的地址段, 见 CLAUDE.md「为什么 qvix 不归云端跑批管」。换时间点重试解决
 # 不了, 原来那个 qvix-retry.yml 已经删了。
 #
-# ⚠️ 只碰 qvix.db 一个库(约 124KB)。**别在这台机器上跑 push_dbs.py --all**:
-# 数据目录里其余几个库都是 fetcher.init_db() 顺手建的空壳(几 KB), 推上去
-# 就是拿空库盖掉线上几十 MB 的真数据。push_dbs 的行数检查会拦下来, 但别去
-# 试那道防线 —— 它是最后一道, 不是第一道。
+# 只发布 qvix.db。净值等基金库在这台 VPS 上只有空表, 切勿用 --all 发布。
 #
 # 装在哪: /opt/fund-analyzer/{repo,venv,data}, cron 见本文件末尾注释。
 set -euo pipefail

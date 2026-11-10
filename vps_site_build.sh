@@ -2,12 +2,8 @@
 # 上证页静态网页 —— 跑在 BWG 上, 生成 /opt/fund-analyzer/site/index.html,
 # nginx 直接发这个目录。页面本身见 build_site.py / site/template.html。
 #
-# 谁调它: cron 每小时一次(接住云端跑批推的 market 和本地推的 strategy),
-# 外加 vps_qvix_daily.sh 每天 07:00 算完 QVIX 后顺手调一次。
-#
-# 只**读**库, 不推任何东西。拉的是 market(云端跑批写)和 strategy(本地回测
-# 写), 这台机器对两者都是纯消费者。**不拉 qvix**: 这台机器自己就是 qvix 的
-# 写入方, 本地那份就是最新的。
+# cron 每小时检查本地推送的 strategy, VPS 更新指数日线或 QVIX 后也会调用。
+# market 和 qvix 直接读 VPS 本地库。
 set -euo pipefail
 
 BASE=/opt/fund-analyzer
@@ -16,14 +12,14 @@ PY=$BASE/venv/bin/python
 SITE=$BASE/site
 cd "$BASE/repo"
 
-# 每小时那次可能正好撞上 07:00 的 QVIX 跑批调过来的这次: 排队等, 不并发。
+# 定时和跑批触发的重建共用一把锁。
 exec 9>/run/fund-site-build.lock
 flock -w 300 9 || { echo "等锁超时, 跳过"; exit 0; }
 
 git pull -q --ff-only || echo "⚠️ git pull 失败, 用本地现有代码继续"
 
 # 条件下载, 远端没变零流量
-$PY sync_down.py market strategy
+$PY sync_down.py strategy
 
 # 代码和三个库都没变就不重新生成
 mkdir -p "$SITE"

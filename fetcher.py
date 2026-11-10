@@ -77,7 +77,7 @@ os.makedirs(_DATA_DIR, exist_ok=True)
 #   库          文件               权威写入方      更新节奏
 #   rank        fund_rank.db       每日跑批        日
 #   qvix        qvix.db            VPS             日
-#   market      market.db          每日跑批        日
+#   market      market.db          VPS             日
 #   strategy    fund_strategy.db   本地回测        手动
 #   nav         fund_nav.db        每日跑批        日
 #   scale       fund_scale.db      每日跑批        季
@@ -1511,8 +1511,8 @@ def fetch_sse_daily(force_refresh: bool = False) -> Optional[pd.DataFrame]:
     """上证指数 daily history from NAV_START, cache-first.
 
     No time-based expiry — the cache is only refreshed when
-    force_refresh=True, which update_daily.py's 06:00 跑批 does every
-    trading day. Columns: date (ISO str), close, pct (daily % change).
+    force_refresh=True, which the VPS market batch uses after close.
+    Columns: date (ISO str), close, pct (daily % change).
     Serves stale cache when the refresh fails; None only with no cache at all.
     """
     conn = _conn()
