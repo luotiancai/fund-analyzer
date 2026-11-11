@@ -27,6 +27,7 @@ on:
         options:
           - full          # 完整跑批(和定时一样)
           - scales-only   # 只刷基金季度规模(覆盖范围扩大后的一次性补全)
+          - inception-only # 只补充筛选范围内 C 份额的成立日
 
 permissions:
   contents: write   # gh release upload 需要
@@ -58,7 +59,11 @@ jobs:
         # 只同步基金库。market 和 qvix 由 VPS 独占发布, strategy 由本地回测发布。
         run: |
           mkdir -p "$FUND_ANALYZER_DATA"
-          for db in fund_rank fund_nav fund_scale; do
+          dbs="fund_rank fund_nav fund_scale"
+          if [ "${{ github.event.inputs.mode }}" = "inception-only" ]; then
+            dbs="fund_rank"
+          fi
+          for db in $dbs; do
             if gh release download data --pattern "$db.db.gz" \
                  --output "$db.db.gz" --repo "$GITHUB_REPOSITORY"; then
               gunzip -c "$db.db.gz" > "$FUND_ANALYZER_DATA/$db.db"
@@ -72,14 +77,21 @@ jobs:
       # 规模单独放最后、单独回传, 避免季报到期时拖慢净值发布。
       # scales-only 只刷规模,别的一概不碰;定时触发没有 inputs,默认 full。
       - name: 跑批(增量补净值 + 重算指标)
-        if: github.event.inputs.mode != 'scales-only'
+        if: github.event.inputs.mode != 'scales-only' && github.event.inputs.mode != 'inception-only'
         run: python update_daily.py --no-scales
+      - name: 补充 C 份额成立日期
+        if: github.event.inputs.mode == 'inception-only'
+        run: python update_daily.py --inception-only
       - name: 压缩并回传 净值/榜单
         if: github.event.inputs.mode != 'scales-only'
         run: |
           cd "$FUND_ANALYZER_DATA"
           up=""
-          for db in fund_rank fund_nav; do
+          dbs="fund_rank fund_nav"
+          if [ "${{ github.event.inputs.mode }}" = "inception-only" ]; then
+            dbs="fund_rank"
+          fi
+          for db in $dbs; do
             [ -f "$db.db" ] || { echo "::warning::缺 $db.db, 不传"; continue; }
             gzip -9 -c "$db.db" > "$db.db.gz" && up="$up $db.db.gz"
           done
@@ -89,8 +101,10 @@ jobs:
             --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
           gh release upload data $up --clobber --repo "$GITHUB_REPOSITORY"
       - name: 刷新基金规模
+        if: github.event.inputs.mode != 'inception-only'
         run: python update_daily.py --scales-only
       - name: 压缩并回传 规模
+        if: github.event.inputs.mode != 'inception-only'
         run: |
           cd "$FUND_ANALYZER_DATA"
           gzip -9 -c fund_scale.db > fund_scale.db.gz

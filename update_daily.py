@@ -107,6 +107,8 @@ def main():
     parser.add_argument("--scales-only", action="store_true",
                         help="只刷基金季度规模,不跑净值/指数/QVIX"
                              "(规模覆盖范围扩大后的一次性补全用)")
+    parser.add_argument("--inception-only", action="store_true",
+                        help="只补充筛选范围内 C 份额的成立日期")
     parser.add_argument("--no-scales", action="store_true",
                         help="跑基金净值和指标,跳过规模刷新")
     args = parser.parse_args()
@@ -123,6 +125,16 @@ def main():
         return
 
     fetcher.init_db()
+
+    if args.inception_only:
+        result = fetcher.refresh_inception_dates(
+            progress=lambda done, total: _log_progress("补充成立日期", done, total))
+        log.info("成立日期：范围 %d，已缓存 %d，本次补充 %d，失败 %d",
+                 result["total"], result["cached"], result["fetched"], len(result["failed"]))
+        if result["failed"]:
+            log.warning("待重试成立日期代码：%s", ",".join(result["failed"]))
+        log.info("✅ 成立日期补充结束，耗时 %.1f 分钟", (time.time() - t0) / 60)
+        return
 
     if args.scales_only:
         # 规模覆盖范围从「本地有净值的基金」扩到「榜单全部非债基金」后,

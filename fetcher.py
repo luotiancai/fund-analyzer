@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from fund_rules import is_fof
+from fund_rules import is_fof, is_locked_fund
 
 import pandas as pd
 import requests
@@ -86,7 +86,7 @@ os.makedirs(_DATA_DIR, exist_ok=True)
 DB_LAYOUT = (
     # (库名, 文件名, 表)
     ("rank", "fund_rank.db",
-     ("fund_list", "fund_sharpe", "fund_nav_meta", "app_meta",
+     ("fund_list", "fund_sharpe", "fund_nav_meta", "fund_inception", "app_meta",
       "fund_index_code", "etf_target_map")),
     # qvix 单独一个库, 而且排在 market 前面 —— 两条都是刻意的。
     # 单独一个库: 它的权威写入方不再是云端跑批, 而是国内那台 VPS。上交所的
@@ -182,6 +182,13 @@ _DDL = {
         code      TEXT PRIMARY KEY,
         saved_at  REAL NOT NULL,
         last_date TEXT
+    );
+    -- 按份额代码保存实际成立日，不能用最早已存净值日期替代。
+    CREATE TABLE IF NOT EXISTS rank.fund_inception (
+        code TEXT PRIMARY KEY,
+        inception_date TEXT NOT NULL,
+        source TEXT NOT NULL,
+        fetched_at REAL NOT NULL
     );
     -- 表名是历史遗留: 建表时它只存夏普, 后来长出了 mdd/ret 各四列, 2026-08-07
     -- 夏普三列已移除;年化收益/年化波动率改为详情页按需计算,不再落库。
@@ -1286,11 +1293,94 @@ def _fetch_holdings_year(code: str, year: str) -> Optional[pd.DataFrame]:
 
 _EM_BASIC_INFO_URL = ("https://fundmobapi.eastmoney.com/FundMNewApi/"
                       "FundMNBasicInformation")
+_INCEPTION_HTTP = threading.local()
 _EM_FUNDCODE_JS = "https://fund.eastmoney.com/js/fundcode_search.js"
 _ETF_MAP_FAIL_TTL = 30 * 86400   # 解析失败一个月后重试
 
 _fund_names: Optional[dict] = None
 _etf_cands: Optional[list] = None
+
+
+def _fetch_fund_inception_date(code: str) -> Optional[str]:
+    """Read the requested share class's ESTABDATE, never its parent's issue date."""
+    client = getattr(_INCEPTION_HTTP, "session", requests)
+    for attempt in range(3):
+        try:
+            response = client.get(
+                _EM_BASIC_INFO_URL,
+                params={"FCODE": code, "deviceid": "Wap", "plat": "Wap",
+                        "product": "EFund", "version": "2.0.0"},
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("invalid inception response")
+            data = payload.get("Datas")
+            if payload.get("ErrCode") != 0 or not isinstance(data, dict):
+                raise ValueError("invalid inception response")
+            if str(data.get("FCODE")) != code:
+                raise ValueError("inception response code mismatch")
+            raw = data.get("ESTABDATE")
+            if not isinstance(raw, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+                raise ValueError("missing inception date")
+            date = datetime.strptime(raw, "%Y-%m-%d").date()
+            if not datetime(1900, 1, 1).date() <= date <= datetime.now(_CST).date():
+                raise ValueError("invalid inception date")
+            return date.isoformat()
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            if attempt == 2:
+                logger.warning("成立日期获取失败 %s: %s", code, exc)
+            else:
+                time.sleep(0.5 * (attempt + 1))
+    return None
+
+
+def refresh_inception_dates(list_df=None, workers: int = 4,
+                            progress: Optional[Callable] = None) -> dict:
+    """Cache missing share-class inception dates for the eligible C-class pool."""
+    funds = fetch_fund_list() if list_df is None else list_df
+    codes = set()
+    for fund in funds.to_dict("records"):
+        code, name, fund_type = fund.get("code"), fund.get("name"), str(fund.get("type") or "")
+        if (not isinstance(code, str) or not re.fullmatch(r"\d{6}", code)
+                or not is_c_class(name) or is_bond(fund_type)
+                or is_fof(fund_type, name) or is_locked_fund(name)
+                or "QDII" in fund_type or "海外" in fund_type):
+            continue
+        codes.add(code)
+    conn = _conn()
+    try:
+        have = {r[0] for r in conn.execute("SELECT code FROM fund_inception")}
+        todo = sorted(codes - have)
+        done = saved = 0
+        failed = []
+        if progress:
+            progress(0, len(todo))
+
+        def init_http():
+            _INCEPTION_HTTP.session = requests.Session()
+
+        if todo:
+            with ThreadPoolExecutor(max_workers=workers, initializer=init_http) as executor:
+                futures = {executor.submit(_fetch_fund_inception_date, code): code for code in todo}
+                for future in as_completed(futures):
+                    code = futures[future]
+                    date = future.result()
+                    done += 1
+                    if date is None:
+                        failed.append(code)
+                    else:
+                        conn.execute("INSERT OR REPLACE INTO fund_inception VALUES (?,?,?,?)",
+                                     (code, date, _EM_BASIC_INFO_URL + "?FCODE=" + code, time.time()))
+                        saved += 1
+                    if done % 50 == 0 or done == len(todo):
+                        conn.commit()
+                        if progress:
+                            progress(done, len(todo))
+        return dict(total=len(codes), cached=len(codes & have), fetched=saved,
+                    failed=sorted(failed))
+    finally:
+        conn.close()
 
 
 def _fund_name(code: str) -> Optional[str]:
@@ -2659,6 +2749,10 @@ def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
     list_df = fetch_fund_list(force_refresh=True)
     all_codes = list_df["code"].dropna().unique().tolist()
     _p("拉取基金列表", 1, 1)
+    inception = refresh_inception_dates(
+        list_df, progress=lambda done, total: _p("补充成立日期", done, total))
+    logger.info("成立日期：已缓存 %d，本次补充 %d，失败 %d",
+                inception["cached"], inception["fetched"], len(inception["failed"]))
 
     backfilled = 0
     if do_backfill:

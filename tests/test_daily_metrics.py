@@ -6,7 +6,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -48,6 +48,10 @@ class DailyMetricsTests(unittest.TestCase):
         funds["nav"] = funds["acc_nav"] = 1.
         funds["daily_ret"] = 0.
         fetcher._save_fund_list_cache(funds)
+        with contextlib.closing(fetcher._conn()) as c:
+            c.executemany("INSERT INTO fund_inception VALUES (?,?,?,?)",
+                          [(code, "2020-01-01", "fixture", time.time()) for code in ("000001", "000005")])
+            c.commit()
         with patch.object(fetcher, "fetch_fund_list", return_value=funds), \
                 patch.object(fetcher, "_backfill_codes", return_value=0) as backfill:
             result = fetcher.run_pipeline()
@@ -58,6 +62,51 @@ class DailyMetricsTests(unittest.TestCase):
             self.assertEqual(c.execute("SELECT MAX(date) FROM fund_nav_daily WHERE code='000002'")
                              .fetchone()[0], end.strftime("%Y-%m-%d"))
         self.assertEqual(fetcher.scale_universe(), ["000001", "000005"])
+
+    def test_inception_uses_share_class_estabdate_and_rejects_bad_responses(self):
+        response = Mock()
+        response.json.return_value = dict(ErrCode=0, Datas=dict(
+            FCODE="029368", ESTABDATE="2026-10-19", ISSBDATE="2010-08-30"))
+        with patch.object(fetcher.requests, "get", return_value=response):
+            self.assertEqual(fetcher._fetch_fund_inception_date("029368"), "2026-10-19")
+        for data in (dict(FCODE="000001", ESTABDATE="2020-01-01"),
+                     dict(FCODE="029368", ESTABDATE="--"),
+                     dict(FCODE="029368", ESTABDATE="2026-02-30"),
+                     dict(FCODE="029368", ESTABDATE="2999-01-01")):
+            with self.subTest(data=data), patch.object(fetcher.time, "sleep"), \
+                    patch.object(fetcher.requests, "get", return_value=response), \
+                    self.assertLogs(fetcher.logger, level="WARNING"):
+                response.json.return_value = dict(ErrCode=0, Datas=data)
+                self.assertIsNone(fetcher._fetch_fund_inception_date("029368"))
+
+    def test_inception_cache_only_fetches_missing_eligible_c_shares(self):
+        funds = pd.DataFrame([
+            dict(code="000001", name="已缓存混合C", type="混合型"),
+            dict(code="000002", name="新增混合C", type="混合型"),
+            dict(code="000003", name="资产配置C", type="FOF-稳健型"),
+            dict(code="000004", name="测试3个月定开混合C", type="混合型"),
+            dict(code="000005", name="普通混合A", type="混合型"),
+            dict(code="000006", name="待重试混合C", type="混合型"),
+            dict(code="000007", name="测试债券C", type="债券型"),
+            dict(code="000008", name="测试海外C", type="QDII-普通股票"),
+        ])
+        with contextlib.closing(fetcher._conn()) as c:
+            c.execute("INSERT INTO fund_inception VALUES (?,?,?,?)",
+                      ("000001", "2010-01-01", "fixture", time.time()))
+            c.commit()
+        with patch.object(fetcher, "_fetch_fund_inception_date",
+                          side_effect=lambda code: "2026-10-19" if code == "000002" else None) as lookup:
+            result = fetcher.refresh_inception_dates(funds, workers=1)
+            self.assertEqual({call.args[0] for call in lookup.call_args_list}, {"000002", "000006"})
+        self.assertEqual(result, dict(total=3, cached=1, fetched=1, failed=["000006"]))
+        with contextlib.closing(fetcher._conn()) as c:
+            self.assertEqual(c.execute("SELECT inception_date FROM fund_inception WHERE code='000002'")
+                             .fetchone()[0], "2026-10-19")
+            self.assertIsNone(c.execute("SELECT * FROM fund_inception WHERE code='000006'").fetchone())
+        with patch.object(fetcher, "_fetch_fund_inception_date", return_value="2026-01-01") as lookup:
+            retry = fetcher.refresh_inception_dates(funds, workers=1)
+            lookup.assert_called_once_with("000006")
+            self.assertEqual(retry, dict(total=3, cached=2, fetched=1, failed=[]))
 
     def test_short_nav_is_stored_but_calculation_thresholds_are_preserved(self):
         short = self.nav.tail(5).reset_index(drop=True)
