@@ -251,6 +251,8 @@ class CalculationTests(unittest.TestCase):
                                 ("测试海外C", "QDII-普通股票"),
                                 ("嘉实领航资产配置混合C", "FOF-稳健型"),
                                 ("测试混合(FOF-LOF)C", "未知"),
+                                ("红土创新科技创新3个月定开混合C", "混合型-偏股"),
+                                ("测试定期开放混合C", "混合型"),
                                 ("测试一年持有混合C", "混合型")):
             with self.subTest(name=name):
                 path = ROOT / "snapshots" / name
@@ -277,7 +279,14 @@ class CalculationTests(unittest.TestCase):
                 self.assertEqual(json.loads(output.read_text())["chosen"], "000002")
 
     def test_fof_cannot_be_picked_or_filtered_and_probe_explains_exclusion(self):
-        path = ROOT / "snapshots" / "fof-exclusion"
+        self._assert_fund_excluded("嘉实领航资产配置混合C", "FOF-稳健型", "规则排除: FOF基金")
+
+    def test_periodic_fund_cannot_be_picked_or_filtered_and_probe_explains_exclusion(self):
+        self._assert_fund_excluded("红土创新科技创新3个月定开混合C", "混合型-偏股",
+                                   "规则排除: 定开或持有期锁定基金")
+
+    def _assert_fund_excluded(self, name, fund_type, reason):
+        path = ROOT / "snapshots" / ("excluded-" + name)
         path.mkdir()
         for filename in FILES.values():
             shutil.copyfile(PATH / filename, path / filename)
@@ -285,7 +294,7 @@ class CalculationTests(unittest.TestCase):
             funds = json.loads(c.execute("SELECT data FROM fund_list").fetchone()[0])
             for fund in funds:
                 if fund["code"] == "000002":
-                    fund.update(name="嘉实领航资产配置混合C", type="FOF-稳健型")
+                    fund.update(name=name, type=fund_type)
             c.execute("UPDATE fund_list SET data=?", (json.dumps(funds),))
             c.commit()
         asof = today().isoformat()
@@ -303,7 +312,7 @@ class CalculationTests(unittest.TestCase):
                                cwd=Path(__file__).resolve().parents[1])
                 result = json.loads(output.read_text())
                 if operation == "probe":
-                    self.assertEqual(result["rows"][0]["why"], "规则排除: FOF基金")
+                    self.assertEqual(result["rows"][0]["why"], reason)
                     self.assertIsNone(result["rows"][0]["rank"])
                 else:
                     self.assertNotIn("000002", {r["code"] for r in result["rows"]})

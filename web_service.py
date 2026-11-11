@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from web_common import CACHE, CST, FILES, snapshot, today, write_json
 from web_cache import prepared_result
-from fund_rules import is_fof
+from fund_rules import is_fof, is_locked_fund
 
 log = logging.getLogger("fund-web")
 HERE = Path(__file__).resolve().parent
@@ -274,6 +274,7 @@ def status():
         import re
         types = sorted({r.get("type", "") for r in data if r.get("type")
                         and not is_fof(r["type"], r.get("name"))
+                        and not is_locked_fund(r.get("name"))
                         and not re.search("债|固收", r["type"])})
         _status_cache = (path.name, {**manifest["summary"], "types": types,
                                     "version": manifest["version"], "code_version": CODE_VERSION})

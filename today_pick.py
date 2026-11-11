@@ -325,7 +325,8 @@ def probe(asof, codes, res: dict = None) -> list:
         metrics = fetcher.compute_metrics_asof(asof_s, cols={"ret_3m"})
         cand = {c: m["ret_3m"] for c, m in metrics.items()
                 if m.get("ret_3m") is not None
-                and not fetcher.is_fof(types.get(c), names.get(c))}
+                and not fetcher.is_fof(types.get(c), names.get(c))
+                and not B._HOLD_PERIOD_RE.search(names.get(c, ""))}
         ranks = {c: i + 1 for i, c in enumerate(
             sorted((c for c in cand if cand[c] < 0), key=cand.get))}
 
@@ -337,6 +338,10 @@ def probe(asof, codes, res: dict = None) -> list:
             out.append(_row(code, names.get(code, code), None, None, aums.get(code),
                             "规则排除: FOF基金", "", None, None, None))
             continue
+        if B._HOLD_PERIOD_RE.search(names.get(code, "")):
+            out.append(_row(code, names.get(code, code), None, None, aums.get(code),
+                            "规则排除: 定开或持有期锁定基金", "", None, None, None))
+            continue
         r3 = cand.get(code)
         if r3 is None:
             # 「没进池子」要说清是哪一种 —— 这个功能是拿来跟支付宝对账的,
@@ -346,8 +351,6 @@ def probe(asof, codes, res: dict = None) -> list:
                 miss = "榜单里没有这个代码(不是C类/已清盘/代码敲错)"
             elif t and ("QDII" in t or "海外" in t):
                 miss = f"规则排除: {t}(跟踪境外市场)"
-            elif B._HOLD_PERIOD_RE.search(n):
-                miss = "规则排除: 名称含持有期锁定"
             elif fetcher.is_bond(t or ""):
                 miss = f"规则排除: 债券类({t})"
             else:

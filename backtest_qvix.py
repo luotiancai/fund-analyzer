@@ -22,6 +22,7 @@ from datetime import timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fetcher
 import qvix_calc
+from fund_rules import HOLD_PERIOD_RE
 
 # 数据分成若干独立的库(见 fetcher.DB_LAYOUT), 连接统一走 fetcher._conn():
 # 它把各库 ATTACH 到一个连接上, 不带库名的表名照常解析, 所以下面的 SQL
@@ -324,11 +325,8 @@ NAV_ANOMALIES = {
 # (?<![-\d]) 是防误伤: "嘉实彭博国开债1-5年指数""国寿安保中债1-3年指数"
 # 这类是**久期区间**命名的债券指数基金, 不是持有期基金, 排除掉数字前面是
 # 连字符或数字的情况后, 区间写法的误伤降到 0。类型词也不含"指数", 同理。
-_HOLD_PERIOD_RE = re.compile(
-    r"(\d+|[一二两三四五六七八九十]+)\s*(年|个月|月|天)(滚动)?持有"
-    r"|持有期|定期开放|封闭式|封闭运作|滚动持有"
-    r"|(?<![-\d])(\d+|[一二两三四五六七八九十]+)\s*(年|个月|月|天)\s*"
-    r"(混合|股票|债券|债)")
+# 与网页筛选共用；简称中的“定开”也属于赎回受限基金。
+_HOLD_PERIOD_RE = HOLD_PERIOD_RE
 
 # 港股/沪港深/恒生指数系列基金一度被排除(理由是"跟踪境外市场,与
 # QVIX/大盘恐慌-反弹逻辑脱钩",套用QDII基金的排除逻辑),2026-07-24

@@ -11,6 +11,7 @@ import time
 
 from web_common import CACHE, FILES, write_json
 from web_cache import lookup_cache, prepared_result
+from fund_rules import is_locked_fund
 
 
 def clean(value):
@@ -159,7 +160,8 @@ def filter_funds(fetcher, funds, connection, args):
                 work[col] = pd.to_numeric(work[col], errors="coerce").fillna(
                     pd.to_numeric(work[col + "_list"], errors="coerce"))
     work = work[~work["type"].fillna("").map(fetcher.is_bond)]
-    work = work.loc[[not fetcher.is_fof(t, n) for t, n in zip(work["type"], work["name"])]]
+    work = work.loc[[not fetcher.is_fof(t, n) and not is_locked_fund(n)
+                     for t, n in zip(work["type"], work["name"])]]
     if args["types"]:
         work = work[work["type"].isin(args["types"])]
     first = fetcher.nav_first_dates()
