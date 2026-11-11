@@ -59,6 +59,26 @@ class DailyMetricsTests(unittest.TestCase):
                              .fetchone()[0], end.strftime("%Y-%m-%d"))
         self.assertEqual(fetcher.scale_universe(), ["000001", "000005"])
 
+    def test_short_nav_is_stored_but_calculation_thresholds_are_preserved(self):
+        short = self.nav.tail(5).reset_index(drop=True)
+        with patch.object(fetcher, "_fetch_nav_full", return_value=short) as download:
+            # Existing callers still require 20 points; storage keeps all 5.
+            self.assertIsNone(fetcher.fetch_nav("000003"))
+            self.assertEqual(len(fetcher._load_nav_df("000003")), 5)
+            self.assertEqual(len(fetcher.fetch_nav("000003", min_points=1)), 5)
+            download.assert_called_once_with("000003")
+        self.assertIsNone(fetcher._metrics_from_nav(short))
+        asof = (short["date"].iloc[-1] + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        self.assertNotIn("000003", fetcher.compute_metrics_asof(asof, cols={"ret_3m"}))
+        self.assertNotIn("000003", fetcher.compute_metrics_asof(
+            asof, cols={"ret_3m", "mdd_3m"}, low_memory=True))
+
+    def test_backfill_counts_short_history_as_saved(self):
+        short = self.nav.tail(3).reset_index(drop=True)
+        with patch.object(fetcher, "_fetch_nav_full", return_value=short):
+            self.assertEqual(fetcher._backfill_codes(["000003"], workers=1), 1)
+        self.assertEqual(len(fetcher._load_nav_df("000003")), 3)
+
     def test_comparison_pool_excludes_fof_by_type_or_name(self):
         import pct_rank
         funds = [dict(code="000001", name="嘉实领航资产配置混合C", type="FOF-稳健型"),

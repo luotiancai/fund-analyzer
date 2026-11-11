@@ -160,12 +160,12 @@ class CalculationTests(unittest.TestCase):
         import web_sync
 
         asof = today().isoformat()
-        cases = [(kind, offset) for kind in ("negative", "positive", "no-return")
-                 for offset in (0, 20)] + [("no-history", 0)]
+        cases = [(kind, offset) for kind in ("negative", "positive")
+                 for offset in (0, 20)] + [("no-return", 0), ("no-history", 0)]
         for kind, offset in cases:
             with self.subTest(kind=kind, offset=offset):
                 label = f"{kind}-{offset}"
-                code = "000005" if kind == "no-return" else "000003"
+                code = "000003"
                 path = ROOT / "snapshots" / f"partial-nav-{label}"
                 path.mkdir()
                 for filename in FILES.values():
@@ -180,6 +180,11 @@ class CalculationTests(unittest.TestCase):
                                     "ORDER BY date DESC LIMIT 1 OFFSET ?", (code, offset)).fetchone()[0]
                     if kind == "no-history":
                         c.execute("DELETE FROM fund_nav_daily WHERE code=?", (code,))
+                    elif kind == "no-return":
+                        # Old enough for the window, but too sparse to calculate.
+                        c.execute("DELETE FROM fund_nav_daily WHERE code=? AND date NOT IN "
+                                  "(SELECT date FROM fund_nav_daily WHERE code=? ORDER BY date LIMIT 19)",
+                                  (code, code))
                     else:
                         c.execute("DELETE FROM fund_nav_daily WHERE code=? AND date=?", (code, gap))
                     c.commit()
@@ -201,13 +206,45 @@ class CalculationTests(unittest.TestCase):
                 self.assertNotEqual(process.returncode, 0)
                 error = process.stderr.strip().splitlines()[-1]
                 self.assertIn("基金近3个月净值不完整", error)
-                if kind != "no-history":
+                if kind not in ("no-history", "no-return"):
                     self.assertIn(f"缺少 {gap} 的净值", error)
                 self.assertNotIn(code, error)
                 self.assertFalse(output.exists())
                 self.assertIsNone(prepared_result(path, version, "pick", {"asof": asof}))
                 self.assertIsNone(prepared_result(path, version, "probe",
                                                   {"asof": asof, "codes": [code]}))
+
+    def test_short_history_does_not_block_or_enter_pick_ranking(self):
+        path = ROOT / "snapshots" / "short-nav"
+        path.mkdir()
+        for filename in FILES.values():
+            shutil.copyfile(PATH / filename, path / filename)
+        with contextlib.closing(sqlite3.connect(path / FILES["nav"])) as c:
+            end = pd.Timestamp(c.execute("SELECT MAX(date) FROM fund_nav_daily").fetchone()[0])
+            start = (end - pd.Timedelta(days=85)).strftime("%Y-%m-%d")
+            c.execute("DELETE FROM fund_nav_daily WHERE code='000003' AND date<?", (start,))
+            c.execute("UPDATE fund_nav_daily SET daily_ret_pct=-0.2 WHERE code='000003'")
+            c.commit()
+        args = {"asof": today().isoformat()}
+        request, output = ROOT / "short-nav-request.json", ROOT / "short-nav-result.json"
+        write_json(request, dict(snapshot=str(path), operation="probe", args={**args, "codes": ["000003"]}))
+        subprocess.run([sys.executable, "web_tasks.py", str(request), str(output)],
+                       check=True, capture_output=True, timeout=15,
+                       cwd=Path(__file__).resolve().parents[1])
+        row = json.loads(output.read_text())["rows"][0]
+        self.assertIsNone(row["rank"])
+        self.assertIsNone(row["ret3m"])
+        # The 30-point young fixture is skipped even when it has a missing day.
+        with contextlib.closing(sqlite3.connect(path / FILES["nav"])) as c:
+            c.execute("DELETE FROM fund_nav_daily WHERE code='000005' AND date=?", (end.strftime("%Y-%m-%d"),))
+            c.commit()
+        write_json(request, dict(snapshot=str(path), operation="pick", args=args))
+        subprocess.run([sys.executable, "web_tasks.py", str(request), str(output)],
+                       check=True, capture_output=True, timeout=15,
+                       cwd=Path(__file__).resolve().parents[1])
+        result = json.loads(output.read_text())
+        self.assertEqual(result["chosen"], "000002")
+        self.assertNotIn("000003", {r["code"] for r in result["rows"]})
 
     def test_pick_only_checks_eligible_c_class_funds(self):
         for name, fund_type in (("测试混合A", "混合型"), ("测试债券C", "债券型"),

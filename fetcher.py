@@ -1097,11 +1097,12 @@ def refresh_scale_hist(codes: Optional[list] = None,
     return fetched
 
 
-def fetch_nav(code: str) -> Optional[pd.DataFrame]:
+def fetch_nav(code: str, min_points: int = 20) -> Optional[pd.DataFrame]:
     """Return NAV history since NAV_START for a single fund (cache-first).
 
     Serves stored rows while fresh (< NAV_TTL); otherwise downloads the whole
-    history in one pingzhongdata request and stores it row-per-day.
+    history in one pingzhongdata request and stores it row-per-day, even when
+    short. The default return threshold stays at 20; batch backfill uses 1.
     Columns: date, nav, daily_ret_pct, acc_nav
     """
     conn = _conn()
@@ -1110,17 +1111,17 @@ def fetch_nav(code: str) -> Optional[pd.DataFrame]:
     if meta and (time.time() - meta["saved_at"]) < NAV_TTL:
         df = _load_nav_df(code, conn)
         conn.close()
-        return df if len(df) >= 20 else None
+        return df if len(df) >= min_points else None
     conn.close()
 
     df = _fetch_nav_full(code)
-    if df is None or len(df) < 20:
+    if df is None or df.empty:
         return None
     conn = _conn()
     _write_nav_rows(conn, code, df)
     conn.commit()
     conn.close()
-    return df
+    return df if len(df) >= min_points else None
 
 
 # ── 指标计算 ──────────────────────────────────────────────────────────────────
@@ -2627,7 +2628,7 @@ def _backfill_codes(codes: list, workers: int = MAX_WORKERS,
     if not codes:
         return 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(fetch_nav, c): c for c in codes}
+        futures = {ex.submit(fetch_nav, c, min_points=1): c for c in codes}
         for fut in as_completed(futures):
             done += 1
             try:

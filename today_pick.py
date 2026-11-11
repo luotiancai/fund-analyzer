@@ -187,20 +187,23 @@ def _require_complete_nav(conn, trading_dates, need_date, codes):
         raise IncompleteNavError("交易日历未覆盖完整的近3个月窗口，已停止本次选基。")
     required = set(trading_dates[trading_dates.between(anchor, need_date)].dt.strftime("%Y-%m-%d"))
     start_s, end_s = anchor.date().isoformat(), need_date.date().isoformat()
+    eligible = set()
     for code in codes:
+        first_nav = conn.execute("SELECT MIN(date) FROM fund_nav_daily WHERE code=?",
+                                 (code,)).fetchone()[0]
+        # 尚未积累完整的近3月历史，不参与排名，也不因窗口不足阻断整批。
+        # 完全没有净值的基金仍报错，不能把抓取失败默认为新基金。
+        if first_nav is not None and first_nav > start_s:
+            continue
         available = {row["date"] for row in conn.execute(
             "SELECT date FROM fund_nav_daily WHERE code=? AND date BETWEEN ? AND ? AND nav IS NOT NULL",
             (code, start_s, end_s))}
         gaps = required - available
         if gaps:
-            # 基金成立前没有应披露的净值。较老基金仍检查窗口内的首个锚点。
-            first_nav = conn.execute("SELECT MIN(date) FROM fund_nav_daily WHERE code=?",
-                                     (code,)).fetchone()[0]
-            missing_day = min((day for day in gaps if first_nav is None or day >= first_nav),
-                              default=None)
-            if missing_day is not None:
-                raise IncompleteNavError(
-                    f"基金近3个月净值不完整，缺少 {missing_day} 的净值，已停止本次选基。")
+            raise IncompleteNavError(
+                f"基金近3个月净值不完整，缺少 {min(gaps)} 的净值，已停止本次选基。")
+        eligible.add(code)
+    return eligible
 
 
 def scan(asof, top: int = 40) -> dict:
@@ -250,14 +253,14 @@ def scan(asof, top: int = 40) -> dict:
                    if c not in exclude and fetcher.is_c_class(n)
                    and not fetcher.is_overseas_equity(types[c])
                    and not fetcher.is_bond(types[c]))
-    _require_complete_nav(conn, sse["date"], need_date, codes)
+    eligible = _require_complete_nav(conn, sse["date"], need_date, codes)
     if thr is None or pd.isna(thr):
         return out
 
     asof_s = asof.strftime("%Y-%m-%d")
     metrics = fetcher.compute_metrics_asof(asof_s, cols={"ret_3m"})
     cand = {c: m["ret_3m"] for c, m in metrics.items()
-            if m.get("ret_3m") is not None and c not in exclude}
+            if m.get("ret_3m") is not None and c in eligible}
     if not cand:
         return out
     # 跌幅榜名次: 分母是「真跌」的那批(跟策略的遍历顺序同一个序列), 不含
