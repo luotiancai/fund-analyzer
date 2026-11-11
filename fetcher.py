@@ -1335,6 +1335,18 @@ def _fetch_fund_inception_date(code: str) -> Optional[str]:
     return None
 
 
+def fund_inception_dates(conn=None) -> dict:
+    """Read persisted share-class inception dates without network requests."""
+    own = conn is None
+    conn = _conn() if own else conn
+    try:
+        return {row["code"]: row["inception_date"] for row in conn.execute(
+            "SELECT code,inception_date FROM fund_inception")}
+    finally:
+        if own:
+            conn.close()
+
+
 def refresh_inception_dates(list_df=None, workers: int = 4,
                             progress: Optional[Callable] = None) -> dict:
     """Cache missing share-class inception dates for the eligible C-class pool."""

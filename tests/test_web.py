@@ -47,6 +47,8 @@ def fixture():
                 for d, n, r in zip(days, nav, returns)]
         c.executemany("INSERT INTO fund_nav_daily VALUES (?,?,?,?,?)", rows)
         c.execute("INSERT INTO fund_nav_meta VALUES (?,?,?)", (code, time.time(), days[-1].strftime("%Y-%m-%d")))
+        c.execute("INSERT INTO fund_inception VALUES (?,?,?,?)",
+                  (code, days[0].strftime("%Y-%m-%d"), "fixture", time.time()))
         funds.append(dict(code=code, name=f"测试{i}混合C", type="债券型" if i == 2 else "混合型",
                           nav=float(nav[-1]), nav_date=dates[-1].strftime("%Y-%m-%d"),
                           ret_1m=2, ret_3m=3, ret_6m=4, ret_1y=5))
@@ -225,6 +227,9 @@ class CalculationTests(unittest.TestCase):
             c.execute("DELETE FROM fund_nav_daily WHERE code='000003' AND date<?", (start,))
             c.execute("UPDATE fund_nav_daily SET daily_ret_pct=-0.2 WHERE code='000003'")
             c.commit()
+        with contextlib.closing(sqlite3.connect(path / FILES["rank"])) as c:
+            c.execute("UPDATE fund_inception SET inception_date=? WHERE code='000003'", (start,))
+            c.commit()
         args = {"asof": today().isoformat()}
         request, output = ROOT / "short-nav-request.json", ROOT / "short-nav-result.json"
         write_json(request, dict(snapshot=str(path), operation="probe", args={**args, "codes": ["000003"]}))
@@ -245,6 +250,45 @@ class CalculationTests(unittest.TestCase):
         result = json.loads(output.read_text())
         self.assertEqual(result["chosen"], "000002")
         self.assertNotIn("000003", {r["code"] for r in result["rows"]})
+
+    def test_age_filter_uses_inception_before_checking_nav_and_keeps_errors_for_mature_funds(self):
+        asof = today().isoformat()
+        boundary = pd.Timestamp(asof) - pd.DateOffset(months=6)
+        for kind in ("young", "mature", "unknown"):
+            with self.subTest(kind=kind):
+                path = ROOT / "snapshots" / ("age-" + kind)
+                path.mkdir()
+                for filename in FILES.values():
+                    shutil.copyfile(PATH / filename, path / filename)
+                with contextlib.closing(sqlite3.connect(path / FILES["rank"])) as c:
+                    if kind == "unknown":
+                        c.execute("DELETE FROM fund_inception WHERE code='000003'")
+                    else:
+                        inception = boundary + pd.Timedelta(days=1 if kind == "young" else 0)
+                        c.execute("UPDATE fund_inception SET inception_date=? WHERE code='000003'",
+                                  (inception.strftime("%Y-%m-%d"),))
+                    c.commit()
+                with contextlib.closing(sqlite3.connect(path / FILES["nav"])) as c:
+                    gap = c.execute("SELECT date FROM fund_nav_daily WHERE code='000003' "
+                                    "ORDER BY date DESC LIMIT 1 OFFSET 20").fetchone()[0]
+                    c.execute("DELETE FROM fund_nav_daily WHERE code='000003' AND date=?", (gap,))
+                    c.commit()
+                request, output = ROOT / f"age-{kind}.json", ROOT / f"age-{kind}-out.json"
+                write_json(request, dict(snapshot=str(path), operation="pick", args={"asof": asof}))
+                process = subprocess.run([sys.executable, "web_tasks.py", str(request), str(output)],
+                                         capture_output=True, text=True, timeout=15,
+                                         cwd=Path(__file__).resolve().parents[1])
+                if kind == "young":
+                    self.assertEqual(process.returncode, 0, process.stderr)
+                    result = json.loads(output.read_text())
+                    self.assertEqual(result["chosen"], "000002")
+                    self.assertEqual(result["min_age_months"], 6)
+                    self.assertNotIn("000003", {r["code"] for r in result["rows"]})
+                else:
+                    self.assertNotEqual(process.returncode, 0)
+                    self.assertFalse(output.exists())
+                    self.assertIn("成立日期尚未同步" if kind == "unknown" else f"缺少 {gap} 的净值",
+                                  process.stderr)
 
     def test_pick_only_checks_eligible_c_class_funds(self):
         for name, fund_type in (("测试混合A", "混合型"), ("测试债券C", "债券型"),

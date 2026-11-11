@@ -1,6 +1,18 @@
 """Fund classifications shared by batch jobs and the lightweight web reader."""
 
 import re
+from calendar import monthrange
+from datetime import date
+
+MIN_FUND_AGE_MONTHS = 6
+
+
+def fund_maturity_date(inception_date: str) -> str:
+    """Six calendar months after inception, with month-end dates clamped."""
+    founded = date.fromisoformat(inception_date)
+    year, month = divmod(founded.year * 12 + founded.month - 1 + MIN_FUND_AGE_MONTHS, 12)
+    month += 1
+    return date(year, month, min(founded.day, monthrange(year, month)[1])).isoformat()
 
 
 HOLD_PERIOD_RE = re.compile(

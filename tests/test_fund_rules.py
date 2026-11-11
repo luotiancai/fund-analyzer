@@ -1,9 +1,17 @@
 import unittest
 
-from fund_rules import is_fof, is_locked_fund
+from fund_rules import is_fof, is_locked_fund, fund_maturity_date
 
 
 class FundRulesTests(unittest.TestCase):
+    def test_six_calendar_month_anniversary(self):
+        for inception, mature in (("2026-05-11", "2026-11-11"),
+                                   ("2026-05-12", "2026-11-12"),
+                                   ("2025-08-31", "2026-02-28"),
+                                   ("2023-08-31", "2024-02-29")):
+            with self.subTest(inception=inception):
+                self.assertEqual(fund_maturity_date(inception), mature)
+
     def test_periodic_and_holding_funds_are_excluded_without_matching_duration_indices(self):
         for name, expected in (
             ("红土创新科技创新3个月定开混合C", True),

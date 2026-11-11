@@ -43,6 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backtest_qvix as B      # noqa: E402
 import fetcher                 # noqa: E402
 import qvix_calc               # noqa: E402
+from fund_rules import MIN_FUND_AGE_MONTHS, fund_maturity_date
 
 def _std_params():
     """标准策略的参数, **直接读 run_backtest 的签名默认值**。
@@ -179,6 +180,14 @@ def _gates(conn, sse, code, asof_s, aum):
     return None, beta, aum
 
 
+def _mature_codes(conn, codes, asof):
+    dates = fetcher.fund_inception_dates(conn)
+    if any(code not in dates for code in codes):
+        raise IncompleteNavError("基金成立日期尚未同步完整，已停止本次选基。")
+    asof_s = pd.Timestamp(asof).strftime("%Y-%m-%d")
+    return {code for code in codes if fund_maturity_date(dates[code]) <= asof_s}
+
+
 def _require_complete_nav(conn, trading_dates, need_date, codes):
     """按 T-1 对齐校验, 避免缺净值的基金把整个检查窗口往前挪。"""
     start_limit = need_date - pd.Timedelta(days=fetcher.RETURN_DAYS["ret_3m"])
@@ -189,12 +198,7 @@ def _require_complete_nav(conn, trading_dates, need_date, codes):
     start_s, end_s = anchor.date().isoformat(), need_date.date().isoformat()
     eligible = set()
     for code in codes:
-        first_nav = conn.execute("SELECT MIN(date) FROM fund_nav_daily WHERE code=?",
-                                 (code,)).fetchone()[0]
-        # 尚未积累完整的近3月历史，不参与排名，也不因窗口不足阻断整批。
-        # 完全没有净值的基金仍报错，不能把抓取失败默认为新基金。
-        if first_nav is not None and first_nav > start_s:
-            continue
+        # 进入此处的基金已成立满6个月，窗口不足也属于缺失，不能再静默跳过。
         available = {row["date"] for row in conn.execute(
             "SELECT date FROM fund_nav_daily WHERE code=? AND date BETWEEN ? AND ? AND nav IS NOT NULL",
             (code, start_s, end_s))}
@@ -244,6 +248,7 @@ def scan(asof, top: int = 40) -> dict:
            "nav_max": nav_max, "sse_max": sse_max, "behind": behind,
            "need_date": need_date, "missing": missing,
            "std": STD, "rows": [], "too_deep": 0, "chosen": None,
+           "min_age_months": MIN_FUND_AGE_MONTHS,
            "fund_line": None, "sse_line": None, "names": names}
     if need_date is None or missing:
         return out
@@ -253,7 +258,9 @@ def scan(asof, top: int = 40) -> dict:
                    if c not in exclude and fetcher.is_c_class(n)
                    and not fetcher.is_overseas_equity(types[c])
                    and not fetcher.is_bond(types[c]))
-    eligible = _require_complete_nav(conn, sse["date"], need_date, codes)
+    mature = _mature_codes(conn, codes, asof)
+    out["excluded_young"] = len(codes) - len(mature)
+    eligible = _require_complete_nav(conn, sse["date"], need_date, sorted(mature))
     if thr is None or pd.isna(thr):
         return out
 
@@ -319,12 +326,15 @@ def probe(asof, codes, res: dict = None) -> list:
     sse = sse.sort_values("date").reset_index(drop=True)
 
     asof_s = pd.Timestamp(asof).strftime("%Y-%m-%d")
+    inception = fetcher.fund_inception_dates(conn)
+    mature = {code for code, date in inception.items() if fund_maturity_date(date) <= asof_s}
     cand = (res or {}).get("cand")
     ranks = (res or {}).get("ranks")
     if cand is None:
         metrics = fetcher.compute_metrics_asof(asof_s, cols={"ret_3m"})
         cand = {c: m["ret_3m"] for c, m in metrics.items()
                 if m.get("ret_3m") is not None
+                and c in mature
                 and not fetcher.is_fof(types.get(c), names.get(c))
                 and not B._HOLD_PERIOD_RE.search(names.get(c, ""))}
         ranks = {c: i + 1 for i, c in enumerate(
@@ -341,6 +351,10 @@ def probe(asof, codes, res: dict = None) -> list:
         if B._HOLD_PERIOD_RE.search(names.get(code, "")):
             out.append(_row(code, names.get(code, code), None, None, aums.get(code),
                             "规则排除: 定开或持有期锁定基金", "", None, None, None))
+            continue
+        if code in inception and code not in mature:
+            out.append(_row(code, names.get(code, code), None, None, aums.get(code),
+                            "成立未满6个月，暂不参与选基", "", None, None, None))
             continue
         r3 = cand.get(code)
         if r3 is None:
