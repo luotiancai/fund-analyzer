@@ -58,7 +58,7 @@ NAV_ANOMALIES = {
 # aum_basis="merged") +
 # 近3月跌幅不超过30%(max_drop=30.0, 2026-08-12 加, 见该参数说明) +
 # 跌幅耗尽(没有真正跌过的合格候选)就放弃当天、顺延到下一个信号日 +
-# 排除QDII/海外/持有期锁定基金
+# 排除QDII/海外/FOF/持有期锁定基金
 # (港股通/沪港深/恒生系列不再排除, 见 _HK_RE 定义处说明), 命令:
 #   python3 backtest_qvix.py
 # (以上全部是当前 run_backtest 的默认值, 不用额外传参——含 window=490/
@@ -901,7 +901,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     # 跟上证相关系数常年0.4~0.74,"脱钩"假设不成立,2026-07-24撤销这条)
     # 有持有期锁定的基金也排除(见 _HOLD_PERIOD_RE 定义处说明)
     hold_codes = {c for c, n in fund_names.items() if _HOLD_PERIOD_RE.search(n)}
-    exclude_codes = qdii_codes | hold_codes
+    fof_codes = {c for c, t in fund_types.items() if fetcher.is_fof(t, fund_names[c])}
+    exclude_codes = qdii_codes | hold_codes | fof_codes
 
     # Load QVIX —— 自算(qvix_self_history,上交所官方期权风险指标反推,
     # 不再是 optbbs 的 index_daily_cache)。阈值按传入的 window/pct 现算,

@@ -212,6 +212,8 @@ class CalculationTests(unittest.TestCase):
     def test_pick_only_checks_eligible_c_class_funds(self):
         for name, fund_type in (("测试混合A", "混合型"), ("测试债券C", "债券型"),
                                 ("测试海外C", "QDII-普通股票"),
+                                ("嘉实领航资产配置混合C", "FOF-稳健型"),
+                                ("测试混合(FOF-LOF)C", "未知"),
                                 ("测试一年持有混合C", "混合型")):
             with self.subTest(name=name):
                 path = ROOT / "snapshots" / name
@@ -236,6 +238,40 @@ class CalculationTests(unittest.TestCase):
                                check=True, capture_output=True, timeout=15,
                                cwd=Path(__file__).resolve().parents[1])
                 self.assertEqual(json.loads(output.read_text())["chosen"], "000002")
+
+    def test_fof_cannot_be_picked_or_filtered_and_probe_explains_exclusion(self):
+        path = ROOT / "snapshots" / "fof-exclusion"
+        path.mkdir()
+        for filename in FILES.values():
+            shutil.copyfile(PATH / filename, path / filename)
+        with contextlib.closing(sqlite3.connect(path / FILES["rank"])) as c:
+            funds = json.loads(c.execute("SELECT data FROM fund_list").fetchone()[0])
+            for fund in funds:
+                if fund["code"] == "000002":
+                    fund.update(name="嘉实领航资产配置混合C", type="FOF-稳健型")
+            c.execute("UPDATE fund_list SET data=?", (json.dumps(funds),))
+            c.commit()
+        asof = today().isoformat()
+        cases = [("pick", {"asof": asof}),
+                 ("probe", {"asof": asof, "codes": ["000002"]})]
+        for day in (asof, (today() - pd.Timedelta(days=7)).isoformat()):
+            cases.append(("filter", dict(asof=day, period="3m", types=[],
+                                         min_ret=None, max_dd=None, min_aum=0)))
+        for i, (operation, args) in enumerate(cases):
+            with self.subTest(operation=operation, asof=args["asof"]):
+                request, output = ROOT / f"fof-{i}-request.json", ROOT / f"fof-{i}-result.json"
+                write_json(request, dict(snapshot=str(path), operation=operation, args=args))
+                subprocess.run([sys.executable, "web_tasks.py", str(request), str(output)],
+                               check=True, capture_output=True, timeout=15,
+                               cwd=Path(__file__).resolve().parents[1])
+                result = json.loads(output.read_text())
+                if operation == "probe":
+                    self.assertEqual(result["rows"][0]["why"], "规则排除: FOF基金")
+                    self.assertIsNone(result["rows"][0]["rank"])
+                else:
+                    self.assertNotIn("000002", {r["code"] for r in result["rows"]})
+                    if operation == "pick":
+                        self.assertNotEqual(result["chosen"], "000002")
 
     def test_download_failure_preserves_current_generation(self):
         import web_sync

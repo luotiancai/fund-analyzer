@@ -21,12 +21,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from web_common import CACHE, CST, FILES, snapshot, today, write_json
 from web_cache import prepared_result
+from fund_rules import is_fof
 
 log = logging.getLogger("fund-web")
 HERE = Path(__file__).resolve().parent
 WORKER = HERE / "web_tasks.py"
 CODE_VERSION = hashlib.sha256(b"".join((HERE / name).read_bytes() for name in (
-    "web_service.py", "web_tasks.py", "web_cache.py", "fetcher.py", "today_pick.py", "backtest_qvix.py"))).hexdigest()[:16]
+    "web_service.py", "web_tasks.py", "web_cache.py", "fetcher.py", "today_pick.py", "backtest_qvix.py",
+    "fund_rules.py"))).hexdigest()[:16]
 JOB_TIMEOUT = int(os.environ.get("FUND_WEB_JOB_TIMEOUT", "240"))
 
 
@@ -271,6 +273,7 @@ def status():
             data = json.loads(c.execute("SELECT data FROM fund_list WHERE id=1").fetchone()[0])
         import re
         types = sorted({r.get("type", "") for r in data if r.get("type")
+                        and not is_fof(r["type"], r.get("name"))
                         and not re.search("债|固收", r["type"])})
         _status_cache = (path.name, {**manifest["summary"], "types": types,
                                     "version": manifest["version"], "code_version": CODE_VERSION})

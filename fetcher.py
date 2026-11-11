@@ -14,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+from fund_rules import is_fof
+
 import pandas as pd
 import requests
 import socket
@@ -1033,12 +1035,15 @@ def scale_universe() -> list:
         row = conn.execute("SELECT data FROM fund_list WHERE id = 1").fetchone()
         conn.close()
         if row:
-            df = pd.DataFrame(json.loads(row["data"]))
+            items = json.loads(row["data"])
+            df = pd.DataFrame(items)
+            fof_codes = {r["code"] for r in items
+                         if is_fof(r.get("type"), r.get("name"))}
             if "type" in df.columns:
                 df = df[~df["type"].map(is_bond)]
             codes = {str(c).zfill(6) for c in df["code"].dropna()}
             if codes:
-                return sorted(codes | list_nav_codes())
+                return sorted((codes | list_nav_codes()) - fof_codes)
     except Exception as e:
         logger.warning("scale_universe fell back to NAV codes: %s", e)
     return sorted(list_nav_codes())
@@ -2301,6 +2306,9 @@ def append_incremental(list_df: pd.DataFrame,
             skipped += 1
             continue
         row = latest.loc[code]
+        if is_fof(row.get("type"), row.get("name")):
+            skipped += 1
+            continue
         new_date = pd.to_datetime(row["nav_date"], errors="coerce")
         nav = pd.to_numeric(row["nav"], errors="coerce")
         if pd.isna(new_date) or pd.isna(nav):
@@ -2341,6 +2349,11 @@ def recompute_all(progress_callback: Optional[Callable] = None) -> int:
     """
     conn = _conn()
     codes = [r["code"] for r in conn.execute("SELECT code FROM fund_nav_meta").fetchall()]
+    row = conn.execute("SELECT data FROM fund_list WHERE id=1").fetchone()
+    if row:
+        fof_codes = {r["code"] for r in json.loads(row["data"])
+                     if is_fof(r.get("type"), r.get("name"))}
+        codes = [c for c in codes if c not in fof_codes]
     total, done, saved = len(codes), 0, 0
     for code in codes:
         done += 1
@@ -2649,7 +2662,7 @@ def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
     backfilled = 0
     if do_backfill:
         have = list_nav_codes()
-        # Only C-class, non-overseas-equity shares get a NAV history; without
+        # Only C-class, non-overseas-equity, non-FOF shares get NAV history; without
         # this filter every fund cleaned out of the DB (non-C, QDII/海外股)
         # would be re-downloaded daily.
         meta = list_df.dropna(subset=["code"]).drop_duplicates("code") \
@@ -2659,6 +2672,7 @@ def run_pipeline(progress: Optional[Callable] = None, do_backfill: bool = True,
         todo = [c for c in all_codes
                 if c not in have and is_c_class(names.get(c))
                 and not is_overseas_equity(types.get(c))
+                and not is_fof(types.get(c), names.get(c))
                 and not is_bond(types.get(c))]
         backfilled = _backfill_codes(
             todo, workers, lambda d, t: _p("回填缺失历史", d, t)

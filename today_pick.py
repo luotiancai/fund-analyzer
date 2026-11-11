@@ -220,6 +220,7 @@ def scan(asof, top: int = 40) -> dict:
         names[c] = it.get("name") or c
         types[c] = it.get("type") or ""
     exclude = ({c for c, t in types.items() if ("QDII" in t or "海外" in t)}
+               | {c for c, t in types.items() if fetcher.is_fof(t, names[c])}
                | {c for c, n in names.items() if B._HOLD_PERIOD_RE.search(n)})
 
     sse = B.load_cached_json(conn, "sse")
@@ -320,7 +321,8 @@ def probe(asof, codes, res: dict = None) -> list:
     if cand is None:
         metrics = fetcher.compute_metrics_asof(asof_s, cols={"ret_3m"})
         cand = {c: m["ret_3m"] for c, m in metrics.items()
-                if m.get("ret_3m") is not None}
+                if m.get("ret_3m") is not None
+                and not fetcher.is_fof(types.get(c), names.get(c))}
         ranks = {c: i + 1 for i, c in enumerate(
             sorted((c for c in cand if cand[c] < 0), key=cand.get))}
 
@@ -328,6 +330,10 @@ def probe(asof, codes, res: dict = None) -> list:
     aums = fetcher.funds_aum_asof(codes, asof_s, merge_classes=True)
     out = []
     for code in codes:
+        if fetcher.is_fof(types.get(code), names.get(code)):
+            out.append(_row(code, names.get(code, code), None, None, aums.get(code),
+                            "规则排除: FOF基金", "", None, None, None))
+            continue
         r3 = cand.get(code)
         if r3 is None:
             # 「没进池子」要说清是哪一种 —— 这个功能是拿来跟支付宝对账的,

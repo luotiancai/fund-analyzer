@@ -20,8 +20,8 @@
     根本不会买的迷你基金没有意义, 而且那批基金的净值本身就不可信(015111
     惠升领先优选 2024-03-28 单日 +20.18%, 而它当季末净资产只剩 100 万,
     那 20% 是 93% 份额被短期赎回、赎回费分摊给剩下 7% 造成的);
-  · 另排除三类**这笔交易本身不成立**的标的 —— QDII/海外(跟QVIX恐慌-反弹
-    逻辑脱钩, 策略一贯排除)、持有期锁定(赎不出来, 止损卖不掉)、净值僵化-
+  · 另排除**这笔交易本身不成立**的标的 —— QDII/海外(跟QVIX恐慌-反弹
+    逻辑脱钩, 策略一贯排除)、FOF(净值披露滞后)、持有期锁定(赎不出来, 止损卖不掉)、净值僵化-
     补涨(脏数据);
   · 其余**不设**条件: 不要求真跌、无跌幅上限、无波动率门槛、无规模上限。
   · 每只候选都用**它自己的**双止损线(基金线=当日阈值/5×自身波动率比值,
@@ -54,6 +54,7 @@ def _pool_universe(conn):
         names[c] = it.get("name") or c
         types[c] = it.get("type") or ""
     exclude = ({c for c, t in types.items() if ("QDII" in t or "海外" in t)}
+               | {c for c, t in types.items() if fetcher.is_fof(t, names[c])}
                | {c for c, n in names.items() if B._HOLD_PERIOD_RE.search(n)})
     return names, types, exclude
 

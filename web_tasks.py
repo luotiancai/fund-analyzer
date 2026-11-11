@@ -159,6 +159,7 @@ def filter_funds(fetcher, funds, connection, args):
                 work[col] = pd.to_numeric(work[col], errors="coerce").fillna(
                     pd.to_numeric(work[col + "_list"], errors="coerce"))
     work = work[~work["type"].fillna("").map(fetcher.is_bond)]
+    work = work.loc[[not fetcher.is_fof(t, n) for t, n in zip(work["type"], work["name"])]]
     if args["types"]:
         work = work[work["type"].isin(args["types"])]
     first = fetcher.nav_first_dates()

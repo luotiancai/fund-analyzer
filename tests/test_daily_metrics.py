@@ -1,5 +1,6 @@
 """Batch storage omits annualization; detail calculations keep it on demand."""
 import contextlib
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -33,6 +34,39 @@ class DailyMetricsTests(unittest.TestCase):
             fetcher._write_nav_rows(c, "000001", self.nav)
             fetcher._write_nav_rows(c, "000002", self.flat)
             c.commit()
+
+    def test_daily_pipeline_skips_new_and_stored_fof_funds(self):
+        end = self.nav["date"].iloc[-1]
+        funds = pd.DataFrame([
+            dict(code="000001", name="普通混合C", type="混合型"),
+            dict(code="000002", name="嘉实领航资产配置混合C", type="FOF-稳健型"),
+            dict(code="000003", name="新增资产配置C", type="FOF-混合型"),
+            dict(code="000004", name="新增混合(FOF-LOF)C", type="未知"),
+            dict(code="000005", name="新增普通混合C", type="混合型"),
+        ])
+        funds["nav_date"] = end + pd.offsets.BDay(1)
+        funds["nav"] = funds["acc_nav"] = 1.
+        funds["daily_ret"] = 0.
+        fetcher._save_fund_list_cache(funds)
+        with patch.object(fetcher, "fetch_fund_list", return_value=funds), \
+                patch.object(fetcher, "_backfill_codes", return_value=0) as backfill:
+            result = fetcher.run_pipeline()
+        self.assertEqual(backfill.call_args.args[0], ["000005"])
+        self.assertEqual(result["appended"], 1)
+        self.assertEqual(result["recomputed"], 1)
+        with contextlib.closing(fetcher._conn()) as c:
+            self.assertEqual(c.execute("SELECT MAX(date) FROM fund_nav_daily WHERE code='000002'")
+                             .fetchone()[0], end.strftime("%Y-%m-%d"))
+        self.assertEqual(fetcher.scale_universe(), ["000001", "000005"])
+
+    def test_comparison_pool_excludes_fof_by_type_or_name(self):
+        import pct_rank
+        funds = [dict(code="000001", name="嘉实领航资产配置混合C", type="FOF-稳健型"),
+                 dict(code="000002", name="测试混合(FOF)C", type="混合型"),
+                 dict(code="000003", name="普通混合C", type="混合型")]
+        with contextlib.closing(fetcher._conn()) as c:
+            c.execute("INSERT INTO fund_list VALUES (1,?,?)", (json.dumps(funds), time.time()))
+            self.assertEqual(pct_rank._pool_universe(c)[2], {"000001", "000002"})
 
     def test_batch_skips_annualization_and_preserves_all_eight_period_metrics(self):
         period_cols = set(fetcher.RETURN_DAYS) | set(fetcher.DRAWDOWN_DAYS)

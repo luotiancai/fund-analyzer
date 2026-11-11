@@ -10,7 +10,7 @@ import tempfile
 SOURCE = Path(__file__).resolve().parent
 FILES = ["web", "deploy", "requirements-web.txt", "web_common.py", "web_cache.py", "web_service.py",
          "web_sync.py", "web_tasks.py", "web_prepare.py", "fetcher.py", "today_pick.py",
-         "backtest_qvix.py", "qvix_calc.py", "qvix_core.py"]
+         "backtest_qvix.py", "qvix_calc.py", "qvix_core.py", "fund_rules.py"]
 
 
 def exclude_metadata(info):
