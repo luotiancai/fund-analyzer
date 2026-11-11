@@ -81,7 +81,7 @@ const pickColumns = [
   {key:'why',label:'结论',text:true,render:(v,r)=>esc(v||r.role||'通过')}
 ];
 function renderPick(result) {
-  let html = notice(`数据够：本次需要截至 ${result.need_date} 的净值，净值库已到 ${result.nav_max}。`);
+  let html = notice(`本次净值截止日为 ${result.need_date}，净值库最新日期为 ${result.nav_max}。`);
   const s = result.std;
   html += `<p class="muted">近3月跌幅最大 · 跌幅 ≤ ${num(s.max_drop,0)}% · 波动率比值 ≥ ${s.min_vol_ratio} · 规模 ≥ ${s.min_aum} 亿${s.max_aum?'，上限 '+s.max_aum+' 亿':''}。${result.too_deep} 只跌幅超过上限。</p>`;
   if (result.asof !== state.today && result.thr != null) {

@@ -28,7 +28,8 @@ scan(asof) 收任意决策日, 不是只能算今天: 口径全是 T-1, 换个�
 收盘后该买哪只。回测只留结果, 这里能看见完整的淘汰路径。
 
 ⚠️ 所有指标都是**信号日 T-1 口径**(基金净值当晚才公布, 决策时看不到当天),
-跟回测完全一致; 规模用信号日当时**已披露**的最新季报(无未来函数)。
+规模用信号日当时**已披露**的最新季报(无未来函数)。今日候选出结果前检查
+符合筛选条件的全部 C 类基金的近3月净值是否完整。
 QVIX 用的是库里最后一个收盘值 —— 盘中要看实时值请跑 qvix_now.py。
 """
 import inspect
@@ -59,6 +60,10 @@ def _std_params():
 
 
 STD = _std_params()
+
+
+class IncompleteNavError(ValueError):
+    """An eligible C-class fund's NAV window cannot be verified as complete."""
 
 
 def _threshold(asof: pd.Timestamp):
@@ -122,8 +127,7 @@ def _ret3m_window(conn, code: str, asof_s: str):
 
     口径照抄 fetcher._window_by_date: 终点 = 该基金**早于 asof** 的最后一个
     净值日(当日净值当晚才公布, 决策时看不到); 起点 = 终点往回 91 个自然日、
-    取该日或之前最近的一个净值日。所以窗口是**逐只**算的 —— 哪只基金净值
-    更新慢, 它的窗口就整体往前挪, 跟别人不完全对齐。
+    取该日或之前最近的一个净值日。
     ⚠️ 这跟支付宝/东财的"近3月"不是一回事: 它们按**整3个自然月**取起点。
     实测 025778 同一个终点(2026-08-12), 91天口径起点落在 05-13 得 -27.32%,
     而支付宝的起点是 05-12、得 -28.13%, 差一个交易日就差 0.8 个百分点。
@@ -175,6 +179,30 @@ def _gates(conn, sse, code, asof_s, aum):
     return None, beta, aum
 
 
+def _require_complete_nav(conn, trading_dates, need_date, codes):
+    """按 T-1 对齐校验, 避免缺净值的基金把整个检查窗口往前挪。"""
+    start_limit = need_date - pd.Timedelta(days=fetcher.RETURN_DAYS["ret_3m"])
+    anchor = trading_dates[trading_dates <= start_limit].max()
+    if pd.isna(anchor):
+        raise IncompleteNavError("交易日历未覆盖完整的近3个月窗口，已停止本次选基。")
+    required = set(trading_dates[trading_dates.between(anchor, need_date)].dt.strftime("%Y-%m-%d"))
+    start_s, end_s = anchor.date().isoformat(), need_date.date().isoformat()
+    for code in codes:
+        available = {row["date"] for row in conn.execute(
+            "SELECT date FROM fund_nav_daily WHERE code=? AND date BETWEEN ? AND ? AND nav IS NOT NULL",
+            (code, start_s, end_s))}
+        gaps = required - available
+        if gaps:
+            # 基金成立前没有应披露的净值。较老基金仍检查窗口内的首个锚点。
+            first_nav = conn.execute("SELECT MIN(date) FROM fund_nav_daily WHERE code=?",
+                                     (code,)).fetchone()[0]
+            missing_day = min((day for day in gaps if first_nav is None or day >= first_nav),
+                              default=None)
+            if missing_day is not None:
+                raise IncompleteNavError(
+                    f"基金近3个月净值不完整，缺少 {missing_day} 的净值，已停止本次选基。")
+
+
 def scan(asof, top: int = 40) -> dict:
     """按标准策略走一遍当天的候选, 返回结构化结果(CLI 和页面共用)。
 
@@ -213,6 +241,15 @@ def scan(asof, top: int = 40) -> dict:
            "need_date": need_date, "missing": missing,
            "std": STD, "rows": [], "too_deep": 0, "chosen": None,
            "fund_line": None, "sse_line": None, "names": names}
+    if need_date is None or missing:
+        return out
+
+    # 按现有筛选口径检查全部 C 类基金，不依赖收益是否可算、是否下跌。
+    codes = sorted(c for c, n in names.items()
+                   if c not in exclude and fetcher.is_c_class(n)
+                   and not fetcher.is_overseas_equity(types[c])
+                   and not fetcher.is_bond(types[c]))
+    _require_complete_nav(conn, sse["date"], need_date, codes)
     if thr is None or pd.isna(thr):
         return out
 
@@ -222,11 +259,10 @@ def scan(asof, top: int = 40) -> dict:
             if m.get("ret_3m") is not None and c not in exclude}
     if not cand:
         return out
-    aums = fetcher.funds_aum_asof(sorted(cand), asof_s, merge_classes=True)
-
     # 跌幅榜名次: 分母是「真跌」的那批(跟策略的遍历顺序同一个序列), 不含
     # 涨的 —— 涨的根本不在这条路径上, 混进分母只会让名次看起来更靠前。
     order = sorted((c for c in cand if cand[c] < 0), key=cand.get)
+    aums = fetcher.funds_aum_asof(sorted(cand), asof_s, merge_classes=True)
     ranks = {c: i + 1 for i, c in enumerate(order)}
     out["n_drop"] = len(order)
 

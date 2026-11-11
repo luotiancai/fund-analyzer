@@ -169,7 +169,9 @@ class Jobs:
                     last = stderr.strip().splitlines()[-1] if stderr.strip() else ""
                     # Expected data validation errors are safe to show. Internal
                     # exceptions stay in journald, without exposing paths/SQL.
-                    message = last[12:] if last.startswith("ValueError: ") else "计算失败，请稍后重试"
+                    expected_errors = ("ValueError: ", "today_pick.IncompleteNavError: ")
+                    message = (last.split(": ", 1)[1] if last.startswith(expected_errors)
+                               else "计算失败，请稍后重试")
                     raise RuntimeError(message)
                 if not (folder / "result.json").exists():
                     raise RuntimeError("计算未返回结果，请重试")

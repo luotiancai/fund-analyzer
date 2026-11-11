@@ -155,6 +155,88 @@ class CalculationTests(unittest.TestCase):
         self.assertIn("数据尚未同步", process.stderr)
         self.assertFalse(output.exists())
 
+    def test_pick_stops_for_missing_nav_at_end_or_inside_window(self):
+        from web_cache import prepared_result
+        import web_sync
+
+        asof = today().isoformat()
+        cases = [(kind, offset) for kind in ("negative", "positive", "no-return")
+                 for offset in (0, 20)] + [("no-history", 0)]
+        for kind, offset in cases:
+            with self.subTest(kind=kind, offset=offset):
+                label = f"{kind}-{offset}"
+                code = "000005" if kind == "no-return" else "000003"
+                path = ROOT / "snapshots" / f"partial-nav-{label}"
+                path.mkdir()
+                for filename in FILES.values():
+                    shutil.copyfile(PATH / filename, path / filename)
+                with contextlib.closing(sqlite3.connect(path / FILES["nav"])) as c:
+                    if kind == "negative":
+                        # Give a fund beyond the first candidate a negative return.
+                        c.execute("INSERT OR REPLACE INTO fund_nav_daily "
+                                  "SELECT '000003',date,nav,daily_ret_pct+0.04,acc_nav "
+                                  "FROM fund_nav_daily WHERE code='000002'")
+                    gap = c.execute("SELECT date FROM fund_nav_daily WHERE code=? "
+                                    "ORDER BY date DESC LIMIT 1 OFFSET ?", (code, offset)).fetchone()[0]
+                    if kind == "no-history":
+                        c.execute("DELETE FROM fund_nav_daily WHERE code=?", (code,))
+                    else:
+                        c.execute("DELETE FROM fund_nav_daily WHERE code=? AND date=?", (code, gap))
+                    c.commit()
+                if kind == "no-history":
+                    with contextlib.closing(sqlite3.connect(path / FILES["rank"])) as c:
+                        c.execute("DELETE FROM fund_nav_meta WHERE code=?", (code,))
+                        c.commit()
+                web_sync.build_meta(path)
+
+                operation = "prepare" if offset == 0 else "pick"
+                request = ROOT / f"partial-nav-{label}-request.json"
+                output = ROOT / f"partial-nav-{label}-result.json"
+                version = "partial-nav-test"
+                write_json(request, dict(snapshot=str(path), code_version=version,
+                                         operation=operation, args={"asof": asof}))
+                process = subprocess.run([sys.executable, "web_tasks.py", str(request), str(output)],
+                                         capture_output=True, text=True, timeout=15,
+                                         cwd=Path(__file__).resolve().parents[1])
+                self.assertNotEqual(process.returncode, 0)
+                error = process.stderr.strip().splitlines()[-1]
+                self.assertIn("基金近3个月净值不完整", error)
+                if kind != "no-history":
+                    self.assertIn(f"缺少 {gap} 的净值", error)
+                self.assertNotIn(code, error)
+                self.assertFalse(output.exists())
+                self.assertIsNone(prepared_result(path, version, "pick", {"asof": asof}))
+                self.assertIsNone(prepared_result(path, version, "probe",
+                                                  {"asof": asof, "codes": [code]}))
+
+    def test_pick_only_checks_eligible_c_class_funds(self):
+        for name, fund_type in (("测试混合A", "混合型"), ("测试债券C", "债券型"),
+                                ("测试海外C", "QDII-普通股票"),
+                                ("测试一年持有混合C", "混合型")):
+            with self.subTest(name=name):
+                path = ROOT / "snapshots" / name
+                path.mkdir()
+                for filename in FILES.values():
+                    shutil.copyfile(PATH / filename, path / filename)
+                with contextlib.closing(sqlite3.connect(path / FILES["rank"])) as c:
+                    funds = json.loads(c.execute("SELECT data FROM fund_list").fetchone()[0])
+                    for fund in funds:
+                        if fund["code"] == "000003":
+                            fund.update(name=name, type=fund_type)
+                    c.execute("UPDATE fund_list SET data=?", (json.dumps(funds),))
+                    c.execute("DELETE FROM fund_nav_meta WHERE code='000003'")
+                    c.commit()
+                with contextlib.closing(sqlite3.connect(path / FILES["nav"])) as c:
+                    c.execute("DELETE FROM fund_nav_daily WHERE code='000003'")
+                    c.commit()
+                request, output = ROOT / "scope-request.json", ROOT / "scope-result.json"
+                write_json(request, dict(snapshot=str(path), operation="pick",
+                                         args={"asof": today().isoformat()}))
+                subprocess.run([sys.executable, "web_tasks.py", str(request), str(output)],
+                               check=True, capture_output=True, timeout=15,
+                               cwd=Path(__file__).resolve().parents[1])
+                self.assertEqual(json.loads(output.read_text())["chosen"], "000002")
+
     def test_download_failure_preserves_current_generation(self):
         import web_sync
         current = (ROOT / "current").resolve()
