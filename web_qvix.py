@@ -2,6 +2,7 @@
 import asyncio
 import contextlib
 import datetime as dt
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -11,10 +12,12 @@ import sys
 import time
 
 import qvix_core
-from web_common import FILES
+from web_common import CACHE, FILES, write_json
 
 log = logging.getLogger("fund-web.qvix")
 TIMEOUT = 25
+CACHE_VERSION = hashlib.sha256(
+    Path(__file__).read_bytes() + Path(qvix_core.__file__).read_bytes()).hexdigest()[:16]
 
 
 def connection(path, name):
@@ -77,15 +80,53 @@ def calculate(path, now=None):
 
 class LiveQvix:
     """Only button clicks start work; concurrent clicks share one small process."""
-    def __init__(self):
+    def __init__(self, cache_dir=None):
         self.pending = None
+        self.pending_key = None
+        self.cache_file = (Path(cache_dir) if cache_dir is not None else CACHE / "qvix") / "frozen.json"
 
-    async def get(self, path):
+    @staticmethod
+    def cacheable(key, result):
+        return (key[-1] in ("noon", "close") and result.get("phase") == key[-1]
+                and result.get("date") == key[-2] and result.get("qvix") is not None)
+
+    async def get(self, path, now=None):
+        clock = now or dt.datetime.now(qvix_core.CST)
+        phase, _ = qvix_core.market_phase(clock, clock.weekday() < 5)
+        key = (CACHE_VERSION, str(path), clock.date().isoformat(), phase)
+        if phase in ("noon", "close"):
+            try:
+                cached = json.loads(self.cache_file.read_text(encoding="utf-8"))
+                if (cached.get("key") == list(key) and isinstance(cached.get("result"), dict)
+                        and self.cacheable(key, cached["result"])):
+                    return {**cached["result"], "cached": True}
+            except (OSError, ValueError, AttributeError):
+                pass
+        if self.pending and not self.pending.done() and self.pending_key != key:
+            # A request from another session/data generation cannot reuse the
+            # old result, but still waits so only one lookup process runs.
+            with contextlib.suppress(ValueError):
+                await asyncio.shield(self.pending)
+            return await self.get(path, now=now)
         if self.pending is None or self.pending.done():
-            self.pending = asyncio.create_task(self.run(path))
+            self.pending_key = key
+            self.pending = asyncio.create_task(self.query(path, key))
             # A disconnected caller must not leave an unobserved exception.
             self.pending.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
         return await asyncio.shield(self.pending)
+
+    async def query(self, path, key):
+        result = await self.run(path)
+        # Failed queries and a result that crossed a session boundary never
+        # enter the cache. The date/session key expires lunch at 13:00 and
+        # the closing value at midnight; snapshot/code changes also expire it.
+        if self.cacheable(key, result):
+            try:
+                self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+                write_json(self.cache_file, {"key": key, "result": result})
+            except OSError:
+                log.warning("Unable to save QVIX cache", exc_info=True)
+        return {**result, "cached": False}
 
     async def run(self, path):
         process = await asyncio.create_subprocess_exec(

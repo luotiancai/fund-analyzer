@@ -2,10 +2,10 @@ update.log
 __pycache__/
 .venv/
 .DS_Store
-# qvix_now.py 算出的盘中实时值, 只在本机看, 不上传也不进仓库
+# 旧版本地 QVIX 工具的遗留文件，避免其他机器的旧配置进入仓库
 qvix_now.json
 
-# 通知配置: 里面是手机号, 不进仓库
+# 旧通知配置包含手机号
 qvix_notify.conf
 
 .claude/

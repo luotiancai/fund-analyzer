@@ -6,12 +6,16 @@
   <meta name="color-scheme" content="light dark">
   <title>基金分析仪</title>
   <link rel="stylesheet" href="./app.css?v=2">
-  <script src="./app.js?v=2" defer></script>
+  <script src="./app.js?v=3" defer></script>
 </head>
 <body>
 <main>
   <header class="page-head"><h1>📊 基金分析仪</h1><a class="site-link" href="/">上证 · QVIX <span aria-hidden="true">→</span></a></header>
   <div id="data-status" class="muted" role="status">正在读取数据状态…</div>
+  <section id="qvix-panel" aria-labelledby="qvix-title">
+    <div class="toolbar"><h2 id="qvix-title">实时 QVIX</h2><button id="qvix-button" type="button">查询实时 QVIX</button></div>
+    <div id="qvix-output" aria-live="polite"><p class="muted">点击查询当前值和恐慌阈值。</p></div>
+  </section>
   <nav class="tabs" aria-label="功能切换">
     <button class="active" data-pane="pick" aria-selected="true">今日候选</button>
     <button data-pane="filter" aria-selected="false">基金筛选</button>
@@ -19,8 +23,6 @@
   </nav>
 
   <section id="pane-pick" class="pane">
-    <div class="toolbar"><h2>实时 QVIX</h2><button id="qvix-button" type="button">查询实时 QVIX</button></div>
-    <div id="qvix-output" aria-live="polite"><p class="muted">点击查询当前值和恐慌阈值。</p></div>
     <div class="section-title"><div><h2>今天会买哪只</h2><p>沿近 3 月跌幅榜逐只检查，展示走到选中基金为止的路径。</p></div></div>
     <form id="pick-form" class="toolbar query-form">
       <label>决策日<input type="date" id="pick-date" min="2020-01-01" required></label>

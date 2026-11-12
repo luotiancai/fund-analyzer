@@ -29,7 +29,7 @@ $('qvix-button').addEventListener('click', async () => {
     const signal = r.threshold == null ? '恐慌阈值暂缺。' :
       `恐慌阈值 ${num(r.threshold)}（截至 ${r.threshold_date}）：${r.hit?'已达到阈值':'距触发还差 '+num(-r.gap)}。`;
     $('qvix-output').innerHTML = notice(`QVIX ${num(r.qvix)} · ${phase} ${r.date} ${r.time}。${signal}`, r.hit?'warn':'') +
-      `<p class="muted">查询于 ${esc(checked)} · 仅在点击时更新</p>`;
+      `<p class="muted">${r.cached?'缓存结果 · ':''}计算于 ${esc(checked)} · 仅手动查询</p>`;
   } catch (error) {
     $('qvix-output').innerHTML = notice(error.message, 'error');
   } finally {

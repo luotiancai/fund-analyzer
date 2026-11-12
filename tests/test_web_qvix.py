@@ -9,7 +9,13 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import qvix_core
-import web_qvix
+
+
+def setUpModule():
+    # Let HTTP test fixtures configure web_common paths before importing it,
+    # regardless of the order unittest loads the test modules.
+    global web_qvix
+    import web_qvix
 
 
 class QvixTests(unittest.TestCase):
@@ -97,6 +103,17 @@ class QvixTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="qvix-cache-test-")
+        self.addCleanup(self.tmp.cleanup)
+        self.cache_dir = Path(self.tmp.name)
+
+    def now(self, clock="12:00", day="2026-11-12"):
+        return dt.datetime.fromisoformat(day + "T" + clock).replace(tzinfo=qvix_core.CST)
+
+    def result(self, phase="noon", date="2026-11-12"):
+        return dict(qvix=22, phase=phase, date=date, checked_at=12345)
+
     async def test_no_automatic_query_and_concurrent_clicks_share_one_worker(self):
         lookup = web_qvix.LiveQvix()
         self.assertIsNone(lookup.pending)
@@ -128,6 +145,60 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 await web_qvix.LiveQvix().run(Path("/snapshot"))
         process.kill.assert_called_once()
         process.wait.assert_awaited_once()
+
+    async def test_noon_cache_survives_restart_and_expires_at_afternoon_open(self):
+        lookup = web_qvix.LiveQvix(self.cache_dir)
+        path = Path("/snapshot")
+        with patch.object(lookup, "run", new_callable=AsyncMock, return_value=self.result()) as run:
+            first = await lookup.get(path, now=self.now())
+            cached = await lookup.get(path, now=self.now("12:59:59"))
+            self.assertFalse(first["cached"])
+            self.assertTrue(cached["cached"])
+            self.assertEqual(first["checked_at"], cached["checked_at"])
+            run.assert_awaited_once()
+            restarted = web_qvix.LiveQvix(self.cache_dir)
+            with patch.object(restarted, "run", new_callable=AsyncMock) as rerun:
+                self.assertTrue((await restarted.get(path, now=self.now()))["cached"])
+                rerun.assert_not_called()
+            run.return_value = self.result("live")
+            self.assertFalse((await lookup.get(path, now=self.now("13:00")))["cached"])
+            self.assertFalse((await lookup.get(path, now=self.now("13:01")))["cached"])
+            self.assertEqual(run.await_count, 3)
+
+    async def test_close_cache_expires_for_date_snapshot_and_code_changes(self):
+        lookup = web_qvix.LiveQvix(self.cache_dir)
+        path = Path("/snapshot")
+        with patch.object(lookup, "run", new_callable=AsyncMock, return_value=self.result("close")) as run:
+            self.assertFalse((await lookup.get(path, now=self.now("15:00")))["cached"])
+            self.assertTrue((await lookup.get(path, now=self.now("23:59")))["cached"])
+            run.return_value = self.result("close", "2026-11-13")
+            tomorrow = self.now("15:00", "2026-11-13")
+            self.assertFalse((await lookup.get(path, now=tomorrow))["cached"])
+            self.assertFalse((await lookup.get(Path("/new-snapshot"), now=tomorrow))["cached"])
+            with patch.object(web_qvix, "CACHE_VERSION", "updated"):
+                self.assertFalse((await lookup.get(Path("/new-snapshot"), now=tomorrow))["cached"])
+            self.assertEqual(run.await_count, 4)
+
+    async def test_failed_lookup_is_retried_and_only_success_is_cached(self):
+        lookup = web_qvix.LiveQvix(self.cache_dir)
+        with patch.object(lookup, "run", new_callable=AsyncMock,
+                          side_effect=[ValueError("查询失败"), self.result()]) as run:
+            with self.assertRaisesRegex(ValueError, "查询失败"):
+                await lookup.get(Path("/snapshot"), now=self.now())
+            self.assertFalse(lookup.cache_file.exists())
+            self.assertFalse((await lookup.get(Path("/snapshot"), now=self.now()))["cached"])
+            self.assertTrue((await lookup.get(Path("/snapshot"), now=self.now()))["cached"])
+            self.assertEqual(run.await_count, 2)
+
+    async def test_holiday_and_crossed_session_result_are_never_cached(self):
+        lookup = web_qvix.LiveQvix(self.cache_dir)
+        with patch.object(lookup, "run", new_callable=AsyncMock) as run:
+            for phase in ("prev", "live"):
+                run.return_value = self.result(phase)
+                for _ in range(2):
+                    self.assertFalse((await lookup.get(Path("/snapshot"), now=self.now()))["cached"])
+            self.assertEqual(run.await_count, 4)
+            self.assertFalse(lookup.cache_file.exists())
 
 
 if __name__ == "__main__":

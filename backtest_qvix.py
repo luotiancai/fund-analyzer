@@ -915,7 +915,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     qvix = qvix.sort_values("date").reset_index(drop=True)
     minp = int(window * minp_ratio)
     # .shift(1):信号日 d 比的是"截至 d-1 收盘"的分位, 不含 d 当天——实盘
-    # 就是拿盘中实时值比昨日阈值(qvix_now.py), 回测不 shift 的话暴涨日
+    # 就是拿网站盘中实时值比昨日阈值，回测不 shift 的话暴涨日
     # 自己会把当日阈值抬高一点, 口径比实盘严一天。生产阈值列(fetcher.
     # update_qvix_self_daily)不 shift, 因为那列存的是"截至该日收盘"的值,
     # 次日实盘拿最后一行来比, 语义正好等价于这里的 shift(1)。

@@ -1774,59 +1774,8 @@ def _trading_days() -> Optional[set]:
     return days
 
 
-# 开盘到收盘(北京时间),中午 11:30~13:00 的休市**包含在内**,不切成两段。
-# 休市时新浪返回的是 11:30 的静态快照,照常现算得到的就是"上午收盘"那个
-# 值——这正是午休时该显示的最新值。要是把午休排除掉,页面会在 11:30~13:00
-# 退回去显示**昨天**的收盘值,而上午明明已经交易了两小时,那才是错的。
-# 集合竞价 9:15~9:25 不算:那时只有申报、没有连续成交,期权买卖盘还没铺开,
-# 现算出来的值噪声大且不可比。
-# 盘中QVIX的"取哪个数"分档(北京时间,交易日)。交易所连续竞价是
-# 9:30~11:30 和 13:00~15:00,中午休市和收盘后新浪返回的都是休市/收盘那一刻
-# 的静态报价,所以那两段不是"没有数",而是"数已经定格了":
-#   00:00~09:30  昨天的收盘值(今天还没开始交易)
-#   09:30~11:30  实时现算
-#   11:30~13:00  定格在 11:30(上午收盘值)
-#   13:00~14:57  实时现算
-#   14:57~15:00  不给数(收盘集合竞价)
-#   15:00~24:00  定格在 15:00(今日收盘值)
-# 收盘集合竞价 14:57~15:00 跟开盘那段一样只有申报、没有连续成交, 新浪给的
-# 买卖盘不是正常盘口。2026-10-20 14:59:48 手动现算得 12.17, 15:00 后拿收盘
-# 盘口重算是 15.80(前一天 16.39) —— 差 3.6, 像是虚值档买价被报成 0、触发
-# term_variance 的"连续两个零买价截断"砍掉一段虚值。这 3 分钟算出来的数
-# 不可信, 也没有可以替它的值(上午/收盘那两档是盘口定格, 这里是盘口失真),
-# 所以这一档只提示等 15:00, 不给数。
-# 定格靠给 qvix_calc.compute_qvix 传 as_of 实现:报价本来就是静态的,只要
-# 把"剩余到期时间"也钉在同一刻,同一批报价就永远算出同一个数,不会出现
-# 下午2点看和晚上10点看不一致。非交易日全天走"昨天的收盘值"。
-_OPEN = dt_time(9, 30)
-_NOON_CLOSE = dt_time(11, 30)
-_NOON_OPEN = dt_time(13, 0)
-_CLOSE_AUCTION = dt_time(14, 57)
+# 日度跑批补算最近一次收盘的实时口径值。
 _CLOSE = dt_time(15, 0)
-
-
-def is_trading_day(day=None) -> bool:
-    """是不是A股交易日。节假日靠交易日历排除;日历拉不到时退化成只看
-    星期几——那种情况下节假日会被误判成交易日,但届时新浪返回的是上一
-    交易日的静态报价,算出来等于上一收盘值,不会凭空造出一个错的实时值。"""
-    day = day or datetime.now(_CST).date()
-    days = _trading_days()
-    if days is not None:
-        return day in days
-    return day.weekday() < 5
-
-
-def qvix_phase(now: Optional[datetime] = None) -> tuple:
-    """当下该取哪个数 → (档位, as_of)。
-
-    档位∈{"live","noon","auction","close","prev"};as_of 是要钉住的时刻
-    ("live" 为 None=用当下,"prev" 也是 None=不现算、直接读库,
-    "auction" 为 None=收盘集合竞价、不能算也没有可替的值)。"""
-    now = now or datetime.now(_CST)
-    import qvix_core
-    return qvix_core.market_phase(now, is_trading_day(now.date()))
-
-
 
 
 def save_qvix_self_history(rows: list) -> None:
@@ -2115,7 +2064,7 @@ def update_qvix_self_daily() -> tuple:
     if hist is not None:
         hist = hist.sort_values("date").reset_index(drop=True)
         # 这列**故意不 shift**:存的是"截至该日收盘"的分位。实盘用法是次日
-        # 盘中拿最后一行来比(qvix_now.py), 今天的数据天然不在窗口里;
+        # 网站盘中查询拿最后一行来比，今天的数据天然不在窗口里;
         # 回测(backtest_qvix.py)在自己那边 shift(1) 达成同一口径。别在
         # 这里加 shift——那会让实盘比的阈值凭空旧一天。
         hist["threshold"] = (hist["qvix"]
@@ -2130,7 +2079,7 @@ def update_qvix_rt_close() -> tuple:
     交易日" 15:00 的 QVIX, 写进 qvix_self_history.qvix_rt。返回 (日期, 值或None)。
 
     跟 qvix 列是两条路径算的同一个东西: qvix 列由上交所官方 IV 反推
-    BS 价格(能回算历史), 这一列是盘中 qvix_now.py 那套、收盘那一刻的值。
+    BS 价格(能回算历史), 这一列是网站实时查询那套、收盘那一刻的值。
     并排放着是为了看两者差多少 —— 盘中拿实时值比阈值, 而阈值是 qvix 列
     算出来的, 两把尺子到底偏多少, 以前只能凭感觉。
     **只作展示, 不进信号判定也不进阈值**: 混进去就真成两把尺子量一件事了。

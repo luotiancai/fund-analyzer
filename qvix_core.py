@@ -1,7 +1,7 @@
 """自算 QVIX 的核心实现:**只用 Python 标准库**,零第三方依赖——没有
 requests / pandas / numpy / akshare。
 
-本机 qvix_now.py 和网站的手动查询共用。新浪可能按出口 IP 限流；
+网站手动查询和 VPS 日度跑批共用。新浪可能按出口 IP 限流；
 2026-11-12 VPS 连续三次成功取得完整期权链，网站因此恢复手动实时查询。
 
 为什么单独抽出来:
@@ -67,7 +67,11 @@ _RETRY_SLEEP = 0.6
 
 
 def market_phase(now: dt.datetime, trading_day: bool) -> tuple:
-    """连续竞价现算；午休和收盘冻结时间；集合竞价不给数。"""
+    """连续竞价现算；午休和收盘冻结时间；集合竞价不给数。
+
+    14:57–15:00 的买卖盘可能触发零买价截断而低估波动率，必须等收盘。
+    午休固定在 11:30、收盘固定在 15:00，避免静态报价随剩余期限漂移。
+    """
     if not trading_day or now.time() < dt.time(9, 30):
         return "prev", None
     if now.time() < dt.time(11, 30):
@@ -541,7 +545,3 @@ def diagnose(as_of: Optional[dt.datetime] = None) -> dict:
 
     out["result"] = compute_qvix(as_of=as_of)
     return out
-
-
-if __name__ == "__main__":
-    print(json.dumps({"result": compute_qvix()}, ensure_ascii=False))

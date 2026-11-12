@@ -1,9 +1,9 @@
 """自算 QVIX(CBOE VIX 白皮书方法论)。两条独立路径,共享同一套核心公式
 (_term_variance/K0选取/1-K²加权/30天插值),数据来源不同:
 
-  ① compute_qvix() ——当前实时值。用上交所50ETF期权的新浪实时报价
-     (bid/ask)现算, 实现在 qvix_core, 这里只是转发。本机脚本和网站手动查询
-     共用；新浪可能按出口 IP 限流，失败时明确报错。
+  ① qvix_core.compute_qvix() ——当前实时值。用上交所50ETF期权的新浪
+     实时报价(bid/ask)现算，供网站手动查询和 VPS 收盘值跑批共用。
+     新浪可能按出口 IP 限流，失败时明确报错。
   ② compute_qvix_for_date() ——收盘后的历史/日线值。实时买卖价查不到
      历史,改用上交所官方期权风险指标接口(option_risk_indicator_sse,
      2015-02-09起可查)已经算好的隐含波动率反推 Black-Scholes 理论价格
@@ -131,24 +131,6 @@ _fetch_chain = qvix_core.fetch_chain
 def _shibor_curve() -> Optional[list]:
     """今天最新一行 SHIBOR 各期限报价(年化小数)。见 qvix_core.shibor_curve。"""
     return qvix_core.shibor_curve()
-
-
-def compute_qvix(as_of: Optional[dt.datetime] = None) -> Optional[tuple]:
-    """现算 QVIX → (qvix, "HH:MM:SS");算不出来返回 None。
-
-    as_of 用于把结果"冻结"在某一刻(中午休市11:30 / 收盘后15:00), 调用方见
-    fetcher.qvix_phase()。SHIBOR 取不到时的兜底利率仍走本项目的
-    fetcher.get_risk_free_rate()(1年期国债收益率, 带DB缓存); qvix_core 自己
-    也有一个默认常数, 单独跑它(python3 qvix_core.py)时用那个。"""
-    try:
-        fallback = fetcher.get_risk_free_rate()
-    except Exception:
-        fallback = 0.0113
-    try:
-        return qvix_core.compute_qvix(as_of=as_of, fallback_rate=fallback)
-    except Exception as e:
-        log.warning("self-computed QVIX failed: %s", e)
-        return None
 
 
 # ── 「链失效」: 算不出来这件事本身就是信号 ────────────────────────────────
