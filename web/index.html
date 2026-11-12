@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>基金分析仪</title>
   <link rel="stylesheet" href="./app.css?v=2">
-  <script src="./app.js?v=1" defer></script>
+  <script src="./app.js?v=2" defer></script>
 </head>
 <body>
 <main>
@@ -19,6 +19,8 @@
   </nav>
 
   <section id="pane-pick" class="pane">
+    <div class="toolbar"><h2>实时 QVIX</h2><button id="qvix-button" type="button">查询实时 QVIX</button></div>
+    <div id="qvix-output" aria-live="polite"><p class="muted">点击查询当前值和恐慌阈值。</p></div>
     <div class="section-title"><div><h2>今天会买哪只</h2><p>沿近 3 月跌幅榜逐只检查，展示走到选中基金为止的路径。</p></div></div>
     <form id="pick-form" class="toolbar query-form">
       <label>决策日<input type="date" id="pick-date" min="2020-01-01" required></label>

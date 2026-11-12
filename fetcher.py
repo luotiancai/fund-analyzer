@@ -1823,20 +1823,8 @@ def qvix_phase(now: Optional[datetime] = None) -> tuple:
     ("live" 为 None=用当下,"prev" 也是 None=不现算、直接读库,
     "auction" 为 None=收盘集合竞价、不能算也没有可替的值)。"""
     now = now or datetime.now(_CST)
-    if not is_trading_day(now.date()):
-        return "prev", None
-    t = now.time()
-    if t < _OPEN:
-        return "prev", None
-    if t < _NOON_CLOSE:
-        return "live", None
-    if t < _NOON_OPEN:
-        return "noon", now.replace(hour=11, minute=30, second=0, microsecond=0)
-    if t < _CLOSE_AUCTION:
-        return "live", None
-    if t < _CLOSE:
-        return "auction", None
-    return "close", now.replace(hour=15, minute=0, second=0, microsecond=0)
+    import qvix_core
+    return qvix_core.market_phase(now, is_trading_day(now.date()))
 
 
 

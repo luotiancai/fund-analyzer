@@ -18,6 +18,24 @@ async function request(path, options={}) {
 }
 function notice(message, type='') { return `<div class="notice ${type}" role="status">${esc(message)}</div>`; }
 function loading(target, message) { $(target).innerHTML = `<div class="loading" role="status"><span class="spinner"></span>${esc(message)}</div>`; }
+$('qvix-button').addEventListener('click', async () => {
+  const button = $('qvix-button');
+  button.disabled = true;
+  loading('qvix-output', '正在查询实时 QVIX…');
+  try {
+    const r = await request('qvix/now', {method:'POST'});
+    const phase = {live:'实时', noon:'上午收盘', close:'今日收盘', prev:'上一交易日收盘'}[r.phase];
+    const checked = new Date(r.checked_at*1000).toLocaleString('zh-CN', {timeZone:'Asia/Shanghai', hour12:false});
+    const signal = r.threshold == null ? '恐慌阈值暂缺。' :
+      `恐慌阈值 ${num(r.threshold)}（截至 ${r.threshold_date}）：${r.hit?'已达到阈值':'距触发还差 '+num(-r.gap)}。`;
+    $('qvix-output').innerHTML = notice(`QVIX ${num(r.qvix)} · ${phase} ${r.date} ${r.time}。${signal}`, r.hit?'warn':'') +
+      `<p class="muted">查询于 ${esc(checked)} · 仅在点击时更新</p>`;
+  } catch (error) {
+    $('qvix-output').innerHTML = notice(error.message, 'error');
+  } finally {
+    button.disabled = false;
+  }
+});
 function invalidate(target) { state.tokens[target] = Symbol(); }
 async function task(args, target, render) {
   const token = Symbol(); state.tokens[target] = token;

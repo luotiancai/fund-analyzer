@@ -421,6 +421,24 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(state["status"], "error")
         self.assertIn("服务已更新", state["error"])
 
+    def test_qvix_only_runs_on_manual_post_and_returns_clear_failure(self):
+        from unittest.mock import AsyncMock
+        import web_service
+        result = dict(qvix=22.5, phase="live", threshold=22., hit=True)
+        with patch.object(web_service.live_qvix, "get", new_callable=AsyncMock) as lookup:
+            lookup.return_value = result
+            self.client.get("/")
+            self.client.get("/api/v1/status")
+            lookup.assert_not_called()
+            response = self.client.post("/api/v1/qvix/now")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), result)
+            lookup.assert_awaited_once_with(PATH.resolve())
+            lookup.side_effect = ValueError("实时 QVIX 查询超时，请稍后重试。")
+            response = self.client.post("/api/v1/qvix/now")
+            self.assertEqual(response.status_code, 503)
+            self.assertIn("超时", response.json()["detail"])
+
     def test_filter_pagination_cache_and_csv(self):
         task = dict(operation="filter", period="3m", min_ret=None, max_dd=None)
         job_id, result = self.wait(task)

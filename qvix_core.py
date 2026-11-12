@@ -1,11 +1,8 @@
 """自算 QVIX 的核心实现:**只用 Python 标准库**,零第三方依赖——没有
 requests / pandas / numpy / akshare。
 
-**只在本机跑。** 境外主机连不上新浪 hq.sinajs.cn(实测 Streamlit Cloud/GCP
-建连成功率约50%), 而新浪只认 *.sina.com.cn 的 Referer、浏览器无法伪造, 所以
-客户端方案也走不通。曾经为此在境内腾讯云 SCF 上挂过一个云函数入口(把本文件
-整个粘进在线编辑器), 2026-09-21 撤掉——实时值本来就只在本机看(见
-qvix_now.py), 那个公开 URL 留着只是多一个每次调用都打新浪的口子。
+本机 qvix_now.py 和网站的手动查询共用。新浪可能按出口 IP 限流；
+2026-11-12 VPS 连续三次成功取得完整期权链，网站因此恢复手动实时查询。
 
 为什么单独抽出来:
   抽出来是为了**只有一份实现**。如果为手机端另写一份 JS/Swift, 两边的 K0
@@ -67,6 +64,21 @@ TIMEOUT = 10
 # 5 次全失败的概率约 1/32。
 _RETRY = 5
 _RETRY_SLEEP = 0.6
+
+
+def market_phase(now: dt.datetime, trading_day: bool) -> tuple:
+    """连续竞价现算；午休和收盘冻结时间；集合竞价不给数。"""
+    if not trading_day or now.time() < dt.time(9, 30):
+        return "prev", None
+    if now.time() < dt.time(11, 30):
+        return "live", None
+    if now.time() < dt.time(13):
+        return "noon", now.replace(hour=11, minute=30, second=0, microsecond=0)
+    if now.time() < dt.time(14, 57):
+        return "live", None
+    if now.time() < dt.time(15):
+        return "auction", None
+    return "close", now.replace(hour=15, minute=0, second=0, microsecond=0)
 
 
 def _get(url: str, params: Optional[dict] = None) -> str:

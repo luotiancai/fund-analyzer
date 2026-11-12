@@ -22,13 +22,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from web_common import CACHE, CST, FILES, snapshot, today, write_json
 from web_cache import prepared_result
 from fund_rules import is_fof, is_locked_fund
+from web_qvix import LiveQvix
 
 log = logging.getLogger("fund-web")
 HERE = Path(__file__).resolve().parent
 WORKER = HERE / "web_tasks.py"
 CODE_VERSION = hashlib.sha256(b"".join((HERE / name).read_bytes() for name in (
     "web_service.py", "web_tasks.py", "web_cache.py", "fetcher.py", "today_pick.py", "backtest_qvix.py",
-    "fund_rules.py"))).hexdigest()[:16]
+    "fund_rules.py", "qvix_core.py", "web_qvix.py"))).hexdigest()[:16]
 JOB_TIMEOUT = int(os.environ.get("FUND_WEB_JOB_TIMEOUT", "240"))
 
 
@@ -225,12 +226,14 @@ class Jobs:
 
 
 jobs = None
+live_qvix = None
 
 
 @contextlib.asynccontextmanager
 async def lifespan(app):
-    global jobs
+    global jobs, live_qvix
     jobs = Jobs()
+    live_qvix = LiveQvix()
     CACHE.mkdir(parents=True, exist_ok=True)
     # In-flight tasks belong to the previous process. Polling clients must get
     # an explicit retry rather than wait forever on an abandoned queued state.
@@ -243,6 +246,7 @@ async def lifespan(app):
     try:
         yield
     finally:
+        await live_qvix.close()
         jobs.runner.cancel()
         jobs.network_runner.cancel()
         await asyncio.gather(jobs.runner, jobs.network_runner, return_exceptions=True)
@@ -299,6 +303,18 @@ def health():
 @app.post("/api/v1/jobs", status_code=202)
 async def submit(task: Task):
     return await jobs.submit(task)
+
+
+@app.post("/api/v1/qvix/now")
+async def qvix_now():
+    try:
+        path, _ = snapshot()
+    except (FileNotFoundError, RuntimeError):
+        raise HTTPException(503, "数据正在首次同步，请稍后再试")
+    try:
+        return await live_qvix.get(path)
+    except ValueError as exc:
+        raise HTTPException(503, str(exc))
 
 
 @app.get("/api/v1/jobs/{job_id}")
