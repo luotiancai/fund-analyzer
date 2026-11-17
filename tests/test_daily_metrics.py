@@ -76,6 +76,33 @@ class DailyMetricsTests(unittest.TestCase):
         fetcher._save_fund_list_cache(funds[funds["code"] == "000002"])
         self.assertEqual(fetcher.scale_universe(), [])
 
+    def test_new_standard_moves_previous_standard_to_history_without_changing_trades(self):
+        old_trades = [{"买入日": "2024-01-01", "卖出日": "2024-02-01", "费后收益": 10.}]
+        new_trades = [{"买入日": "2024-01-01", "卖出日": "2024-02-02", "费后收益": 5.}]
+        old = fetcher.save_strategy_run(old_trades, {"aum_basis": "merged"}, is_standard=True)
+        comparison = fetcher.save_strategy_run(new_trades, {"aum_basis": "single"})
+        self.assertEqual(fetcher.load_backtest_trades()[3], old)
+        current = fetcher.save_strategy_run(new_trades, {"aum_basis": "single"}, is_standard=True)
+        self.assertEqual(fetcher.load_backtest_trades()[3], current)
+        with contextlib.closing(fetcher._conn()) as c:
+            rows = {r["id"]: dict(r) for r in c.execute("SELECT * FROM strategy_runs")}
+        self.assertEqual(rows[old]["is_standard"], 0)
+        self.assertEqual(rows[comparison]["is_standard"], 0)
+        self.assertEqual(rows[current]["is_standard"], 1)
+        self.assertEqual(json.loads(rows[old]["trades"]), old_trades)
+        self.assertEqual(json.loads(rows[current]["params"])["review_notes"], {})
+
+    def test_failed_standard_insert_keeps_previous_standard_active(self):
+        trades = [{"买入日": "2024-01-01", "卖出日": "2024-02-01", "费后收益": 10.}]
+        old = fetcher.save_strategy_run(trades, {"aum_basis": "merged"}, is_standard=True)
+        with contextlib.closing(fetcher._conn()) as c:
+            c.execute("CREATE TRIGGER strategy.reject_new_run BEFORE INSERT ON strategy_runs "
+                      "BEGIN SELECT RAISE(ABORT, 'test failure'); END")
+            c.commit()
+        with self.assertRaises(sqlite3.IntegrityError):
+            fetcher.save_strategy_run(trades, {"aum_basis": "single"}, is_standard=True)
+        self.assertEqual(fetcher.load_backtest_trades()[3], old)
+
     def test_own_share_aum_excludes_a_and_unpublished_quarters(self):
         funds = pd.DataFrame([
             dict(code="000001", name="普通混合C", type="混合型"),

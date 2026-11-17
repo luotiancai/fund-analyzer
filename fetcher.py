@@ -1885,21 +1885,28 @@ def save_strategy_run(trades: list, params: Optional[dict] = None,
     参数, 汇总指标(笔数/胜率/累计收益)顺手算好存下来, 免得页面为了画
     一个列表把每条的明细全解一遍。
 
-    is_standard=True 标记这条是"线上标准策略"那一跑, 主复盘表读最新的
-    那条标准跑批(见 load_backtest_trades)。"""
+    is_standard=True 时原标准转入历史，当前记录成为唯一标准策略。
+    新标准不自动继承按买入日维护的旧点评。"""
     n, win, cum = _run_summary(trades)
+    params = dict(params or {})
+    if is_standard:
+        params.setdefault("review_notes", {})
     conn = _conn()
-    cur = conn.execute(
-        "INSERT INTO strategy.strategy_runs "
-        "(run_at, label, params, trades, is_standard, n_trades, win_rate, cum_return) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (time.time(), label or describe_run(params),
-         json.dumps(params or {}, ensure_ascii=False, default=str),
-         json.dumps(trades, ensure_ascii=False, default=str),
-         1 if is_standard else 0, n, win, cum))
-    conn.commit()
-    run_id = cur.lastrowid
-    conn.close()
+    try:
+        with conn:
+            if is_standard:
+                conn.execute("UPDATE strategy.strategy_runs SET is_standard=0 WHERE is_standard=1")
+            cur = conn.execute(
+                "INSERT INTO strategy.strategy_runs "
+                "(run_at, label, params, trades, is_standard, n_trades, win_rate, cum_return) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (time.time(), label or describe_run(params),
+                 json.dumps(params, ensure_ascii=False, default=str),
+                 json.dumps(trades, ensure_ascii=False, default=str),
+                 1 if is_standard else 0, n, win, cum))
+            run_id = cur.lastrowid
+    finally:
+        conn.close()
     return run_id
 
 

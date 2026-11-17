@@ -95,7 +95,10 @@ def collect() -> dict:
     else:
         rv["summary"] = sse_view.md_inline(
             sse_view.review_summary(bt_df, bt_id, bt_at, _p))
-        df, trig = sse_view.review_table(bt_df, fetcher.load_backtest_notes())
+        notes = _p.get("review_notes")
+        if notes is None:
+            notes = fetcher.load_backtest_notes()
+        df, trig = sse_view.review_table(bt_df, notes)
         rv["table"] = _table(df, trig)
     out["review"] = rv
 
