@@ -23,6 +23,9 @@
   · 另排除**这笔交易本身不成立**的标的 —— QDII/海外(跟QVIX恐慌-反弹
     逻辑脱钩, 策略一贯排除)、FOF(净值披露滞后)、持有期锁定(赎不出来, 止损卖不掉)、净值僵化-
     补涨(脏数据);
+  · 排除买入日已核实的历史限购，包括大额限额、暂停申购及暂停个人申购；
+    公告证据和逐日快照保存在 fund_purchase_limits.json，不按基金永久拉黑。
+    当前覆盖标准 #54 的九个买入日；新增买入日需先补公告核查，不能默认不限购。
   · 其余**不设**条件: 不要求真跌、无跌幅上限、无波动率门槛、无规模上限。
   · 每只候选都用**它自己的**双止损线(基金线=当日阈值/5×自身波动率比值,
     大盘线=阈值/5)逐日盯出卖点, 再按实现收益(扣完赎回费)排名 —— 跟策略
@@ -41,6 +44,7 @@ import pandas as pd
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 import backtest_qvix as B      # noqa: E402
 import fetcher                 # noqa: E402
+from fund_purchase_rules import restricted_codes_on  # noqa: E402
 
 COL = "可买池分位"
 
@@ -89,8 +93,10 @@ def compute(run_id: int, dry_run: bool = False):
         # 要查两万多次, 会把这个脚本拖到小时级)。
         aums = fetcher.funds_aum_asof(sorted(cand), t["买入日"],
                                     merge_classes=(params.get("aum_basis", "single") == "merged"))
+        restricted = restricted_codes_on(t["买入日"])
         cand = {c for c in cand
-                if aums.get(c) is not None and aums[c] >= 2.0}
+                if aums.get(c) is not None and aums[c] >= 2.0
+                and c not in restricted}
 
         lo = (buy - pd.Timedelta(days=need + 20)).strftime("%Y-%m-%d")
         hi = (buy + pd.Timedelta(days=500)).strftime("%Y-%m-%d")
