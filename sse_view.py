@@ -357,10 +357,11 @@ def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
             + ")" if _uni == "etf" else "")
     caption = (
         f"规则:{_rule}"
-        f"候选须满足波动率比值≥{_mark(_vr, 1.5)}"
-        + ("(仅跌幅分支, 涨幅分支不设门槛)" if _tvr is None
-           else "(涨跌两个分支同一门槛)" if _tvr == "same"
-           else f"(跌幅分支; 涨幅分支≥**{_tvr}**)")
+        + ("候选**不设波动率门槛**" if _vr is None else
+           f"候选须满足波动率比值≥{_mark(_vr, 1.5)}"
+           + ("(仅跌幅分支, 涨幅分支不设门槛)" if _tvr is None
+              else "(涨跌两个分支同一门槛)" if _tvr == "same"
+              else f"(跌幅分支; 涨幅分支≥**{_tvr}**)"))
         + "、"
         + (f"近3月跌幅≤{_mdrop}%、" if _mdrop == 30.0
            else f"近3月跌幅≤**{_mdrop}%**、" if _mdrop
