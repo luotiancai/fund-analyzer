@@ -252,7 +252,7 @@ def review_table(bt_df: pd.DataFrame, notes: dict):
     df = bt_df.rename(columns={_RAW_TGT: TGT_COL,
                                _RAW_RET: "近3月涨跌(前日口径)"})
     df = df[[c for c in [
-        "买入日", "卖出日", TGT_COL,
+        TGT_COL, "持有收益", "买入日", "卖出日",
         "类型", "买入时规模(亿)", "波动率比值(近3月)", "恐慌阈值",
         FUND_LINE_COL, SSE_LINE_COL, "近3月涨跌(前日口径)", "选向",
         # 「可买池分位」= 这一笔在**当天本来可以买的所有基金**里排第几
@@ -271,7 +271,7 @@ def review_table(bt_df: pd.DataFrame, notes: dict):
         # 由 pct_rank.py 单独算好写进 trades —— 每个信号日要给一两千
         # 只基金逐日跑止损, 约15分钟, 不适合塞进每次回测。
         # ⚠️ 换了标准策略要重跑 pct_rank.py, 否则这列是上一版的旧数。
-        "持有收益", COL_POOL_PCT, "期间最高", "期间最大回撤",
+        COL_POOL_PCT, "期间最高", "期间最大回撤",
         "同期上证",
     ] if c in df.columns]].copy()
     # 「备注」是人工点评(backtest_notes 表), 算不出来、只能人写,
@@ -395,9 +395,9 @@ def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
     _x_ret = f"{_x_win}涨跌(前日口径)"
     view = x_df.rename(columns={_RAW_TGT: TGT_COL, _RAW_RET: _x_ret})
     view = view[[c for c in [
-        "买入日", "卖出日", TGT_COL, "类型", "买入时规模(亿)",
+        TGT_COL, "持有收益", "买入日", "卖出日", "类型", "买入时规模(亿)",
         "波动率比值(近3月)", "恐慌阈值", FUND_LINE_COL,
         SSE_LINE_COL, _x_ret, "上证当日涨跌", "选向",
-        "持有收益", "期间最高", "期间最大回撤", "同期上证",
+        "期间最高", "期间最大回撤", "同期上证",
     ] if c in view.columns]].copy()
     return caption, view, [trig_of(r) for r in x_df["卖出原因"]]
