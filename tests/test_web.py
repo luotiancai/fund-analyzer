@@ -75,6 +75,52 @@ PATH = fixture()
 
 
 class CalculationTests(unittest.TestCase):
+    def test_pick_probe_and_filter_use_c_share_aum_and_ignore_large_a_sibling(self):
+        for aum in (None, 1.5, 2.0):
+            with self.subTest(c_aum=aum):
+                path = ROOT / "snapshots" / f"own-c-aum-{aum}"
+                path.mkdir()
+                for filename in FILES.values():
+                    shutil.copyfile(PATH / filename, path / filename)
+                with contextlib.closing(sqlite3.connect(path / FILES["rank"])) as c:
+                    funds = json.loads(c.execute("SELECT data FROM fund_list").fetchone()[0])
+                    sibling = {**funds[0], "code": "990001", "name": "测试0混合A"}
+                    funds.append(sibling)
+                    c.execute("UPDATE fund_list SET data=?", (json.dumps(funds),))
+                    c.commit()
+                with contextlib.closing(sqlite3.connect(path / FILES["scale"])) as c:
+                    if aum is None:
+                        c.execute("DELETE FROM fund_scale_hist WHERE code='000002'")
+                    else:
+                        c.execute("UPDATE fund_scale_hist SET aum=? WHERE code='000002'", (aum,))
+                    c.execute("INSERT INTO fund_scale_hist VALUES (?,?,?,?,?)",
+                              ("990001", "2025-12-31", 20., "2026-01-22", time.time()))
+                    c.commit()
+                day = today().isoformat()
+                cases = [("pick", dict(asof=day)),
+                         ("probe", dict(asof=day, codes=["000002"])),
+                         ("filter", dict(asof=day, period="3m", types=[],
+                                         min_ret=None, max_dd=None, min_aum=2.0))]
+                for operation, args in cases:
+                    request = ROOT / f"own-c-aum-{aum}-{operation}.json"
+                    output = ROOT / f"own-c-aum-{aum}-{operation}-result.json"
+                    write_json(request, dict(snapshot=str(path), operation=operation, args=args))
+                    subprocess.run([sys.executable, "web_tasks.py", str(request), str(output)],
+                                   check=True, capture_output=True, timeout=15,
+                                   cwd=Path(__file__).resolve().parents[1])
+                    result = json.loads(output.read_text())
+                    if operation == "pick":
+                        self.assertEqual(result["std"]["aum_basis"], "single")
+                        self.assertEqual(result["chosen"], "000002" if aum == 2.0 else None)
+                        row = next(r for r in result["rows"] if r["code"] == "000002")
+                        self.assertEqual(row["aum"], aum)
+                    elif operation == "probe":
+                        self.assertEqual(result["rows"][0]["aum"], aum)
+                    else:
+                        codes = {r["code"] for r in result["rows"]}
+                        self.assertNotIn("990001", codes)
+                        self.assertEqual("000002" in codes, aum == 2.0)
+
     def test_upstream_holdings_cache_survives_code_and_data_generations(self):
         from web_cache import lookup_cache
         cached = lookup_cache(PATH)

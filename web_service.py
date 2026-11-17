@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from web_common import CACHE, CST, FILES, snapshot, today, write_json
 from web_cache import prepared_result
-from fund_rules import is_fof, is_locked_fund
+from fund_rules import is_c_class, is_fof, is_locked_fund
 from web_qvix import LiveQvix
 
 log = logging.getLogger("fund-web")
@@ -277,6 +277,7 @@ def status():
             data = json.loads(c.execute("SELECT data FROM fund_list WHERE id=1").fetchone()[0])
         import re
         types = sorted({r.get("type", "") for r in data if r.get("type")
+                        and is_c_class(r.get("name"))
                         and not is_fof(r["type"], r.get("name"))
                         and not is_locked_fund(r.get("name"))
                         and not re.search("债|固收", r["type"])})

@@ -94,7 +94,7 @@ def collect() -> dict:
             "会往策略库追加一条标准跑批, 页面随即显示。")
     else:
         rv["summary"] = sse_view.md_inline(
-            sse_view.review_summary(bt_df, bt_id, bt_at))
+            sse_view.review_summary(bt_df, bt_id, bt_at, _p))
         df, trig = sse_view.review_table(bt_df, fetcher.load_backtest_notes())
         rv["table"] = _table(df, trig)
     out["review"] = rv

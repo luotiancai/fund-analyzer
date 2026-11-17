@@ -95,13 +95,13 @@ const pickColumns = [
   {key:'rank',label:'跌幅榜',render:v=>v??'—'}, {key:'code',label:'基金代码',render:codeLink},
   {key:'name',label:'基金名称',text:true}, {key:'ret3m',label:'近3月收益(%)',render:v=>num(v)},
   {key:'win_start',label:'近3月窗口',render:(v,r)=>v&&r.win_end?`${esc(v)} → ${esc(r.win_end)}`:'—'},
-  {key:'beta',label:'波动率比值',render:v=>num(v)}, {key:'aum',label:'规模(亿)',render:v=>num(v)},
+  {key:'beta',label:'波动率比值',render:v=>num(v)}, {key:'aum',label:'C类规模(亿)',render:v=>num(v)},
   {key:'why',label:'结论',text:true,render:(v,r)=>esc(v||r.role||'通过')}
 ];
 function renderPick(result) {
   let html = notice(`本次净值截止日为 ${result.need_date}，净值库最新日期为 ${result.nav_max}。`);
   const s = result.std;
-  html += `<p class="muted">近3月跌幅最大 · 跌幅 ≤ ${num(s.max_drop,0)}% · 波动率比值 ≥ ${s.min_vol_ratio} · 规模 ≥ ${s.min_aum} 亿${s.max_aum?'，上限 '+s.max_aum+' 亿':''}。${result.too_deep} 只跌幅超过上限。</p>`;
+  html += `<p class="muted">近3月跌幅最大 · 跌幅 ≤ ${num(s.max_drop,0)}% · 波动率比值 ≥ ${s.min_vol_ratio} · C类自身规模 ≥ ${s.min_aum} 亿${s.max_aum?'，上限 '+s.max_aum+' 亿':''}。${result.too_deep} 只跌幅超过上限。</p>`;
   if (result.asof !== state.today && result.thr != null) {
     html += notice(result.broken ? `${result.qdate} 期权链失效，按触发信号处理，与回测一致。` :
       `${result.qdate} QVIX ${num(result.qvix)}，阈值 ${num(result.thr)}：${result.hit?'触发买入信号。':'没有信号，下面仅展示假如买会选哪只。'}`, result.hit?'':'warn');
@@ -131,7 +131,7 @@ $('probe-form').addEventListener('submit', event => {
   });
 });
 
-const filterColumns=[{key:'code',label:'基金代码',render:codeLink},{key:'name',label:'基金名称',text:true},{key:'type',label:'类型',text:true},{key:'aum',label:'规模(亿)',render:v=>num(v)},{key:'ret',label:'收益率(%)',render:v=>num(v)},{key:'mdd',label:'最大回撤(%)',render:v=>num(v)}];
+const filterColumns=[{key:'code',label:'基金代码',render:codeLink},{key:'name',label:'基金名称',text:true},{key:'type',label:'类型',text:true},{key:'aum',label:'C类规模(亿)',render:v=>num(v)},{key:'ret',label:'收益率(%)',render:v=>num(v)},{key:'mdd',label:'最大回撤(%)',render:v=>num(v)}];
 function renderFilter(result,id) {
   if (!state.filter || state.filter.id!==id) state.selected.clear();
   state.filter={id,result}; state.filterPage=result.page||1;

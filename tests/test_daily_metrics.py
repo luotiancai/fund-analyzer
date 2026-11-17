@@ -63,6 +63,72 @@ class DailyMetricsTests(unittest.TestCase):
                              .fetchone()[0], end.strftime("%Y-%m-%d"))
         self.assertEqual(fetcher.scale_universe(), ["000001", "000005"])
 
+    def test_scale_maintenance_keeps_only_c_shares_even_if_old_nav_exists(self):
+        funds = pd.DataFrame([
+            dict(code="000001", name="普通混合C", type="混合型"),
+            dict(code="000002", name="普通混合A", type="混合型"),
+            dict(code="000003", name="新增混合C", type="混合型"),
+            dict(code="000004", name="资产配置C", type="FOF-混合型"),
+            dict(code="000005", name="测试债券C", type="债券型"),
+        ])
+        fetcher._save_fund_list_cache(funds)
+        self.assertEqual(fetcher.scale_universe(), ["000001", "000003"])
+        fetcher._save_fund_list_cache(funds[funds["code"] == "000002"])
+        self.assertEqual(fetcher.scale_universe(), [])
+
+    def test_own_share_aum_excludes_a_and_unpublished_quarters(self):
+        funds = pd.DataFrame([
+            dict(code="000001", name="普通混合C", type="混合型"),
+            dict(code="000003", name="普通混合A", type="混合型"),
+            dict(code="000004", name="缺失混合C", type="混合型"),
+            dict(code="000005", name="缺失混合A", type="混合型"),
+        ])
+        fetcher._save_fund_list_cache(funds)
+        with contextlib.closing(fetcher._conn()) as c:
+            c.executemany("INSERT INTO fund_scale_hist VALUES (?,?,?,?,?)", [
+                ("000001", "2025-09-30", 1.9, "2025-10-25", time.time()),
+                ("000001", "2025-12-31", 3.0, "2026-01-25", time.time()),
+                ("000003", "2025-09-30", 10., "2025-10-25", time.time()),
+                ("000005", "2025-09-30", 20., "2025-10-25", time.time()),
+            ])
+            c.commit()
+        asof = "2026-01-10"
+        with patch.object(fetcher, "_SIBLING_MAP", None):
+            self.assertEqual(fetcher.funds_aum_asof(["000001", "000004"], asof),
+                             {"000001": 1.9, "000004": None})
+            self.assertEqual(fetcher.fund_aum_asof("000001", asof, fetch_if_missing=False), 1.9)
+            self.assertIsNone(fetcher.fund_aum_asof("000004", asof, fetch_if_missing=False))
+            merged = fetcher.funds_aum_asof(["000001", "000004"], asof, merge_classes=True)
+            self.assertAlmostEqual(merged["000001"], 11.9)
+            self.assertEqual(merged["000004"], 20.)
+            self.assertAlmostEqual(fetcher.fund_aum_asof("000001", asof,
+                                                       fetch_if_missing=False, merge_classes=True), 11.9)
+        many = fetcher.funds_aum_asof([f"{i:06d}" for i in range(1200)], asof)
+        self.assertEqual(len(many), 1200)
+        self.assertEqual(many["000001"], 1.9)
+
+    def test_backtest_default_uses_c_share_aum_and_includes_exact_threshold(self):
+        import backtest_qvix as B
+        asof = (self.nav["date"].iloc[-1] + pd.offsets.BDay(1)).strftime("%Y-%m-%d")
+        fetcher._save_fund_list_cache(pd.DataFrame([
+            dict(code="000001", name="普通混合C", type="混合型"),
+            dict(code="000003", name="普通混合A", type="混合型"),
+        ]))
+        with contextlib.closing(fetcher._conn()) as c:
+            c.executemany("INSERT INTO fund_scale_hist VALUES (?,?,?,?,?)", [
+                ("000001", "2023-03-31", 1.9, "2023-04-25", time.time()),
+                ("000003", "2023-03-31", 10., "2023-04-25", time.time()),
+            ])
+            c.commit()
+            with patch.object(B, "_metrics_asof_cached", return_value={"000001": {"ret_3m": -10.}}), \
+                    patch.object(fetcher, "_SIBLING_MAP", None):
+                args = dict(pick="bottom", min_aum=2.0)
+                self.assertIsNone(B.find_champion_on_date(c, asof, **args)[0])
+                self.assertEqual(B.find_champion_on_date(c, asof, aum_basis="merged", **args)[0], "000001")
+                c.execute("UPDATE fund_scale_hist SET aum=2.0 WHERE code='000001'")
+                c.commit()
+                self.assertEqual(B.find_champion_on_date(c, asof, **args)[0], "000001")
+
     def test_inception_uses_share_class_estabdate_and_rejects_bad_responses(self):
         response = Mock()
         response.json.return_value = dict(ErrCode=0, Datas=dict(

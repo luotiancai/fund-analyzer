@@ -5,7 +5,7 @@
   · 找不到"真正跌过"的合格候选就放弃当天, 顺延到下一个信号日
     (2026-08-12 之前这里有"改买涨幅最大"的兜底和配套的"顺延至标的换掉",
      两条都已删除, 理由见 run_backtest 里买入那段注释)
-- 标的: 前一交易日近3月冠军(C类全市场, 规模≥2亿), 冠军排名复用 fetcher.compute_
+- 标的: 前一交易日近3月冠军(C类全市场, C类自身规模≥2亿), 冠军排名复用 fetcher.compute_
   metrics_asof——与基金筛选页"截至日期"筛选完全同口径(按日
   收益率连乘, 正确处理分红除权, 自带单日|收益率|>30%异常值过滤), 而非
   简化的 end_nav/anchor_nav-1(曾把 2020-07-16 算错成广发医疗保健夺冠,
@@ -31,10 +31,8 @@ from fund_rules import HOLD_PERIOD_RE
 # 基金规模(AUM)过滤:规模数据(季度期末净资产,亿元)存在 fund_scale.db 的
 # fund_scale_hist 表, 取数/按信号日取值的逻辑都在 fetcher(见
 # fetcher.fund_aum_asof, 无未来函数——只用已披露的季报)。这里直接调它。
-# 2026-08-06 起口径改为 **A/C 份额合并**: 数据源按基金代码给净资产, 而 A/C 是
-# 同一份基金合同下的两个代码, 单看 C 类会系统性低估整只基金的规模(如财通成长
-# 优选 2025-04-07: C 类 1.36亿, 合并 21.43亿)。门槛想挡的"迷你基金净值易被单笔
-# 申赎搅动"和清盘线都是整只基金口径, 详见 fetcher 里 A/C 份额合并那段。
+# 2026-11-17 起默认只看 C 类自身规模≥2亿。aum_basis="single"；
+# 历史 A/C 合并口径通过 --aum-basis merged 显式复现，旧跑批记录保持原参数。
 
 # 已核实的净值异常(直连东财源头核对过, 不是本地缓存问题, 但明显非真实
 # 市场收益): 014939 同泰产业升级混合C 2025-03-31 单位净值单日 +68.7%
@@ -48,15 +46,16 @@ NAV_ANOMALIES = {
     "014939": [(pd.Timestamp("2025-03-31"), 1.6249 / 0.9630)],
 }
 
-# ── 标准策略回测参考快照(2026-08-11, 数据/规则变了要重跑, 别当成结论)──
+# ── 历史标准策略回测参考快照(合并规模口径，非当前 C 类自身口径)──
+# 下述统计尚未按 2026-11-17 的新规模口径重跑。
 # 上面这段窗口×分位对比、以及后面出现过的"涨幅冠军+相关系数过滤"都是
 # 中途淘汰的旧方案, 历史版本见 git 历史, 不再列在这里。当前标准策略是
 # QVIX 2年90分位信号(window=490,pct=0.90) + 近3月跌幅最大(ret_col=
 # "ret_3m",pick="bottom") + 候选波动率比值≥1.5(min_vol_ratio=1.5,
 # 2026-08-13 定档, 见下面的实测) +
 # 候选规模≥2亿(min_aum=2.0 于2026-08-06 从0.5亿提高; 2026-08-12 一度加过
-# 10亿上限, 2026-08-13 撤掉, 见下面实测; 规模按 A/C 份额合并计算,
-# aum_basis="merged") +
+# 10亿上限, 2026-08-13 撤掉, 见下面历史实测; 当前按 C 类自身规模计算,
+# aum_basis="single") +
 # 近3月跌幅不超过30%(max_drop=30.0, 2026-08-12 加, 见该参数说明) +
 # 跌幅耗尽(没有真正跌过的合格候选)就放弃当天、顺延到下一个信号日 +
 # 排除QDII/海外/FOF/持有期锁定基金
@@ -471,7 +470,7 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
                           sse_df=None, min_corr=None,
                           ret_col="ret_3m", pick="top", min_vol_ratio=None,
                           min_aum=None, require_drop=True, max_aum=None,
-                          aum_basis="merged", max_drop=None):
+                          aum_basis="single", max_drop=None):
     """找 asof_date 当天视角下排名第一的标的(排除 exclude_codes). 返回 (code, ret).
 
     复用 fetcher.compute_metrics_asof——按日收益率连乘计算区间收益(正确
@@ -715,7 +714,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  regime_basis: str = "day", no_same_day_rebuy: bool = False,
                  sell_cooldown: int = 2,
                  max_aum: float = None,
-                 aum_basis: str = "merged",
+                 aum_basis: str = "single",
                  min_signal_date: str = None,
                  top_min_vol_ratio=None,
                  signal_mode: str = "threshold",
@@ -837,7 +836,10 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     最初加这道门槛(2026-07-28, 0.5亿)是因为"跌幅最大"排在最前面的常是几十万~
     几千万规模的迷你/僵尸基金, 净值容易被单笔申赎搅动失真。
 
-    ⚠️ 口径变更(2026-08-06): 规模改为 A/C 份额**合并**(见文件头说明)。同一个
+    aum_basis: 默认 single，只看 C 类自身规模；merged 显式使用历史合并口径。
+    2026-11-17 改为单份额默认后，下面的历史回测统计尚未重跑。
+
+    历史口径变更(2026-08-06): 规模曾改为 A/C 份额**合并**。同一个
     数字在新口径下宽松得多——C 类通常只占整只基金的一小部分。下面那张四档表
     是**旧的单份额口径**下测的, 只能当历史记录看, 不能拿来给合并口径定档;
     合并口径的重测结果见文件头的快照。
@@ -1354,10 +1356,9 @@ def main():
                         help="关掉「跌幅耗尽即不操作」规则:信号日即便所有候选都"
                              "是正收益也照买跌幅最大(涨幅最小)那个。默认保留该"
                              "规则(标准策略:没有真正下跌的标的当天就不买)")
-    parser.add_argument("--aum-basis", choices=["merged", "single"], default="merged",
-                        help="规模口径: merged(默认)=同一只基金的 A/C 等份额"
-                             "类别合并计算; single=只算被选中那个代码的份额"
-                             "类别(2026-08-06 之前的旧口径, 系统性低估)。"
+    parser.add_argument("--aum-basis", choices=["merged", "single"], default="single",
+                        help="规模口径: single(默认)=只看 C 类自身规模; "
+                             "merged=合并 A/C 等份额，用于复现历史跑批。"
                              "同一个 --min-aum 数值在两种口径下松紧差很多。")
     parser.add_argument("--max-aum",
                         type=lambda s: None if s.lower() == "none" else float(s),
@@ -1428,7 +1429,7 @@ def main():
                     and args.pick == "bottom" and args.min_vol_ratio == 1.5
                     and args.dd_divisor == 5.0 and args.min_aum == 2.0
                     and args.max_aum is None
-                    and args.aum_basis == "merged"
+                    and args.aum_basis == "single"
                     # 候选池也得是标准的那个 —— 场内 ETF 版参数可以全默认,
                     # 但它是另一个市场的对照实验, 绝不能顶掉主复盘表。
                     and args.min_signal_date is None
@@ -1450,8 +1451,8 @@ def main():
         # 卖出→下次买入的冻结交易日数。2026-09-04 之前的跑批没有这个键,
         # 等同于 0(卖出当天就能买回), 跟之后的跑批比较时必须先看这一项。
         "sell_cooldown": args.sell_cooldown,
-        # 规模口径。2026-08-06 之前的跑批是 "single"(只算被选中那个代码的
-        # 份额类别), 之后是 "merged"(A/C 等份额合并)。同一个 min_aum 数值
+        # 规模口径。2026-11-17 起默认回到 "single"；历史跑批按记录的
+        # "single" 或 "merged" 复现。同一个 min_aum 数值
         # 在两种口径下松紧完全不同, 历史跑批之间比较时必须先看这一项。
         "aum_basis": args.aum_basis,
         "min_signal_date": args.min_signal_date,

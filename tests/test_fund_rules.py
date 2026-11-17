@@ -1,9 +1,16 @@
 import unittest
 
-from fund_rules import is_fof, is_locked_fund, fund_maturity_date
+from fund_rules import is_c_class, is_fof, is_locked_fund, fund_maturity_date
 
 
 class FundRulesTests(unittest.TestCase):
+    def test_c_class_names_preserve_currency_suffixes_without_matching_index_names(self):
+        for name in ("测试混合C", "测试混合c", "测试C类", "测试C(QDII)",
+                     "测试(QDII)C人民币", "测试C美元"):
+            self.assertTrue(is_c_class(name), name)
+        for name in (None, float("nan"), "测试混合A", "MSCI指数A", "CES指数A", "CAC40指数A"):
+            self.assertFalse(is_c_class(name), name)
+
     def test_six_calendar_month_anniversary(self):
         for inception, mature in (("2026-05-11", "2026-11-11"),
                                    ("2026-05-12", "2026-11-12"),

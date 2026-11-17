@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>基金分析仪</title>
   <link rel="stylesheet" href="./app.css?v=2">
-  <script src="./app.js?v=3" defer></script>
+  <script src="./app.js?v=4" defer></script>
 </head>
 <body>
 <main>
@@ -28,7 +28,7 @@
       <label>决策日<input type="date" id="pick-date" min="2020-01-01" required></label>
       <button class="primary" type="submit">计算候选</button>
     </form>
-    <details class="help"><summary>计算口径</summary><p>只使用决策日前的净值。近 3 月按实际净值终点往回 91 个自然日取窗口，规模取当时已披露的季报，合并 A/C 等份额。排除 QDII、海外、FOF、定开和持有期锁定基金。C 类份额按实际成立日满 6 个自然月后才参与排名和净值检查；参选基金缺少近 3 月窗口内应有的交易日净值时，计算会报错。历史日期展示当时的 QVIX 信号。</p></details>
+    <details class="help"><summary>计算口径</summary><p>只使用决策日前的净值。近 3 月按实际净值终点往回 91 个自然日取窗口，仅取 C 类自身当时已披露的季报规模，门槛为至少 2 亿。排除 QDII、海外、FOF、定开和持有期锁定基金。C 类份额按实际成立日满 6 个自然月后才参与排名和净值检查；参选基金缺少近 3 月窗口内应有的交易日净值时，计算会报错。历史日期展示当时的 QVIX 信号。</p></details>
     <div id="pick-output" aria-live="polite"><div class="empty">选择日期，查看候选及淘汰原因。</div></div>
     <div id="probe-panel" hidden>
       <h3>查一只基金为什么没选中</h3>
@@ -38,7 +38,7 @@
   </section>
 
   <section id="pane-filter" class="pane" hidden>
-    <div class="section-title"><div><h2>筛选基金</h2><p>按收益、回撤和规模筛选，支持回看历史日期。</p></div></div>
+    <div class="section-title"><div><h2>筛选基金</h2><p>仅筛选 C 类份额，规模按 C 类自身计算，支持回看历史日期。</p></div></div>
     <form id="filter-form" class="filter-grid">
       <label class="wide">基金类型<select id="filter-types" multiple size="3" aria-label="基金类型，不选则全部"></select><small>不选则全部；已排除债券和固收类。</small></label>
       <label>时间区间<select id="filter-period"><option value="1m">近 1 月</option><option value="3m">近 3 月</option><option value="6m">近 6 月</option><option value="1y" selected>近 1 年</option></select></label>

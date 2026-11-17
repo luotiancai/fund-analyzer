@@ -5,6 +5,12 @@ from calendar import monthrange
 from datetime import date
 
 MIN_FUND_AGE_MONTHS = 6
+_C_CLASS_RE = re.compile(r"[Cc](类|\(|（|人民币|美元|$)")
+
+
+def is_c_class(name) -> bool:
+    """Share-class C suffix, including currency/parenthesis variants."""
+    return name is not None and _C_CLASS_RE.search(str(name).strip()) is not None
 
 
 def fund_maturity_date(inception_date: str) -> str:

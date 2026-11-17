@@ -8,6 +8,8 @@
 --------
 
 - GitHub Actions 的 `update-daily.yml` 刷新基金净值、指标和季度规模。
+  2026-11-17 起只维护非债、非 FOF 的 C 类规模；选基和筛选按 C 类自身规模，
+  选基门槛至少 2 亿。历史其他份额规模保留，供显式合并口径的旧跑批复现。
 - VPS 的 `vps_qvix_daily.sh` 每周二至周六北京时间 07:00 更新前一交易日的
   QVIX 和上证日线，发布 `qvix.db` 与 `market.db` 后重建上证页。首次部署
   先运行 `sync_down.py market` 取回历史行情，再安装脚本末尾的 cron。

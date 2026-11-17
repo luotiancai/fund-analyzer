@@ -136,6 +136,7 @@ def prepare_probes(fetcher, funds, connection, result, asof):
 def filter_funds(fetcher, funds, connection, args):
     import pandas as pd
     from web_common import today
+    funds = funds[funds["name"].map(fetcher.is_c_class)]
     period = args["period"]
     suffix = {"1m": "1m", "3m": "3m", "6m": "6m", "1y": "1y"}[period]
     ret, mdd = "ret_" + suffix, "mdd_" + suffix
@@ -176,10 +177,10 @@ def filter_funds(fetcher, funds, connection, args):
         work = work[work[ret] >= args["min_ret"]]
     if args["max_dd"] is not None:
         work = work[work[mdd].isna() | (work[mdd] * 100 <= args["max_dd"])]
-    aums = fetcher.funds_aum_asof(work["code"].tolist(), ref)
+    aums = fetcher.funds_aum_asof(work["code"].tolist(), ref, merge_classes=False)
     work["aum"] = work["code"].map(aums)
     if args["min_aum"]:
-        work = work[work["aum"].isna() | (work["aum"] >= args["min_aum"])]
+        work = work[work["aum"] >= args["min_aum"]]
     work = work.sort_values(ret, ascending=False, na_position="last")
     result = work[["code", "name", "type", "aum", ret, mdd]].rename(
         columns={ret: "ret", mdd: "mdd"}).copy()

@@ -57,7 +57,7 @@ def _std_params():
          inspect.signature(B.run_backtest).parameters.items()
          if v.default is not inspect.Parameter.empty}
     return {k: d[k] for k in ("min_vol_ratio", "min_aum", "max_aum",
-                              "max_drop", "dd_divisor", "window", "pct")}
+                              "max_drop", "dd_divisor", "window", "pct", "aum_basis")}
 
 
 STD = _std_params()
@@ -273,7 +273,8 @@ def scan(asof, top: int = 40) -> dict:
     # 跌幅榜名次: 分母是「真跌」的那批(跟策略的遍历顺序同一个序列), 不含
     # 涨的 —— 涨的根本不在这条路径上, 混进分母只会让名次看起来更靠前。
     order = sorted((c for c in cand if cand[c] < 0), key=cand.get)
-    aums = fetcher.funds_aum_asof(sorted(cand), asof_s, merge_classes=True)
+    aums = fetcher.funds_aum_asof(sorted(cand), asof_s,
+                                merge_classes=(STD["aum_basis"] == "merged"))
     ranks = {c: i + 1 for i, c in enumerate(order)}
     out["n_drop"] = len(order)
 
@@ -341,7 +342,9 @@ def probe(asof, codes, res: dict = None) -> list:
             sorted((c for c in cand if cand[c] < 0), key=cand.get))}
 
     codes = [c.strip() for c in codes if c and c.strip()]
-    aums = fetcher.funds_aum_asof(codes, asof_s, merge_classes=True)
+    aum_codes = [code for code in codes if fetcher.is_c_class(names.get(code))]
+    aums = fetcher.funds_aum_asof(aum_codes, asof_s,
+                                merge_classes=(STD["aum_basis"] == "merged"))
     out = []
     for code in codes:
         if fetcher.is_fof(types.get(code), names.get(code)):

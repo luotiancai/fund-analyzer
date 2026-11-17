@@ -74,8 +74,9 @@ def compute(run_id: int, dry_run: bool = False):
     sse_ret = sse_close.pct_change()
     need = fetcher.RETURN_DAYS["ret_3m"]
 
-    row = conn.execute("SELECT label, trades FROM strategy_runs WHERE id=?",
+    row = conn.execute("SELECT label, trades, params FROM strategy_runs WHERE id=?",
                        (run_id,)).fetchone()
+    params = json.loads(row["params"] or "{}")
     trades = json.loads(row["trades"])
     print(f"跑批 #{run_id}「{row['label']}」{len(trades)} 笔\n", flush=True)
 
@@ -86,7 +87,8 @@ def compute(run_id: int, dry_run: bool = False):
                 if m.get("ret_3m") is not None and c not in exclude}
         # 规模≥2亿: 用批量版一次 SQL 取完, 纯读库不触网(逐只 fund_aum_asof
         # 要查两万多次, 会把这个脚本拖到小时级)。
-        aums = fetcher.funds_aum_asof(sorted(cand), t["买入日"], merge_classes=True)
+        aums = fetcher.funds_aum_asof(sorted(cand), t["买入日"],
+                                    merge_classes=(params.get("aum_basis", "single") == "merged"))
         cand = {c for c in cand
                 if aums.get(c) is not None and aums[c] >= 2.0}
 

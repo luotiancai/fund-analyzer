@@ -174,7 +174,7 @@ def _done_rets(df: pd.DataFrame):
     return done, rets, days
 
 
-def review_summary(bt_df: pd.DataFrame, bt_id, bt_at) -> str:
+def review_summary(bt_df: pd.DataFrame, bt_id, bt_at, params=None) -> str:
     """标准策略那张表上方的统计说明(markdown)。"""
     _done, _rets, _days = _done_rets(bt_df)
     _n, _wins = len(_rets), int((_rets > 0).sum())
@@ -194,8 +194,13 @@ def review_summary(bt_df: pd.DataFrame, bt_id, bt_at) -> str:
     _loss = _rets[_rets <= 0]
     _loss_txt = ("、".join(f"{v:+.2f}%" for v in _loss)
                  if len(_loss) else "无")
+    merged = (params or {}).get("aum_basis", "single") == "merged"
+    basis = "A/C 等份额合并" if merged else "C 类自身"
     return (
-        f"{_n} 笔已完成:胜率 {_wins / _n * 100:.1f}%({_wins}/{_n}),"
+        f"本次跑批规模口径：**{basis}**。"
+        + ("这是历史合并口径跑批，当前选基已改为 C 类自身规模，尚未按新口径重跑。"
+           if merged else "")
+        + f"{_n} 笔已完成:胜率 {_wins / _n * 100:.1f}%({_wins}/{_n}),"
         f"费后复利 {_cum:+.2f}%,累计手续费 {_fees:.1f}%,"
         f"平均持有 {_days.mean():.0f} 天,"
         f"平均费后 {_rets.mean():+.2f}%,"
@@ -225,8 +230,7 @@ def review_summary(bt_df: pd.DataFrame, bt_id, bt_at) -> str:
         "同一只基金在止损后连续12个信号日仍是涨幅冠军、照规则买回去"
         "是 -10.47%,说明 +36.76% 是买入时点的运气而非规则的能力。"
         "规模按信号日当时"
-        "已披露的最新季报口径(无未来函数)、A/C 等份额类别合并计算"
-        "(2026-08-06 改,此前只算 C 类那一个代码,系统性低估),"
+        f"已披露的最新季报口径(无未来函数)、{basis}计算，"
         "排掉了几十万~几千万"
         "规模、净值易失真的迷你基金。橙色=触发基金回撤线离场,"
         "蓝色=触发大盘回撤线离场,两格都染色=同日两条线双双触发;"
@@ -342,9 +346,7 @@ def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
     _tvr = x_params.get("top_min_vol_ratio", "same")
     _mdrop = x_params.get("max_drop")   # 老跑批没记这项
     _aum = x_params.get("min_aum", 0.5)   # 老跑批没记这项时按旧标准
-    # 规模口径 2026-08-06 从「只算该代码的份额类别」改成
-    # 「A/C 合并」, 同一个 min_aum 数值在两种口径下松紧差很多,
-    # 所以旧口径的跑批必须标出来, 否则会跟标准策略误比。
+    # 按跑批保存的口径标注，避免历史合并规模与当前 C 类自身规模混淆。
     _basis = x_params.get("aum_basis", "single")
     # 候选池/费率口径: 场内 ETF 版跟场外是两个市场, 页面上
     # 必须一眼看出来, 否则跟场外跑批并排列着会被当成同类比较。
@@ -366,8 +368,7 @@ def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
         + (f"规模**{_aum}~{x_params['max_aum']}亿**"
            if x_params.get("max_aum") else
            f"规模≥{_mark(_aum, 2.0)}亿")
-        + ("(**旧口径:只算该代码的份额类别,未合并 A/C**)"
-           if _basis != "merged" else "")
+        + ("(合并份额口径)" if _basis == "merged" else "(单份额口径)")
         + (f"。候选池:{_mkt}" if _mkt else "")
         + (f",{x_params['exit_note']}"
            if x_params.get("exit_note") else ",双止损口径同标准策略")
