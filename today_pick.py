@@ -210,12 +210,12 @@ def _require_complete_nav(conn, trading_dates, need_date, codes):
     return eligible
 
 
-def scan(asof, top: int = 40) -> dict:
+def scan(asof) -> dict:
     """按标准策略走一遍当天的候选, 返回结构化结果(CLI 和页面共用)。
 
     rows 是**实际遍历路径**: 从跌幅最深处往下, 每行一个 dict(见 _row)。
-    走到选中那只就截止 —— 之后的候选策略压根没看过。跌幅超上限的那批只
-    计数(too_deep), 不进 rows。
+    走到选中那只就截止；没有合格标的时遍历完全部下跌候选，不按数量截断。
+    跌幅超上限的那批只计数(too_deep), 不进 rows。
 
     想知道某只具体基金在今天这批候选里的位置, 用 probe() 单查, 不要把这条
     遍历路径拉长: 路径的意义就是"策略实际看过哪些", 多列的部分不属于它。"""
@@ -291,7 +291,7 @@ def scan(asof, top: int = 40) -> dict:
         _a, _e = _ret3m_window(conn, code, asof_s)
         rows.append(_row(code, names.get(code, code), r3, beta, aum, why,
                          role, _a, _e, ranks.get(code)))
-        if chosen is not None or len(rows) >= top:
+        if chosen is not None:
             break
 
     out.update(rows=rows, too_deep=too_deep, chosen=chosen, cand=cand,

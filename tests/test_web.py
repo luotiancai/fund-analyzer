@@ -75,6 +75,47 @@ PATH = fixture()
 
 
 class CalculationTests(unittest.TestCase):
+    def test_pick_continues_after_more_than_40_rejections(self):
+        path = ROOT / "snapshots" / "long-pick-path"
+        path.mkdir()
+        for filename in FILES.values():
+            shutil.copyfile(PATH / filename, path / filename)
+        with contextlib.closing(sqlite3.connect(":memory:")) as c:
+            for name, filename in FILES.items():
+                c.execute(f"ATTACH DATABASE ? AS {name}", (str(path / filename),))
+            dates = [r[0] for r in c.execute(
+                "SELECT date FROM fund_nav_daily WHERE code='000002' ORDER BY date")]
+            returns = -.004 + .0001 * np.sin(np.arange(len(dates)) / 5)
+            nav = np.cumprod(1 + returns)
+            funds = json.loads(c.execute("SELECT data FROM fund_list").fetchone()[0])
+            rejected = {f"{100000 + i:06d}" for i in range(41)}
+            # All 41 precede the genuine candidate by loss depth, but fail volatility.
+            for code in sorted(rejected):
+                funds.append(dict(code=code, name=f"低波动混合{code}C", type="混合型"))
+                c.executemany("INSERT INTO fund_nav_daily VALUES (?,?,?,?,?)", [
+                    (code, d, float(n), float(r * 100), float(n))
+                    for d, n, r in zip(dates, nav, returns)])
+                c.execute("INSERT INTO fund_nav_meta VALUES (?,?,?)",
+                          (code, time.time(), dates[-1]))
+                c.execute("INSERT INTO fund_inception VALUES (?,?,?,?)",
+                          (code, dates[0], "fixture", time.time()))
+                c.execute("INSERT INTO fund_scale_hist VALUES (?,?,?,?,?)",
+                          (code, "2025-12-31", 5., "2026-01-22", time.time()))
+            c.execute("UPDATE fund_list SET data=?", (json.dumps(funds),))
+            c.commit()
+        request, output = ROOT / "long-pick-request.json", ROOT / "long-pick-result.json"
+        write_json(request, dict(snapshot=str(path), operation="pick",
+                                 args={"asof": today().isoformat()}))
+        subprocess.run([sys.executable, "web_tasks.py", str(request), str(output)],
+                       check=True, capture_output=True, timeout=15,
+                       cwd=Path(__file__).resolve().parents[1])
+        result = json.loads(output.read_text())
+        self.assertEqual(result["chosen"], "000002")
+        self.assertEqual(len(result["rows"]), 42)
+        self.assertEqual({r["code"] for r in result["rows"][:-1]}, rejected)
+        self.assertTrue(all(r["why"].startswith("波动") for r in result["rows"][:-1]))
+        self.assertEqual(result["rows"][-1]["role"], "★ 选中")
+
     def test_pick_probe_and_filter_use_c_share_aum_and_ignore_large_a_sibling(self):
         for aum in (None, 1.5, 2.0):
             with self.subTest(c_aum=aum):
