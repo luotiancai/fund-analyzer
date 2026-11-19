@@ -18,6 +18,8 @@ on:
     # 分钟数早就错开整点了, 那条建议已经用尽, 别再往这个方向调。要根治得靠
     # 外部触发(workflow_dispatch 是同步建 run 的, 不经过这个会丢事件的定时器)。
     - cron: "37 18 * * 1-5"
+  repository_dispatch:
+    types: [fund-nav-update]  # VPS 的 fund-nav-trigger.timer 触发完整跑批
   workflow_dispatch:      # 手动触发测试 / 单项补数据用
     inputs:
       mode:

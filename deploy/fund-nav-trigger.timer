@@ -1,0 +1,10 @@
+[Unit]
+Description=Trigger the GitHub fund database workflow at 02:37 Beijing time
+
+[Timer]
+OnCalendar=Tue..Sat *-*-* 02:37:00 Asia/Shanghai
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

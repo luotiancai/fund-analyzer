@@ -1,0 +1,10 @@
+[Unit]
+Description=Trigger the GitHub fund database workflow
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=GH_CONFIG_DIR=/root/.config/gh
+ExecStart=/usr/bin/gh api --method POST --header X-GitHub-Api-Version:2026-03-10 repos/luotiancai/fund-analyzer/dispatches -f event_type=fund-nav-update
+TimeoutStartSec=45s
