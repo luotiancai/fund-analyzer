@@ -8,6 +8,7 @@
 --------
 
 - GitHub Actions 的 `update-daily.yml` 刷新基金净值、指标和季度规模。
+  VPS 的 `fund-nav-trigger.timer` 每周二至周六北京时间 02:37 发送 `fund-nav-update` 事件。
   2026-11-17 起只维护非债、非 FOF 的 C 类规模；选基和筛选按 C 类自身规模，
   选基门槛至少 2 亿。历史其他份额规模保留，供显式合并口径的旧跑批复现。
 - VPS 的 `vps_qvix_daily.sh` 每周二至周六北京时间 07:00 更新前一交易日的
@@ -45,6 +46,11 @@
 执行 `python3 deploy_web.py`，默认部署搬瓦工；打包仅包含代码和网页，
 自动排除 macOS 元数据，不上传配置密钥或本地数据库。每次生成独立 release。
 安装脚本保留 nginx 备份，先生成当天缓存、健康检查再开放入口。它不改原有跑批环境和 cron。
+
+迁移基金跑批触发器时，把 `deploy/fund-nav-trigger.service` 和 `deploy/fund-nav-trigger.timer`
+安装到 VPS 的 `/etc/systemd/system/`，执行 `systemctl daemon-reload` 和
+`systemctl enable --now fund-nav-trigger.timer`。服务使用 `/root/.config/gh` 中的 GitHub 登录，
+需要本仓库的 `Contents: write` 权限。
 
 检查：
 

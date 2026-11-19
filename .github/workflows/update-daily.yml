@@ -1,25 +1,9 @@
 name: 每日数据跑批
 
 on:
-  schedule:
-    # 18:37 UTC = 北京次日 02:37:周二至周六凌晨跑。前一交易日 15:00 收盘,
-    # 到凌晨2点半已过去11个半小时, 基金净值(通常当晚20:00~23:00公布)已发布。
-    # 周日/周一凌晨对应周六/周日, 没有新净值, 不跑。
-    #
-    # 分钟数必须错开整点: 原来写的 0 17 命中了 GitHub 全球调度高峰, 实测每次
-    # schedule 事件都要压 80~110 分钟才派发, 2026-08-06 那次更是排了 16 分钟
-    # 都没分到托管 runner, job 一步没跑就被判 cancelled(公共仓库的免费 job 在
-    # runner 分配队列里优先级最低)。整点是最挤的, 别再往回改。
-    #
-    # ⚠️ schedule 这个闹钟本身不可靠, 别把它当唯一触发源。2026-08-10 起当前
-    # cron 的 13 次排期实测: 中位迟 39 分钟, 最坏迟 151 分钟, 而 2026-08-27
-    # 那次**整个被丢掉**——没有失败记录, 没有 job, 什么都没有, 数据就那么停在
-    # 前一天。GitHub 官方文档写明拥堵时 "some queued jobs may be dropped"。
-    # 分钟数早就错开整点了, 那条建议已经用尽, 别再往这个方向调。要根治得靠
-    # 外部触发(workflow_dispatch 是同步建 run 的, 不经过这个会丢事件的定时器)。
-    - cron: "37 18 * * 1-5"
   repository_dispatch:
-    types: [fund-nav-update]  # VPS 的 fund-nav-trigger.timer 触发完整跑批
+    # GitHub 的 schedule 多次延迟数小时或漏跑。定时由 VPS 的 fund-nav-trigger.timer 执行。
+    types: [fund-nav-update]
   workflow_dispatch:      # 手动触发测试 / 单项补数据用
     inputs:
       mode:
@@ -34,11 +18,7 @@ on:
 permissions:
   contents: write   # gh release upload 需要
 
-# 并发组保留(现在组里只剩这一个 workflow —— qvix-retry.yml 已于 2026-08-28
-# 删除, QVIX 改由国内 VPS 独占产出)。留着是因为手动 workflow_dispatch 和
-# 定时那次完全可能撞上: 两次都是"下载 release 库 → 改 → 传回", 并行就会互相
-# 覆盖。让后到的排队等前一个跑完。cancel-in-progress 必须是 false——取消跑到
-# 一半的跑批等于白跑几十分钟还什么都没写回去。
+# VPS 定时触发和手动触发共享并发组，避免两个跑批同时下载并覆盖同一份 Release 数据库。
 concurrency:
   group: fund-analyzer-db
   cancel-in-progress: false
@@ -77,7 +57,7 @@ jobs:
           done
 
       # 规模单独放最后、单独回传, 避免季报到期时拖慢净值发布。
-      # scales-only 只刷规模,别的一概不碰;定时触发没有 inputs,默认 full。
+      # scales-only 只刷规模。VPS 的 repository_dispatch 没有 inputs，按 full 执行。
       - name: 跑批(增量补净值 + 重算指标)
         if: github.event.inputs.mode != 'scales-only' && github.event.inputs.mode != 'inception-only'
         run: python update_daily.py --no-scales
