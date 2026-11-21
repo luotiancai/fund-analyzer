@@ -17,7 +17,7 @@ FOF 基金按类型及名称识别，不参与筛选、选基、回测及净值�
 - `fetcher.py`、`update_daily.py`: 数据采集和每日跑批。
 - `today_pick.py`、`backtest_qvix.py`、`pct_rank.py`: 候选诊断、策略回测和分位补算。
 - `build_site.py`、`sse_view.py`、`site/`: 上证静态页。
-- `qvix_core.py`、`qvix_calc.py`、`web_qvix.py`: QVIX 共用算法、日度计算及网站手动查询。
+- `qvix_core.py`、`qvix_calc.py`、`web_qvix.py`: QVIX 共用算法、上交所收盘价日度计算及网站手动查询。
 - `backfill_qvix_history.py`: QVIX 历史回填工具。
 - `sync_down.py`、`push_dbs.py`、`cloud_peek.py`、`cloud_assets.py`: 数据同步、发布和检查工具。
 - `deploy/`、`deploy_web.py`: 基金网站部署; 详见 [部署说明](deploy/README.md)。

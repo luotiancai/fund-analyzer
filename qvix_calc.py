@@ -1,344 +1,245 @@
-"""自算 QVIX(CBOE VIX 白皮书方法论)。两条独立路径,共享同一套核心公式
-(_term_variance/K0选取/1-K²加权/30天插值),数据来源不同:
+"""50ETF 日线 QVIX。上交所风险指标表只提供当日合约编码，取价用逐合约日 K 线的收盘价。
 
-  ① qvix_core.compute_qvix() ——当前实时值。用上交所50ETF期权的新浪
-     实时报价(bid/ask)现算，供网站手动查询和 VPS 收盘值跑批共用。
-     新浪可能按出口 IP 限流，失败时明确报错。
-  ② compute_qvix_for_date() ——收盘后的历史/日线值。实时买卖价查不到
-     历史,改用上交所官方期权风险指标接口(option_risk_indicator_sse,
-     2015-02-09起可查)已经算好的隐含波动率反推 Black-Scholes 理论价格
-     再代入同一套公式。backfill_qvix_history.py(一次性批量回算)和
-     fetcher.update_qvix_self_daily()(每日跑批增量更新)都用这个。
+2026-11-20 两张有正常成交的认购合约被风险指标表填了零隐波。用它反推
+期权价格会漏掉这两张，算出 13.99，而上交所、东方财富和新浪收盘价都得到
+15.66。历史日线和每日更新共用这个模块；新浪盘中买卖价仍走 qvix_core。
 
-起因:optbbs(1.optbbs.com,唯一免费QVIX源,akshare里所有QVIX变体背后
-都是这一家)偶发返回整天空值、日线收盘价发布常年延迟到次日上午,而且
-2026-03-23(上证单日-3.63%)那天发布的收盘值 42.16 根本不是30天期口径
-——那天3月合约只剩2天到期,自算它的隐含波动率是 41.31,跟 42.16 基本
-重合,而真正30天位置上的4月合约(正好剩30天)是 22.95。也就是说他们
-那天的值塌成了"临到期合约的波动率"。已不再信任 optbbs,全面改用自算。
+只用标准合约，使用最近两个到期月并按 30 天插值。近月到期前不提前换月；
+50ETF 没有周合约，换月后偶尔需要小幅外推，最近可用近月超过 40 天就停。
+到期日为第四个星期三，休市顺延。现货价格和上交所隐波均不参与计算，
+远期价通过认购认沽平价反推。SHIBOR 期限结构按到期天数插值。
 
-方法论: 近月+次近月期权,用 put-call parity 反推远期价格 F,K0 取不
-超过 F 的最大行权价,以 K0 为界选虚值认沽(K<K0)+虚值认购(K>K0)+K0
-处认购认沽均价,按 1/K² 加权求和,再按到期时间插值成 30 天期方差。
-到期时间精确到秒(到期日15:00收盘 - 当前时刻,数学上等价于 CBOE 白皮书
-按分钟分段累加的写法);无风险利率按 SHIBOR 期限结构对近月/次近月各自
-的剩余天数线性插值(而不是不分期限统一用一个1年期利率),取不到 SHIBOR
-时:实时路径退回 fetcher.get_risk_free_rate()(1年期国债收益率),历史路径
-退回常数 0.02——2018年至今 SHIBOR 每个交易日都有,这条兜底从没走到过。
-到期日按上交所规则取"到期月第四个星期三,遇休市顺延至下一交易日"
-(_expiry_for_yymm);实时路径不用自己算,直接取新浪接口给的真实到期日。
-
-到期换月:按现行版白皮书口径,只要求"取夹住30天的两个到期日",近月一直
-用到它到期为止,不做"剩余不足N天就整体跳到后两个月"的换月。这里踩过坑,
-记下来免得再改回去:2009版白皮书(周合约2014年纳入VIX之前那版)确实写了
-"近月剩不足8天就 roll 到第二、第三个合约月",中文圈讲复现VIX的教程抄的
-基本都是那一版,本项目最初也照抄了(_MIN_ROLL_DAYS=7)。但CBOE后来把
-规则改掉、并为此专门把周合约纳进VIX,原因正是老规则会退化:50ETF只有
-月合约,近月一旦被跳过,次月往往已经是35~45天,30天目标落在它之前,
-插值变外推、次月权重变负。恐慌时期限结构倒挂(短期波动率>长期),沿倒挂
-斜率往回外推会把值压低——恰好在该往上冲的时候压低。实测2026-04~07共74
-个交易日,对 optbbs 的平均绝对偏差 0.53→0.41、最大偏差 3.45→2.20;
-2026-07-17(上证-3.05%)从 19.02 修正到 21.08(optbbs 22.47),那天恐慌
-全在只剩5天的7月合约里(IV 26.30),被老规则整个丢掉了。
-
-已知跟官方方法论的差距,均为有意识的取舍而非疏漏:
-  - 风险利率用 SHIBOR(银行间同业拆借利率,含银行信用风险)而非 CBOE
-    原版用的短期国债收益率(纯无风险)——境内没有可比的短期限国债收益
-    率曲线,SHIBOR 是量化定价里通行的替代,概念上不完全等价但业内公认
-    可用。
-  - 50ETF期权没有周合约,凑不出"永远夹住30天"的一对。每月合约到期后的
-    头3~4天,最近的合约还剩33~35天,30天目标落在它之前,这几天仍然是
-    外推(次月权重约-0.15)。这个是没有周合约的硬限制、避不掉,但外推
-    跨度只有3~5天、且不集中在恐慌日,跟上面那条老换月规则的性质不同。
-  - 每次现算要拉近月+次月整月期权链的实时报价。新浪 hq.sinajs.cn/list=
-    支持逗号拼多个 CON_OP_ 代码一次返回(2026-07 实测整月~50合约一个请求
-    15KB 全回来),所以每月链只发 1 个批量请求(近月+次月共 2 个),不再
-    是原来的近50连发——单请求容错高、不会因"瞬时几十并发"被反爬当爬虫
-    掐掉,境外主机(GitHub Actions/Streamlit云)上尤其稳。返回不全时
-    _fetch_chain 会在日志留下"只拿到 X/Y 个合约"的记录,可顺着排查。
-  - 近月方差算出负数时整项丢掉、只用次月(qvix_core.interpolate_30d)。
-    白皮书没有这一条,因为它有周合约、近月永远不会薄到这个地步;50ETF
-    近月剩1~2天时 (1/T)·(F/K0−1)² 会把方差减成负的,而负方差是数学上
-    不存在的东西,只能判定为公式在这里失灵。2018年至今42天踩到。
-算出来的数量级和走势应该跟官方 QVIX 一致,但不保证分毫不差——报价取中
-还是取最新成交、零买价的裁剪时机等实现细节,不同实现之间本来就会有出入。
+沪深300期权曾以同口径试跑，2026-08-31 的回测不如 50ETF，已撤。
 """
 
+from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import logging
 import math
 import re
-import threading
 import time
-from typing import Optional
-from zoneinfo import ZoneInfo
 
-import numpy as np
-import pandas as pd
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 import fetcher
 import qvix_core
 
+
 log = logging.getLogger(__name__)
-
-_CST = ZoneInfo("Asia/Shanghai")
-
 _UNDERLYING = "510050"
-
-# ⚠️ 2026-08-31 试过把这里参数化成多标的、并行产出一条沪深300波指(510300),
-# **回测下来不如 50, 整套已撤, 别再走一遍**。留个记录免得下次又想起来:
-#   · 技术上几乎白拿 —— 上交所那个风险指标接口一次返回当天**全部** ETF 期权
-#     合约(实测 666 条, 510050/510300/510500/588000/588080 都在里面), 换个
-#     前缀筛就是另一只的波指, 不多发一个请求; 合约代码格式、行权价×1000、
-#     到期日规则(到期月第四个星期三)、分红调整标志 M/A 各标的完全一致。
-#   · 立论也站得住 —— 上证50 只从上交所样本里选, 深市一只进不来(中际旭创、
-#     宁德、比亚迪、整个 CPO 板块都在名单外), 而策略买的是"全市场近3月跌
-#     最深", 出来的多半是小盘/成长, 跟信号标的不在一个频道上。
-#   · **但回测不支持**: 同区间(两边第一笔都是 2022-03-15)50 是 9 笔/胜率
-#     8/9/费后复利 +878.95%, 300 是 9 笔(另1笔持仓中)/8/9/+801.22%。300 确实
-#     在 2024-02-02(微盘股崩盘)比 50 早 3 天触发, 但那笔 +15.01% 反而不如
-#     50 在 2024-02-05 买的 +18.82% —— 早不等于好, 02-05 才是真正的底。
-#     而且 300 阈值常年高 2~3 个点, 双止损线跟着变宽, 2025-04-07 那笔晚 7 天
-#     卖、少赚 14 个点。阈值高在这套框架里不是优势, 是让止损更迟钝。
-
-
-_SHIBOR_TENOR_DAYS = [
-    ("O/N", 1), ("1W", 7), ("2W", 14), ("1M", 30),
-    ("3M", 90), ("6M", 180), ("9M", 270), ("1Y", 365),
-]
-
-
-# ── 实时路径:全部委托给 qvix_core ──────────────────────────────────────────
-# qvix_core 是这套算法唯一的实现(只依赖 requests, 见那边的模块说明)。这里
-# 只做转发, **不要**在本文件里另写一份——今天就是因为"同一套算法两处实现"
-# 的风险, 才把核心抽过去的; 在这里复制一份等于把那个风险又请回来。
-# 历史路径(下方 compute_qvix_for_date)复用 qvix_core 的纯计算函数, 取数走
-# 上交所官方接口, 所以仍留在本文件。
-
-norm_cdf = qvix_core.norm_cdf
-bs_price = qvix_core.bs_price
-expiry_date_for_yymm = qvix_core.expiry_date_for_yymm
-_rate_for_days = qvix_core.rate_for_days
-_years_to_expiry = qvix_core.years_to_expiry
-_candidate_pairs = qvix_core.candidate_pairs
-_term_variance = qvix_core.term_variance
-_fetch_chain = qvix_core.fetch_chain
-
-
-def _shibor_curve() -> Optional[list]:
-    """今天最新一行 SHIBOR 各期限报价(年化小数)。见 qvix_core.shibor_curve。"""
-    return qvix_core.shibor_curve()
-
-
-# ── 「链失效」: 算不出来这件事本身就是信号 ────────────────────────────────
-# 失败分两类, 分界线是**取数**还是**算数**:
-#   · 取数失败(接口挂了、收盘价还没发布、当天没有这只标的的合约) —— 纯技术
-#     故障, 跟行情没关系, note 不带前缀。
-#   · 计算失败(合约数据完整地拿到了, 但公式在这堆数据上失效) —— note 带这个
-#     前缀。公式在完整数据上失效的现实原因基本只有一个: **行情极端到跑出了
-#     期权链的覆盖范围**。标的暴跌, 远期价 F 掉到最低挂牌行权价以下, K0 就
-#     选不出来(交易所加挂行权价永远慢半拍), 该月整个被跳过; 几个月份接连被
-#     跳过, 最后只剩下离 30 天太远的合约, 撞上"拒绝外推"那条护栏。
-#
-# 2018 年至今只有 2 个这样的日子, **全部是历史级暴跌**:
-#   2020-02-03 上证 -7.72%(疫情后开市首日)
-#   2022-03-15 上证 -4.95%(4月链 F=2.6459 掉到最低行权价 2.65 以下)
-# 一个平静日的误报都没有(2026-08-31 那次多标的实验里, 沪深300 序列同样只在
-# 2020-02-03 和 2025-04-07 上证 -7.34% 那天失效, 规律一致)。
-# 所以这些日子不该当成"数据缺失"跳过 —— 恰恰相反,
-# 它们是恐慌信号最强的那几天, 只是强到把温度计撑爆了。消费方(回测/今日候选)
-# 拿 is_chain_broken() 判定, 把它们直接算作信号日, 不再跟阈值比(没有值可比)。
+_CONTRACT_RE = re.compile(rf"^{_UNDERLYING}([CP])(\d{{4}})M(\d{{5}})$")
+_SSE_HEADERS = {"Referer": "https://www.sse.com.cn/", "User-Agent": "Mozilla/5.0"}
+_CONTRACT_URL = "https://query.sse.com.cn/commonQuery.do"
+_CLOSE_URL = "https://yunhq.sse.com.cn:32042/v1/sho/dayk/"
+_SHIBOR_BACKUP_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 CHAIN_BROKEN = "链失效"
 
 
 def is_chain_broken(note) -> bool:
-    """这条 note 是不是「链失效」(见上方 CHAIN_BROKEN)。非字符串(NaN/None)
-    一律 False —— 库里 note 为空是正常路径(算出来了就不写原因)。"""
+    """只有期权链确实无法覆盖远期价的日子才可作为恐慌信号。"""
     return isinstance(note, str) and note.startswith(CHAIN_BROKEN)
 
 
-# 合约代码。510050C2609M03000 → (C, 2609, M, 03000): 认购/认沽、到期月、
-# 标准(M)/分红调整(A)、行权价×1000。
-_CONTRACT_RE = re.compile(r"^510050([CP])(\d{4})([A-Z])(\d{5})$")
-
-
-def spot_price_for_date(target_date: dt.date) -> Optional[float]:
-    """指定交易日 510050 收盘价;当天数据还没发布/非交易日返回 None。"""
-    try:
-        df = fetcher.ak.fund_etf_hist_sina(symbol="sh510050")
-    except Exception:
-        return None
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    row = df[df["date"] == target_date]
-    return float(row["close"].iloc[0]) if not row.empty else None
-
-
-def shibor_curve_for_date(target_date: dt.date) -> Optional[list]:
-    """指定交易日的 SHIBOR 期限结构,格式同 _shibor_curve()。当天没有
-    发布返回 None(调用方回退到 fetcher.get_risk_free_rate())。"""
-    try:
-        df = fetcher.ak.macro_china_shibor_all()
-    except Exception:
-        return None
-    df["日期"] = pd.to_datetime(df["日期"]).dt.date
-    row = df[df["日期"] == target_date]
-    if row.empty:
-        return None
-    row = row.iloc[0]
-    pts = []
-    for tenor, days in _SHIBOR_TENOR_DAYS:
-        col = f"{tenor}-定价"
-        if col in row.index and pd.notna(row[col]):
-            pts.append((float(days), float(row[col]) / 100.0))
-    pts.sort()
-    return pts if len(pts) >= 2 else None
-
-
-def _expiry_for_yymm(yymm: str) -> dt.date:
-    """'2301' → 该月合约的**真实**到期日(第四个星期三,遇休市顺延至下一交易日)。
-
-    qvix_core.expiry_date_for_yymm 只算第四个周三就停了:那份文件保持零
-    依赖(见它的模块说明),拿不到交易日历,所以"顺延"这一步只能在
-    这里补。实时路径不需要补——它的到期日是从新浪接口取的真实值。
-    2018年至今只撞上一次:2023-01-25 是春节休市,1月合约实际到期日是
-    2023-01-30。漏掉顺延会让 2022-12-28~2023-01-20 共17个交易日的近月剩余
-    天数少算5天,插值权重跟着偏,值整体偏高 0.03~0.23。
-    拿不到日历、或日历还没覆盖到那个月份时,退回第四个周三(即旧行为)——
-    不能因为一次网络抖动就整段算不出来。"""
-    base = expiry_date_for_yymm(yymm)
-    days = fetcher._trading_days()
-    if not days or base > max(days):
-        return base
-    d = base
-    for _ in range(10):     # 最长的连续休市(春节/国庆)也就9天
-        if d in days:
-            return d
-        d += dt.timedelta(days=1)
-    return base
-
-
-def _listed_expiries(df, target_date: dt.date):
-    """当天数据里实际出现过的到期月代码 → (到期日期, 剩余自然天数),
-    按剩余天数升序;只看普通(非分红调整)合约。"""
-    out = {}
-    for cid in df["CONTRACT_ID"]:
-        m = _CONTRACT_RE.match(cid)
-        if not m or m.group(3) != "M":
-            continue
-        yymm = m.group(2)
-        if yymm in out:
-            continue
+def _get_json(url, params=None, *, headers=None):
+    for attempt in range(3):
         try:
-            expiry = _expiry_for_yymm(yymm)
-        except Exception:
-            continue
-        days = (expiry - target_date).days
-        if days > 0:
-            out[yymm] = (expiry, days)
-    return sorted(out.items(), key=lambda kv: kv[1][1])
-
-
-def _build_chain_from_risk_indicator(df, yymm: str, S: float, T: float, r: float):
-    rows = []
-    for _, row in df.iterrows():
-        m = _CONTRACT_RE.match(row["CONTRACT_ID"])
-        if not m or m.group(3) != "M" or m.group(2) != yymm:
-            continue
-        sigma = row["IMPLC_VOLATLTY"]
-        if pd.isna(sigma):
-            continue
-        strike = int(m.group(4)) / 1000.0
-        price = bs_price(m.group(1), S, strike, T, r, float(sigma))
-        if price is None or price <= 0:
-            continue
-        rows.append({"kind": m.group(1), "strike": strike, "bid": price, "mid": price})
-    # 返回 list of dict 而不是 DataFrame:qvix_core.term_variance 吃的是这个
-    # 结构(它不依赖 pandas)。两条路径共用同一个方差函数, 才谈得上"一份实现"。
-    return rows
-
-
-def _fetch_risk_indicator_with_retry(date_str: str, attempts: int = 3):
-    for i in range(attempts):
-        try:
-            return fetcher.ak.option_risk_indicator_sse(date=date_str)
-        except Exception:
-            if i == attempts - 1:
+            response = requests.get(url, params=params, headers=headers, timeout=8)
+            response.raise_for_status()
+            return response.json()
+        except (requests.RequestException, ValueError):
+            if attempt == 2:
                 raise
-            time.sleep(1.0)
+            time.sleep(0.5 * (attempt + 1))
 
 
-def compute_qvix_for_date(target_date: dt.date, spot: Optional[float] = None,
-                           shibor_curve: Optional[list] = None) -> tuple:
-    """算某个收盘后交易日的QVIX(上交所官方期权风险指标反推,不依赖
-    optbbs)。spot/shibor_curve 不传时现查当天的(单天用;批量回算时
-    调用方应该一次性拉整段历史自己传,不然每天都要重新拉一遍全history)。
-    失败返回 (None, 原因字符串);原因带 CHAIN_BROKEN 前缀时那天该当信号日
-    处理,见该常量说明。"""
-    if spot is None:
-        spot = spot_price_for_date(target_date)
-    if spot is None:
-        return None, "拿不到50ETF当日收盘价(可能还没发布/非交易日)"
-    if shibor_curve is None:
-        shibor_curve = shibor_curve_for_date(target_date)
+def _fetch_contracts(day):
+    """风险指标表当日挂牌快照，仅读交易代码和数字合约编码。"""
+    params = {
+        "isPagination": "false",
+        "trade_date": day.strftime("%Y%m%d"),
+        "sqlId": "SSE_ZQPZ_YSP_GGQQZSXT_YSHQ_QQFXZB_DATE_L",
+        "contractSymbol": "",
+    }
+    payload = _get_json(_CONTRACT_URL, params, headers=_SSE_HEADERS)
+    rows = payload["result"]
+    if not isinstance(rows, list) or any(row["TRADE_DATE"] != day.isoformat() for row in rows):
+        raise ValueError("合约名单日期不符")
+    return [(row["CONTRACT_ID"], row["SECURITY_ID"]) for row in rows]
 
-    date_str = target_date.strftime("%Y%m%d")
+
+def _fetch_closes(symbol, begin, end):
+    params = {"begin": begin.strftime("%Y%m%d"), "end": end.strftime("%Y%m%d"),
+              "select": "date,open,high,low,close,volume"}
+    payload = _get_json(_CLOSE_URL + symbol, params, headers=_SSE_HEADERS)
+    rows = payload.get("kline")
+    if str(payload.get("code")) != symbol or not isinstance(rows, list):
+        raise ValueError("合约日线响应异常")
+    closes = {}
+    for raw_day, _, _, _, raw_close, _ in rows:
+        day = dt.datetime.strptime(str(raw_day), "%Y%m%d").date()
+        if not begin <= day <= end or day in closes:
+            raise ValueError("合约日线日期越界或重复")
+        close = float(raw_close) if raw_close is not None else 0.0
+        closes[day] = close if math.isfinite(close) and close > 0 else None
+    return closes
+
+
+def _shibor_curves(dates):
+    """金十日线为主。若尚未收录近期报价，用东方财富的 SHIBOR 当日报价补齐。"""
+    tenors = qvix_core.SHIBOR_TENOR_DAYS
+    needed = {d.isoformat() for d in dates}
+    values = {}
     try:
-        df = _fetch_risk_indicator_with_retry(date_str)
-    except Exception as e:
-        return None, f"接口失败: {e}"
-    if df is None or df.empty:
-        return None, "当天无数据(非交易日/上市前/尚未发布)"
-    df = df[df["CONTRACT_ID"].str.startswith("510050")]
-    if df.empty:
-        return None, "当天无50ETF期权数据"
+        data = _get_json(qvix_core._SHIBOR_JSON)["values"]
+        values = {d: {tenor: point[0] for tenor, point in data.get(d, {}).items()
+                      if isinstance(point, list) and point}
+                  for d in needed}
+    except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+        log.warning("日线 QVIX 获取金十 SHIBOR 失败：%s", exc)
 
-    pairs = _candidate_pairs(_listed_expiries(df, target_date))
+    def curve(row):
+        try:
+            points = [(days, float(row[tenor]) / 100.0) for tenor, days in tenors]
+        except (KeyError, ValueError, TypeError):
+            return None
+        return points if all(math.isfinite(rate) and rate > 0 for _, rate in points) else None
+
+    missing = {d for d in needed if curve(values.get(d, {})) is None}
+    if missing:
+        try:
+            params = {"reportName": "RPT_IMP_INTRESTRATEN", "columns": "ALL",
+                      "filter": '(MARKET_CODE="001")', "pageSize": 200,
+                      "sortColumns": "REPORT_DATE", "sortTypes": "-1"}
+            for row in _get_json(_SHIBOR_BACKUP_URL, params)["result"]["data"]:
+                d = row["REPORT_DATE"][:10]
+                tenor = re.search(r"\(([^)]+)\)$", row["REPORT_PERIOD"])
+                if d in missing and tenor:
+                    values.setdefault(d, {})[tenor[1]] = row["IR_RATE"]
+        except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+            log.warning("日线 QVIX 获取东方财富 SHIBOR 失败：%s", exc)
+    return {d: curve(values.get(d.isoformat(), {})) for d in dates}
+
+
+def _expiry_for_yymm(month, trading_days):
+    base = qvix_core.expiry_date_for_yymm(month)
+    return next((base + dt.timedelta(days=i) for i in range(10)
+                 if base + dt.timedelta(days=i) in trading_days), base)
+
+
+def _plan(day, trading_days):
+    months = {}
+    for code, symbol in _fetch_contracts(day):
+        match = _CONTRACT_RE.fullmatch(code)
+        if not match:
+            continue
+        kind, month, strike = match.groups()
+        symbol = str(symbol)
+        if not re.fullmatch(r"\d{8}", symbol):
+            raise ValueError("合约编码异常")
+        key = kind, int(strike) / 1000
+        contracts = months.setdefault(month, {})
+        if key in contracts and contracts[key] != symbol:
+            raise ValueError("同月、同方向、同行权价存在不同合约")
+        contracts[key] = symbol
+    listed = sorted(((expires - day).days, contracts)
+                    for month, contracts in months.items()
+                    if (expires := _expiry_for_yymm(month, trading_days)) > day)
+    return [pair for pair in qvix_core.candidate_pairs(listed) if pair[0][0] <= 40]
+
+
+def _term(day, term, closes, curve):
+    days, contracts = term
+    years = days / 365.0
+    rate = qvix_core.rate_for_days(curve, days, 0.02)
+    if any(symbol not in closes for symbol in contracts.values()):
+        return None, False, True
+    prices = {key: closes[symbol][day] for key, symbol in contracts.items()
+              if closes[symbol].get(day) is not None}
+    missing = len(contracts) - len(prices)
+    if missing > max(3, len(contracts) // 10):
+        return None, False, True
+    if missing:
+        log.warning("日线 QVIX %s（%d 天合约）缺 %d/%d 个收盘价",
+                    day, days, missing, len(contracts))
+    chain = [{"kind": kind, "strike": strike, "bid": price, "mid": price}
+             for (kind, strike), price in prices.items()]
+    result = qvix_core.term_variance(chain, rate, years)
+    if result is not None:
+        return result[0], False, False
+
+    calls = {k: price for (kind, k), price in prices.items() if kind == "C"}
+    puts = {k: price for (kind, k), price in prices.items() if kind == "P"}
+    forward = qvix_core.forward_price(calls, puts, rate, years) if len(calls.keys() & puts.keys()) >= 2 else None
+    broken = forward is not None and forward < min(k for _, k in contracts)
+    return None, broken, False
+
+
+def _calculate(day, pairs, closes, curve):
     if not pairs:
-        return None, "找不到满足条件的近月/次近月(合约月份不足)"
+        return None, "无可用近月/次月合约"
+    if not curve:
+        return None, "未取得当日 SHIBOR"
+    broken = False
+    for near, nxt in pairs:
+        var1, b1, missing1 = _term(day, near, closes, curve)
+        var2, b2, missing2 = _term(day, nxt, closes, curve)
+        if missing1 or missing2:
+            return None, "上交所期权收盘数据不全"
+        broken |= b1 or b2
+        if var1 is None or var2 is None:
+            continue
+        n1, n2 = near[0], nxt[0]
+        var30 = qvix_core.interpolate_30d(var1, n1 / 365, n1, var2, n2 / 365, n2)
+        if var30:
+            vix = 100.0 * math.sqrt(var30)
+            if 1.0 < vix < 150.0:
+                return round(vix, 2), None
+    if broken:
+        return None, f"{CHAIN_BROKEN}: 远期价低于合约最低挂牌行权价"
+    return None, "收盘价计算未得到有效的30天方差"
 
-    last_err = "方差算不出来(合约或IV数据不足)"
-    for (near_ms, (_, near_days)), (next_ms, (_, next_days)) in pairs:
-        # 近月都已经比30天远出这么多,说明本该用的那个月被跳过了,此时的
-        # "插值"其实是大幅外推,会给出一个像模像样、实际完全不对的数。这条
-        # 护栏 qvix_core.compute_qvix 里早就有(见那边的注释),当初抽公共代码
-        # 时它写在那边的循环里、没跟着搬过来,补上。
-        # 实测 2022-03-15:4月链的远期价 F=2.6459 掉到最低行权价 2.65 以下,
-        # K0 选不出来,前两对候选全被跳过,最后拿 6月(99天)/9月(197天)外推回
-        # 30天(w1=1.70)算出 29.37 入库——那不是30天口径的数。
-        # 50ETF 合约月间隔约30天,到期后新近月最远也就35天左右,所以正常情况
-        # 下 near_days 不会超过40。
-        if near_days > 40:
-            last_err = f"最近的可用近月已剩{near_days}天,30天目标落在它之前,拒绝外推"
-            continue
-        T1, T2 = near_days / 365.0, next_days / 365.0
-        r1 = _rate_for_days(shibor_curve, near_days, 0.02)
-        r2 = _rate_for_days(shibor_curve, next_days, 0.02)
 
-        near_chain = _build_chain_from_risk_indicator(df, near_ms, spot, T1, r1)
-        next_chain = _build_chain_from_risk_indicator(df, next_ms, spot, T2, r2)
-        near = _term_variance(near_chain, r1, T1)
-        nxt = _term_variance(next_chain, r2, T2)
-        if near is None or nxt is None:
-            continue
-        sigma1, _, _ = near
-        sigma2, _, _ = nxt
+def compute_qvix_history(dates, *, trading_days=None, delay=0.0):
+    """按日计算 QVIX。每张合约只查一次日线，回填和每日跑批共用。"""
+    dates = sorted(set(dates))
+    if not dates:
+        return {}
+    if trading_days is None:
+        trading_days = fetcher._trading_days() or set()
+    curves = _shibor_curves(dates)
+    plans, results = {}, {}
+    for i, day in enumerate(dates, 1):
+        try:
+            plans[day] = _plan(day, trading_days)
+        except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+            results[day] = (None, f"上交所合约名单获取失败: {exc}")
+        if i % 100 == 0:
+            log.info("日线 QVIX 已检查 %d/%d 天合约名单", i, len(dates))
+        if delay and i < len(dates):
+            time.sleep(delay)
+    symbols = {symbol for day, pairs in plans.items() if curves[day]
+               for pair in pairs for _, contracts in pair for symbol in contracts.values()}
 
-        # 走 qvix_core.interpolate_30d 而不是在这里再写一遍同一个公式:两条
-        # 路径共用一份插值实现,近月方差为负的处理才不会两边不一样(那段的
-        # 来龙去脉见 interpolate_30d 的 docstring)。
-        sigma2_30 = qvix_core.interpolate_30d(sigma1, T1, near_days,
-                                              sigma2, T2, next_days)
-        if sigma2_30 is None:
-            last_err = "插值方差非正"
-            continue
-        vix = 100.0 * (sigma2_30 ** 0.5)
-        if not (1.0 < vix < 150.0):
-            last_err = f"结果 {vix:.2f} 超出合理区间,判为脏数据"
-            continue
-        return round(vix, 2), None
-    # 走到这里说明合约数据是完整拿到了的, 只是公式在上面失效 —— 见文件上方
-    # CHAIN_BROKEN 那段: 这不是"没数据", 是行情极端到把温度计撑爆了。
-    return None, f"{CHAIN_BROKEN}: {last_err}"
+    def load(symbol):
+        try:
+            return symbol, _fetch_closes(symbol, dates[0], dates[-1])
+        except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+            log.warning("日线 QVIX 合约 %s 获取收盘价失败：%s", symbol, exc)
+            return symbol, None
+
+    log.info("日线 QVIX %d 个交易日，取 %d 张合约的收盘价", len(dates), len(symbols))
+    closes = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for i, (symbol, values) in enumerate(pool.map(load, sorted(symbols)), 1):
+            if values is not None:
+                closes[symbol] = values
+            if i % 250 == 0:
+                log.info("日线 QVIX 已请求 %d/%d 张合约", i, len(symbols))
+    for day, pairs in plans.items():
+        results[day] = _calculate(day, pairs, closes, curves[day])
+    return {day: results[day] for day in dates}
+
+
+def compute_qvix_for_date(target_date: dt.date) -> tuple:
+    """指定收盘日的日线 QVIX，失败时返回 (None, 原因)。"""
+    return compute_qvix_history([target_date])[target_date]

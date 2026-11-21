@@ -8,6 +8,7 @@ import re
 import threading
 import time
 import logging
+from contextlib import closing
 import numpy as np
 from datetime import datetime, timedelta, time as dt_time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -117,9 +118,8 @@ FUND_LIST_TTL = 26 * 3600
 NAV_TTL = 86400         # 24 hours
 NAV_START = "2018-01-01"  # NAV history is kept from this date onward
 MAX_WORKERS = 8
-# 无风险利率。夏普 2026-08-07 移除后, 唯一的消费者是自算 QVIX: qvix_core 用
-# Black-Scholes 反推期权理论价, 优先按 SHIBOR 期限结构插值, 取不到 SHIBOR 时
-# 才退到这里的 1 年期国债收益率(见 qvix_calc.compute_qvix 的 fallback_rate)。
+# 无风险利率。实时 QVIX 优先按 SHIBOR 期限结构插值，取不到时才用这里的
+# 1 年期国债收益率(见 qvix_core.compute_qvix 的 fallback_rate)。
 # 别再当成夏普的残留删掉。
 RISK_FREE_RATE = 0.0113  # fallback 1-year China gov bond yield (see get_risk_free_rate)
 RF_TTL = 30 * 86400      # auto-refresh the risk-free rate ~monthly
@@ -1772,20 +1772,29 @@ _CLOSE = dt_time(15, 0)
 
 
 def save_qvix_self_history(rows: list) -> None:
-    """写入/覆盖自算QVIX历史(backfill_qvix_history.py 用)。跟 optbbs 的
-    index_daily_cache 是两张独立的表,互不覆盖——这样optbbs的值和自算值
-    可以并排比对,而不是自算结果把optbbs历史顶替掉。rows 是
-    [{"date","qvix","note"}, ...]。"""
-    # 用 UPSERT 而不是 INSERT OR REPLACE: 后者是**整行替换**, 会把同一行的
-    # threshold 抹成 NULL(它每次跑批都重算, 所以平时看不出问题 —— 但只要
-    # 以后再往这张表加别的列, 整行替换就会静默清空它)。这里只动 qvix/note。
-    conn = _conn()
-    conn.executemany(
-        "INSERT INTO qvix_self_history (date, qvix, note) VALUES (?, ?, ?) "
-        "ON CONFLICT(date) DO UPDATE SET qvix=excluded.qvix, note=excluded.note",
-        [(r["date"], r.get("qvix"), r.get("note")) for r in rows])
-    conn.commit()
-    conn.close()
+    """保存日线与滚动阈值。临时取数失败时保留已确认的值或链失效标记。"""
+    from qvix_calc import CHAIN_BROKEN
+
+    if not rows:
+        return
+    chain_broken = CHAIN_BROKEN + "%"
+    with closing(_conn()) as conn, conn:
+        conn.executemany(
+            "INSERT INTO qvix.qvix_self_history (date, qvix, note) VALUES (?, ?, ?) "
+            "ON CONFLICT(date) DO UPDATE SET qvix=excluded.qvix, note=excluded.note "
+            "WHERE excluded.qvix IS NOT NULL OR excluded.note LIKE ? "
+            "OR (qvix_self_history.qvix IS NULL AND coalesce(qvix_self_history.note, '') NOT LIKE ?)",
+            [(r["date"], r.get("qvix"), r.get("note"), chain_broken, chain_broken) for r in rows],
+        )
+        cols = {row[1] for row in conn.execute("PRAGMA qvix.table_info(qvix_self_history)")}
+        if "threshold" not in cols:
+            conn.execute("ALTER TABLE qvix.qvix_self_history ADD COLUMN threshold REAL")
+        hist = pd.read_sql("SELECT date, qvix FROM qvix.qvix_self_history ORDER BY date", conn)
+        thresholds = qvix_rolling_thresholds(hist["qvix"])
+        conn.executemany(
+            "UPDATE qvix.qvix_self_history SET threshold=? WHERE date=?",
+            [(None if pd.isna(t) else t, date) for t, date in zip(thresholds, hist["date"])],
+        )
 
 
 def load_qvix_self_history() -> Optional[pd.DataFrame]:
@@ -1794,20 +1803,6 @@ def load_qvix_self_history() -> Optional[pd.DataFrame]:
     df = pd.read_sql("SELECT * FROM qvix_self_history ORDER BY date", conn)
     conn.close()
     return df if not df.empty else None
-
-
-def save_qvix_self_threshold(dates: list, thresholds: list) -> None:
-    """把滚动2年90分位恐慌阈值写回 qvix_self_history 的 threshold 列
-    (按自算QVIX序列现算的,不是套用optbbs那条历史算出来的阈值)。"""
-    conn = _conn()
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(qvix_self_history)")]
-    if "threshold" not in cols:
-        conn.execute("ALTER TABLE qvix_self_history ADD COLUMN threshold REAL")
-    conn.executemany(
-        "UPDATE qvix_self_history SET threshold = ? WHERE date = ?",
-        [(t, d) for d, t in zip(dates, thresholds)])
-    conn.commit()
-    conn.close()
 
 
 def _run_summary(trades: list) -> tuple:
@@ -2010,75 +2005,49 @@ def load_backtest_notes() -> dict:
 # 约15天的容错,仍然远比240严格(同 backtest_qvix.py 的 minp_ratio=0.97)。
 QVIX_THR_WINDOW, QVIX_THR_MINP, QVIX_THR_PCT = 490, 475, 0.90
 
+def qvix_rolling_thresholds(values: pd.Series) -> pd.Series:
+    """截至该行收盘的滚动阈值。信号回看用前一交易日阈值，由调用方 shift(1)。"""
+    return (pd.to_numeric(values, errors="coerce")
+            .rolling(QVIX_THR_WINDOW, min_periods=QVIX_THR_MINP)
+            .quantile(QVIX_THR_PCT))
+
+
 def update_qvix_self_daily() -> tuple:
-    """收盘后重算"最近一个已收盘交易日"的自算QVIX,写入 qvix_self_history
-    并重算滚动2年90分位阈值。由 update_daily.py --qvix-only 调用。
-
-    目标日期不是"今天"——06:00 时今天还没开盘,14:40 时今天还没收盘,
-    两边其实都是在补"上一个交易日"的数据,天然幂等(UPSERT),
-    重复调用无副作用。上交所官方接口本身也有发布延迟(实测过收盘3小时后
-    仍未发布),这天万一还没发布,下一次调用(次日/当天晚些)自然会
-    补上,调用方不需要关心这件事。
-
-    返回 (qvix_value_or_None, note)。"""
+    """用上交所期权收盘价补最近一个交易日和过去 15 天的缺口。"""
     import qvix_calc
+
     today = datetime.now(_CST).date()
-    try:
-        cal = ak.tool_trade_date_hist_sina()
-        cal["trade_date"] = pd.to_datetime(cal["trade_date"]).dt.date
-        prior = cal[cal["trade_date"] < today]["trade_date"]
-        target = prior.max()
-    except Exception as e:
-        logger.warning("QVIX 每日自算:拉交易日历失败 %s", e)
-        return None, f"交易日历拉取失败: {e}"
+    trading_days = _trading_days()
+    if not trading_days:
+        return None, "拿不到交易日历"
+    cutoff = today - timedelta(days=15)
+    recent = sorted(day for day in trading_days if cutoff <= day < today)
+    if not recent:
+        return None, "近 15 天没有可补的交易日"
 
-    vix, note = qvix_calc.compute_qvix_for_date(target)
-    save_qvix_self_history([{"date": target.isoformat(), "qvix": vix, "note": note}])
-    if vix is None:
-        logger.warning("QVIX 每日自算(%s)失败: %s", target, note)
-    else:
-        logger.info("QVIX 每日自算(%s) = %.2f", target, vix)
-
-    # 自愈:补最近15天里"接口临时失败"留下的空值(qvix IS NULL)。update 每次
-    # 只算"上一个收盘日", 某天上交所接口抽风留的空值之后不会再被重算、会成
-    # 永久空洞(2026-07-28/29 就这么丢过)。这里顺带把近15天的空值重试一遍,
-    # 接口恢复后自动补上。失败不影响主流程。
-    # ⚠️ 链失效日(note 带 qvix_calc.CHAIN_BROKEN 前缀)也会被这里反复重试 ——
-    # 无害: 那天的合约链本来就算不出来, 重试还是失败, note 原样写回。
-    try:
-        _h = load_qvix_self_history()
-        if _h is not None:
-            _cut = (today - timedelta(days=15)).isoformat()
-            _nulls = _h[_h["qvix"].isna() & (_h["date"].astype(str) >= _cut)
-                        & (_h["date"].astype(str) != target.isoformat())]["date"].tolist()
-            for _d in _nulls:
-                _v, _n = qvix_calc.compute_qvix_for_date(datetime.fromisoformat(_d).date())
-                if _v is not None:
-                    save_qvix_self_history([{"date": _d, "qvix": _v, "note": None}])
-                    logger.info("QVIX 空值自愈回补(%s) = %.2f", _d, _v)
-    except Exception as e:
-        logger.warning("QVIX 空值自愈失败(不影响主流程): %s", e)
-
+    target = recent[-1]
     hist = load_qvix_self_history()
+    already_known = set()
     if hist is not None:
-        hist = hist.sort_values("date").reset_index(drop=True)
-        # 这列**故意不 shift**:存的是"截至该日收盘"的分位。实盘用法是次日
-        # 网站盘中查询拿最后一行来比，今天的数据天然不在窗口里;
-        # 回测(backtest_qvix.py)在自己那边 shift(1) 达成同一口径。别在
-        # 这里加 shift——那会让实盘比的阈值凭空旧一天。
-        hist["threshold"] = (hist["qvix"]
-                             .rolling(QVIX_THR_WINDOW, min_periods=QVIX_THR_MINP)
-                             .quantile(QVIX_THR_PCT))
-        save_qvix_self_threshold(hist["date"].tolist(), hist["threshold"].tolist())
-    return vix, note
+        known = hist["qvix"].notna() | hist["note"].map(qvix_calc.is_chain_broken)
+        already_known = set(hist.loc[known, "date"].astype(str))
+    pending = [day for day in recent if day == target or day.isoformat() not in already_known]
+    results = qvix_calc.compute_qvix_history(pending, trading_days=trading_days)
+    save_qvix_self_history([{"date": day.isoformat(), "qvix": value, "note": note}
+                            for day, (value, note) in results.items()])
+    for day, (value, note) in results.items():
+        if value is None:
+            logger.warning("日线 QVIX %s：%s", day, note)
+        else:
+            logger.info("日线 QVIX %s = %.2f", day, value)
+    return results[target]
 
 
 def update_qvix_rt_close() -> tuple:
     """用**实时路径**(qvix_core.compute_qvix, 新浪买卖盘)补算"最近一个已收盘
     交易日" 15:00 的 QVIX, 写进 qvix_self_history.qvix_rt。返回 (日期, 值或None)。
 
-    跟 qvix 列是两条路径算的同一个东西: qvix 列由上交所官方 IV 反推
-    BS 价格(能回算历史), 这一列是网站实时查询那套、收盘那一刻的值。
+    跟 qvix 列是两条路径算的同一个东西: qvix 列用上交所逐合约日线收盘价，qvix_rt 是网站实时路径的收盘盘口值。
     并排放着是为了看两者差多少 —— 盘中拿实时值比阈值, 而阈值是 qvix 列
     算出来的, 两把尺子到底偏多少, 以前只能凭感觉。
     **只作展示, 不进信号判定也不进阈值**: 混进去就真成两把尺子量一件事了。

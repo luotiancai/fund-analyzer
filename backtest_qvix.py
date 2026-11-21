@@ -904,7 +904,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     fof_codes = {c for c, t in fund_types.items() if fetcher.is_fof(t, fund_names[c])}
     exclude_codes = qdii_codes | hold_codes | fof_codes
 
-    # Load QVIX —— 自算(qvix_self_history,上交所官方期权风险指标反推,
+    # Load QVIX —— 自算(qvix_self_history,上交所逐合约收盘价,
     # 不再是 optbbs 的 index_daily_cache)。阈值按传入的 window/pct 现算,
     # 不用表里预存的那一列(那一列固定是线上用的490/0.90)。
     print(f"加载数据... (窗口={window}天, 分位={pct}, 排名依据={ret_col}, "

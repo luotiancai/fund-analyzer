@@ -55,21 +55,7 @@ def _qvix_dates_with_value() -> set:
 
 
 def run_qvix_only() -> list:
-    """只补自算QVIX,不碰基金净值、不刷指数缓存。返回本次补上的日期列表。
-
-    **这条路径现在是 QVIX 的唯一生产者, 跑在国内那台 VPS 上**(2026-08-28
-    改)。原因是上交所的期权风险指标接口挡 GitHub runner 的境外 IP:那天同一
-    时刻本机和 VPS 都拿得到 656 条合约, runner 上三次重试全失败(报文分别是
-    非 JSON 错误页和 connection reset)。云端跑批从此不碰 QVIX, 它写的
-    qvix.db 也不由跑批发布 —— 一张表一个写入方, 没有互相覆盖的机会。
-
-    配套的 qvix-retry.yml(原来北京早上6点在 GitHub 上补跑一次)同时删掉了:
-    换个时间点再试一遍解决不了 IP 被挡, 只是每天多一条绿色的空跑记录。
-
-    幂等:update_qvix_self_daily 是 INSERT OR REPLACE, 重复跑算出来是同一个
-    数, 没有副作用。它自带"补最近15天空值"的自愈逻辑, 所以 VPS 关机几天再
-    开机, 一次就把断档补齐。返回的日期列表用来决定要不要推库 —— 什么都没
-    补上就不必为一个没变的库走一趟 0.3MB 的上传和回读验证。"""
+    """VPS 用上交所合约收盘价补日线 QVIX 和阈值，返回新增有效值的日期。"""
     before = _qvix_dates_with_value()
     vix, note = fetcher.update_qvix_self_daily()
     filled = sorted(_qvix_dates_with_value() - before)

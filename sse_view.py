@@ -67,10 +67,7 @@ def qvix_thresholds(hist: pd.DataFrame):
     hist = hist.sort_values("date").reset_index(drop=True)
     return pd.DataFrame({
         "date": pd.to_datetime(hist["date"]),
-        "thr": (pd.to_numeric(hist["qvix"], errors="coerce")
-                .rolling(fetcher.QVIX_THR_WINDOW,
-                         min_periods=fetcher.QVIX_THR_MINP)
-                .quantile(fetcher.QVIX_THR_PCT).shift(1)),
+        "thr": fetcher.qvix_rolling_thresholds(hist["qvix"]).shift(1),
     })
 
 

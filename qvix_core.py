@@ -21,7 +21,7 @@ requests / pandas / numpy / akshare。
              fetch_chains_with_expiry。
   · SHIBOR   cdn.jin10.com/data_center/reports/il_1.json                 (JSON)
 
-方法论、换月规则、已知取舍等背景, 见 qvix_calc.py 顶部的长注释——那里是这套
+方法论和换月规则见 qvix_calc.py 顶部的说明——那里是这套
 算法的"说明书", 本文件只是它的无依赖实现。**改算法时两个文件要一起看。**
 """
 
@@ -121,21 +121,6 @@ def _get_json(url: str, params: Optional[dict] = None):
 
 # ── 纯计算部分(无网络) ────────────────────────────────────────────────────────
 
-def norm_cdf(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-
-def bs_price(kind: str, S: float, K: float, T: float, r: float, sigma: float):
-    """Black-Scholes 价格。sigma<=0 或 T<=0 返回 None(数据缺失/已到期)。"""
-    if sigma is None or sigma <= 0 or T <= 0:
-        return None
-    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
-    if kind == "C":
-        return S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)
-    return K * math.exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1)
-
-
 def rate_for_days(curve: Optional[list], days: float, fallback: float) -> float:
     """SHIBOR 期限结构线性插值;超出曲线两端用端点值(不外推),曲线拿不到时
     用 fallback。"""
@@ -182,6 +167,15 @@ def candidate_pairs(listed):
     return list(zip(listed, listed[1:]))
 
 
+def forward_price(calls, puts, r: float, T: float):
+    """在认购认沽价差最小的行权价上用平价反推远期价。"""
+    common = calls.keys() & puts.keys()
+    if not common:
+        return None
+    k = min(common, key=lambda k: (abs(calls[k] - puts[k]), k))
+    return k + math.exp(r * T) * (calls[k] - puts[k])
+
+
 def term_variance(chain, r: float, T: float):
     """单个到期日的方差贡献(CBOE VIX 白皮书公式)。chain 是
     [{"kind":"C"/"P", "strike":float, "bid":float, "mid":float}, ...]。
@@ -196,18 +190,11 @@ def term_variance(chain, r: float, T: float):
         else:
             puts[k], bid_puts[k] = row["mid"], row["bid"]
 
-    common = sorted(set(calls) & set(puts))
     all_strikes = sorted(set(calls) | set(puts))
-    if not common or len(all_strikes) < 3:
+    F = forward_price(calls, puts, r, T)
+    if F is None or len(all_strikes) < 3:
         return None
-
-    # 远期价格:C-P 差最小的那个行权价上用 put-call parity 反推(要求该行权价
-    # 认购认沽都有报价, 所以只能在 common 里选)。
-    k_f = min(common, key=lambda k: abs(calls[k] - puts[k]))
-    F = k_f + math.exp(r * T) * (calls[k_f] - puts[k_f])
-    # K0 = 不超过 F 的最大行权价, 范围是**整条链**(白皮书口径), 不能限制在
-    # common 里:上交所对没成交的实值认购报 IV=0, 那些合约被丢掉后 common 会
-    # 整段缩到平值以上, 于是一个候选都不剩、整天算不出来。
+    # K0 是全链中不超过 F 的最大行权价。缺少一边报价的行权价也可参与选择。
     k0_candidates = [k for k in all_strikes if k <= F]
     if not k0_candidates:
         return None
