@@ -28,7 +28,7 @@
       <label>决策日<input type="date" id="pick-date" min="2020-01-01" required></label>
       <button class="primary" type="submit">计算候选</button>
     </form>
-    <details class="help"><summary>计算口径</summary><p>只使用决策日前的净值。从最后一个净值日回推 3 个自然月，取起点当日或之前最近的净值。规模取 C 类自身已披露的最新季报，至少 2 亿。排除 QDII、海外、FOF、定开和持有期锁定基金。C 类份额成立满 6 个自然月后参加排名，期间缺少应有的交易日净值时停止计算。历史买入信号要求 QVIX 触发且上证当日收跌。</p></details>
+    <details class="help"><summary>计算口径</summary><p>只使用决策日前的净值。从最后一个净值日回推 3 个自然月，取起点当日或之前最近的净值。规模取 C 类自身已披露的最新季报，至少 2 亿。排除 QDII、海外、FOF、定开和持有期锁定基金。C 类份额成立满 6 个自然月后参加排名，期间缺少应有的交易日净值时停止计算。QVIX 阈值取前一交易日回推 2 个自然年的 90% 分位，历史买入还要求上证当日收跌。</p></details>
     <div id="pick-output" aria-live="polite"><div class="empty">选择日期，查看候选及淘汰原因。</div></div>
     <div id="probe-panel" hidden>
       <h3>查一只基金为什么没选中</h3>

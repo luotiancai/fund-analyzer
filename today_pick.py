@@ -57,7 +57,7 @@ def _std_params():
          inspect.signature(B.run_backtest).parameters.items()
          if v.default is not inspect.Parameter.empty}
     return {k: d[k] for k in ("min_vol_ratio", "min_aum", "max_aum",
-                              "max_drop", "dd_divisor", "window", "pct", "aum_basis",
+                              "max_drop", "dd_divisor", "aum_basis",
                               "require_sse_down")}
 
 
@@ -68,24 +68,23 @@ class IncompleteNavError(ValueError):
     """An eligible C-class fund's NAV window cannot be verified as complete."""
 
 
-def _threshold(asof: pd.Timestamp):
-    """信号日当天该比的阈值(截至前一交易日的 window/pct 分位)。
+def _threshold(asof: pd.Timestamp, trading_days):
+    """信号日当天该比的阈值(截至前一交易日的自然两年分位)。
     返回 (日期, QVIX值, 阈值, 是否链失效日)。最后那个见
     qvix_calc.CHAIN_BROKEN: 算不出值本身就是极端行情, 那天直接算信号,
     QVIX值会是 NaN —— 调用方不能只看值跟阈值的大小。"""
-    q = fetcher.load_qvix_self_history().rename(columns={"qvix": "close"})
-    q["date"] = pd.to_datetime(q["date"])
-    q["close"] = pd.to_numeric(q["close"], errors="coerce")
-    q = q.sort_values("date").reset_index(drop=True)
-    thr = q["close"].rolling(STD["window"],
-                             min_periods=int(STD["window"] * 0.97)
-                             ).quantile(STD["pct"]).shift(1)
-    q["thr"] = thr
-    row = q[q["date"] <= asof]
-    if row.empty:
+    q = fetcher.load_qvix_self_history()
+    if q is None or q.empty:
         return None, None, None, False
-    r = row.iloc[-1]
-    return r["date"], r["close"], r["thr"], qvix_calc.is_chain_broken(r["note"])
+    q["date"] = pd.to_datetime(q["date"])
+    q = q.loc[q["date"] <= asof, ["date", "qvix", "note"]].reset_index(drop=True)
+    if q.empty:
+        return None, None, None, False
+    r = q.iloc[-1]
+    if r["date"] != asof:
+        q.loc[len(q)] = [asof, float("nan"), None]
+    threshold = fetcher.qvix_rolling_thresholds(q, trading_days, before=True).iloc[-1]
+    return r["date"], r["qvix"], threshold, qvix_calc.is_chain_broken(r["note"])
 
 
 def data_freshness(conn, asof=None, nav_max=None):
@@ -225,7 +224,7 @@ def scan(asof) -> dict:
     sse = sse.sort_values("date").reset_index(drop=True)
 
     asof = pd.Timestamp(asof)
-    qdate, qvix, thr, broken = _threshold(asof)
+    qdate, qvix, thr, broken = _threshold(asof, sse["date"])
     nav_max, sse_max, behind, need_date, missing = data_freshness(conn, asof)
     sse_change = B.sse_day_change(sse, asof)
     # 链失效日直接算触发(见 _threshold): 那天没有 QVIX 值可跟阈值比, 但

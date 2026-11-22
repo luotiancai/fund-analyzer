@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import pandas as pd
+
 import fetcher
 import qvix_calc
 
@@ -39,19 +41,32 @@ class QvixHistoryTests(unittest.TestCase):
         broken = f"{qvix_calc.CHAIN_BROKEN}: 远期价低于最低挂牌行权价"
         with tempfile.TemporaryDirectory() as tmp:
             paths = {name: str(Path(tmp) / file) for name, file, _ in fetcher.DB_LAYOUT}
-            with patch.multiple(fetcher, DB_PATH=paths, _schema_ready=False,
-                                QVIX_THR_WINDOW=3, QVIX_THR_MINP=2):
+            calendar = ("2024-11-20", "2026-11-18", "2026-11-19", "2026-11-20")
+            with patch.multiple(fetcher, DB_PATH=paths, _schema_ready=False):
                 fetcher.init_db()
                 fetcher.save_qvix_self_history([
+                    {"date": "2024-11-20", "qvix": 12.0},
                     {"date": "2026-11-18", "qvix": 14.0},
                     {"date": "2026-11-19", "qvix": None, "note": broken},
                     {"date": "2026-11-20", "qvix": 16.0},
-                ])
+                ], trading_days=calendar)
                 fetcher.save_qvix_self_history([
                     {"date": day, "qvix": None, "note": "接口超时"}
                     for day in ("2026-11-19", "2026-11-20")
-                ])
+                ], trading_days=calendar)
                 with closing(fetcher._conn()) as conn:
                     rows = conn.execute("SELECT qvix,note,threshold FROM qvix.qvix_self_history ORDER BY date")
                     self.assertEqual([tuple(row) for row in rows],
-                                     [(14.0, None, None), (None, broken, None), (16.0, None, 15.8)])
+                                     [(12.0, None, None), (14.0, None, None),
+                                      (None, broken, None), (16.0, None, 15.6)])
+
+    def test_calendar_year_threshold_uses_prior_close_and_calendar_coverage(self):
+        days = pd.bdate_range("2022-02-28", "2024-03-01")
+        history = pd.DataFrame({"date": days, "qvix": 10.0})
+        history.loc[history.index[0], "qvix"] = 100.0
+        history.loc[history.index[-1], "qvix"] = 99.0
+        self.assertEqual(fetcher.qvix_rolling_thresholds(history, days, before=True, pct=1).iloc[-1], 100)
+        self.assertEqual(fetcher.qvix_rolling_thresholds(history, days, pct=1).iloc[-1], 99)
+        self.assertTrue(pd.isna(fetcher.qvix_rolling_thresholds(history, days).iloc[0]))
+        incomplete = history.drop(history.index[300:340])
+        self.assertTrue(pd.isna(fetcher.qvix_rolling_thresholds(incomplete, days).iloc[-1]))

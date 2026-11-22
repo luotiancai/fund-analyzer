@@ -54,20 +54,14 @@ def md_inline(s: str) -> str:
     return re.sub(r"`(.+?)`", r"<code>\1</code>", s)
 
 
-def qvix_thresholds(hist: pd.DataFrame):
-    """按 backtest_qvix.py 同一套口径(含 shift(1):第 d 天画的是"截至
-    d-1 收盘"的分位,与回测信号/实盘用法同口径)现算滚动阈值,供上证指数图
-    叠加展示——与线上生产阈值列(fetcher.update_qvix_self_daily 里精确
-    维护;那列不 shift,存"截至该日收盘"的值,次日实盘拿最后一行来比,
-    语义等价)算法一致但独立现算,只用于图上对比展示,不影响生产阈值/
-    策略复盘本身。窗口/最小样本/分位一律取 fetcher 的常量,别在这里另写
-    一份数字——图上画的和策略判的必须是同一条线。"""
+def qvix_thresholds(hist: pd.DataFrame, trading_days):
+    """图表画截至前一交易日的阈值，与当天回测信号对齐。"""
     if hist is None or hist.empty:
         return None
     hist = hist.sort_values("date").reset_index(drop=True)
     return pd.DataFrame({
         "date": pd.to_datetime(hist["date"]),
-        "thr": fetcher.qvix_rolling_thresholds(hist["qvix"]).shift(1),
+        "thr": fetcher.qvix_rolling_thresholds(hist, trading_days, before=True),
     })
 
 
@@ -141,7 +135,7 @@ def chain_broken_mask(qvix_hist: pd.DataFrame) -> pd.Series:
 # 跑批推一次库页面自动跟着变, 不用改代码。
 
 REVIEW_INTRO = (
-    "**QVIX 490 个交易日的 90% 分位 + 近3月跌幅最大**"
+    "**QVIX 恐慌信号 + 近3月跌幅最大**"
     "(波动率比值≥1.5 + 规模≥2亿 + 近3月跌幅≤30%;没有真跌的合格候选就"
     "放弃当天、顺延到下一个信号日)**+ 基金/大盘双止损逐日盯盘**"
     "。卖出后隔 2 个交易日才允许下一次买入(赎回款 T+2 到账,"
@@ -195,8 +189,11 @@ def review_summary(bt_df: pd.DataFrame, bt_id, bt_at, params=None) -> str:
     basis = "A/C 等份额合并" if merged else "C 类自身"
     calendar = (params or {}).get("lookback_basis") == "calendar_months"
     require_sse_down = (params or {}).get("require_sse_down", False)
+    threshold_years = (params or {}).get("threshold_years")
     return (
         f"本次跑批规模口径：**{basis}**。"
+        + (f"QVIX 阈值取截至前一交易日的滚动 {threshold_years} 个自然年 90% 分位。"
+           if threshold_years else "")
         + ("近3月收益按自然月计算。" if calendar else "")
         + ("入场须满足**上证当日收跌**。" if require_sse_down else "")
         + ("这是历史合并口径跑批，当前选基已改为 C 类自身规模，尚未按新口径重跑。"

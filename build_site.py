@@ -80,7 +80,7 @@ def collect() -> dict:
     hist = fetcher.load_qvix_self_history()
     if hist is not None and not hist.empty:
         hist = hist.sort_values("date").reset_index(drop=True)
-        thr = sse_view.qvix_thresholds(hist)
+        thr = sse_view.qvix_thresholds(hist, sse["date"])
         out["qv"] = {"d": hist["date"].astype(str).tolist(),
                      "v": [_num(v, 2) for v in hist["qvix"]],
                      "t": [_num(v, 3) for v in thr["thr"]],

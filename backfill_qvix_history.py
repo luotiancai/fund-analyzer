@@ -43,7 +43,7 @@ def main():
     data = qvix_calc.compute_qvix_history(dates, trading_days=trading_days, delay=args.delay)
     fetcher.init_db()
     fetcher.save_qvix_self_history([{"date": day.isoformat(), "qvix": value, "note": note}
-                                   for day, (value, note) in data.items()])
+                                   for day, (value, note) in data.items()], trading_days=trading_days)
     for day, (value, note) in data.items():
         if value is None:
             log.warning("%s：%s", day, note)

@@ -221,7 +221,7 @@ _DDL = {
 """,
 
 "qvix": """
-    -- 自算 QVIX 日频历史 + 当日阈值(490交易日90分位)。策略的信号判定读它。
+    -- 自算 QVIX 日频历史 + 截至当日收盘的自然两年90分位阈值。
     -- ⚠️ QVIX 不分方向: 暴跌暴涨都推高它(与上证日涨跌相关系数仅 -0.19,
     -- 97个信号日里 55% 发生在上涨日)。2026-08 试过加一列 skew(虚值认沽IV
     -- − 虚值认购IV, |delta|≈0.25)来补方向, 判别力确实强(相关 -0.463), 但
@@ -1764,7 +1764,7 @@ def _trading_days() -> Optional[set]:
 _CLOSE = dt_time(15, 0)
 
 
-def save_qvix_self_history(rows: list) -> None:
+def save_qvix_self_history(rows: list, *, trading_days) -> None:
     """保存日线与滚动阈值。临时取数失败时保留已确认的值或链失效标记。"""
     from qvix_calc import CHAIN_BROKEN
 
@@ -1779,15 +1779,35 @@ def save_qvix_self_history(rows: list) -> None:
             "OR (qvix_self_history.qvix IS NULL AND coalesce(qvix_self_history.note, '') NOT LIKE ?)",
             [(r["date"], r.get("qvix"), r.get("note"), chain_broken, chain_broken) for r in rows],
         )
-        cols = {row[1] for row in conn.execute("PRAGMA qvix.table_info(qvix_self_history)")}
-        if "threshold" not in cols:
-            conn.execute("ALTER TABLE qvix.qvix_self_history ADD COLUMN threshold REAL")
-        hist = pd.read_sql("SELECT date, qvix FROM qvix.qvix_self_history ORDER BY date", conn)
-        thresholds = qvix_rolling_thresholds(hist["qvix"])
-        conn.executemany(
-            "UPDATE qvix.qvix_self_history SET threshold=? WHERE date=?",
-            [(None if pd.isna(t) else t, date) for t, date in zip(thresholds, hist["date"])],
-        )
+        _write_qvix_thresholds(conn, trading_days)
+
+
+def _write_qvix_thresholds(conn, trading_days) -> int:
+    trading_days = list(trading_days)
+    cols = {row[1] for row in conn.execute("PRAGMA qvix.table_info(qvix_self_history)")}
+    if "threshold" not in cols:
+        conn.execute("ALTER TABLE qvix.qvix_self_history ADD COLUMN threshold REAL")
+    hist = pd.read_sql("SELECT date, qvix FROM qvix.qvix_self_history ORDER BY date", conn)
+    if not trading_days or hist.empty or pd.Timestamp(max(trading_days)) < pd.Timestamp(hist["date"].iloc[-1]):
+        raise ValueError("上证交易日历未覆盖已有 QVIX 历史。")
+    thresholds = qvix_rolling_thresholds(hist, trading_days)
+    conn.executemany(
+        "UPDATE qvix.qvix_self_history SET threshold=? WHERE date=?",
+        [(None if pd.isna(t) else t, date) for t, date in zip(thresholds, hist["date"])],
+    )
+    return int(thresholds.notna().sum())
+
+
+def recompute_qvix_thresholds() -> int:
+    """用已存上证交易日历重算阈值，保留日线和实时口径收盘值。"""
+    with closing(_conn()) as conn, conn:
+        row = conn.execute("SELECT data FROM market.index_daily_cache WHERE key='sse'").fetchone()
+        if not row:
+            raise ValueError("缺少本地上证交易日历。")
+        dates = pd.read_json(io.StringIO(row["data"]), orient="split", convert_dates=False)["date"]
+        if dates.empty:
+            raise ValueError("本地上证交易日历为空。")
+        return _write_qvix_thresholds(conn, dates)
 
 
 def load_qvix_self_history() -> Optional[pd.DataFrame]:
@@ -1985,24 +2005,34 @@ def load_backtest_notes() -> dict:
     return {r["buy_date"]: r["note"] for r in rows}
 
 
-# 阈值口径:滚动窗口(交易日)、最小样本、分位。50 和 300 两条序列共用同一
-# 套参数,各自在自己的序列上滚 —— 集中在这里,免得两处各写一遍慢慢漂开。
-# 2026-07-27 起生产口径从 720/0.95(3年95分位)对齐到 490/0.90(2年90分位)
-# ——与 2026-07-24 定档的标准策略(backtest_qvix.py 头部快照)及上证页
-# 展示线同口径,不然 notify 邮件报的阈值偏高 ~1.6个点,QVIX 落在两阈值之间
-# 时会漏信号。
-# min_periods=475(=490×0.97):阈值要接近满窗口才给值,不足宁可空着也不用
-# 不完整窗口凑数——早期用240(约1年)会让阈值在头两年里被少量样本撑出来的
-# 分位数带偏,不够稳。不用严格490:历史里偶发接口失败/数据缺失(约1.6%的
-# 交易日),真设成490会导致窗口只要出现过一天缺失就整个失真成NaN,475留了
-# 约15天的容错,仍然远比240严格(同 backtest_qvix.py 的 minp_ratio=0.97)。
-QVIX_THR_WINDOW, QVIX_THR_MINP, QVIX_THR_PCT = 490, 475, 0.90
+QVIX_THR_YEARS, QVIX_THR_COVERAGE, QVIX_THR_PCT = 2, 0.97, 0.90
 
-def qvix_rolling_thresholds(values: pd.Series) -> pd.Series:
-    """截至该行收盘的滚动阈值。信号回看用前一交易日阈值，由调用方 shift(1)。"""
-    return (pd.to_numeric(values, errors="coerce")
-            .rolling(QVIX_THR_WINDOW, min_periods=QVIX_THR_MINP)
-            .quantile(QVIX_THR_PCT))
+
+def qvix_rolling_thresholds(history: pd.DataFrame, trading_days, *, before=False,
+                            pct=QVIX_THR_PCT, minp_ratio=QVIX_THR_COVERAGE) -> pd.Series:
+    """取截至当日或前一交易日的滚动自然两年分位，缺失覆盖按交易日历计算。"""
+    result = np.full(len(history), np.nan)
+    if history.empty:
+        return pd.Series(result, index=history.index)
+    dates = pd.DatetimeIndex(pd.to_datetime(history["date"]))
+    calendar = pd.DatetimeIndex(pd.to_datetime(list(trading_days))).unique().sort_values()
+    values = pd.Series(pd.to_numeric(history["qvix"], errors="coerce").to_numpy(), index=dates)
+    closes = values.reindex(calendar).to_numpy(dtype=float, na_value=np.nan)
+    end_positions = calendar.searchsorted(dates, side="left" if before else "right") - 1
+    first_available = dates.min()
+    offset = pd.DateOffset(years=QVIX_THR_YEARS)
+    for i, end in enumerate(end_positions):
+        if end < 0:
+            continue
+        cutoff = calendar[end] - offset
+        if cutoff < first_available:
+            continue
+        start = calendar.searchsorted(cutoff, side="left")
+        window = closes[start:end + 1]
+        valid = window[np.isfinite(window)]
+        if len(valid) and len(valid) >= int(len(window) * minp_ratio):
+            result[i] = np.quantile(valid, pct)
+    return pd.Series(result, index=history.index)
 
 
 def update_qvix_self_daily() -> tuple:
@@ -2027,7 +2057,7 @@ def update_qvix_self_daily() -> tuple:
     pending = [day for day in recent if day == target or day.isoformat() not in already_known]
     results = qvix_calc.compute_qvix_history(pending, trading_days=trading_days)
     save_qvix_self_history([{"date": day.isoformat(), "qvix": value, "note": note}
-                            for day, (value, note) in results.items()])
+                            for day, (value, note) in results.items()], trading_days=trading_days)
     for day, (value, note) in results.items():
         if value is None:
             logger.warning("日线 QVIX %s：%s", day, note)

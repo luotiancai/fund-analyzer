@@ -685,7 +685,8 @@ def get_fund_nav_after(conn, code, from_date):
     return out
 
 
-def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
+def run_backtest(window: int | None = None, pct: float = fetcher.QVIX_THR_PCT,
+                 minp_ratio: float = fetcher.QVIX_THR_COVERAGE,
                  min_corr: float = None, ret_col: str = "ret_3m", pick: str = "bottom",
                  min_vol_ratio: float = 1.5, dd_divisor: float = 5.0,
                  min_aum: float = 2.0, require_drop: bool = True,
@@ -698,10 +699,8 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  signal_mode: str = "threshold",
                  jump_days: int = 3, jump_pct: float = 0.20,
                  max_drop: float = 30.0, require_sse_down: bool = True):
-    """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
-    多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
-    的 475/490 那套道理)。默认 490/0.90 是当前线上在用的参数
-    (2026-07-27 起生产阈值列/通知邮件从 720/0.95 对齐到这个口径)。
+    """阈值默认取前一交易日前的滚动自然两年 90% 分位（含前一交易日）。
+    window 可显式指定交易日数量以复现旧口径。minp_ratio 为窗口有效数据比例。
 
     min_corr: 冠军候选与上证指数近3月相关系数门槛, 见
     find_champion_on_date 的 sse_df/min_corr 说明。2026-07-24 起默认
@@ -883,9 +882,9 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     exclude_codes = qdii_codes | hold_codes | fof_codes
 
     # Load QVIX —— 自算(qvix_self_history,上交所逐合约收盘价,
-    # 不再是 optbbs 的 index_daily_cache)。阈值按传入的 window/pct 现算,
-    # 不用表里预存的那一列(那一列固定是线上用的490/0.90)。
-    print(f"加载数据... (窗口={window}天, 分位={pct}, 排名依据={ret_col}, "
+    # 不再是 optbbs 的 index_daily_cache)。按信号日前可见的历史计算阈值。
+    window_name = f"{fetcher.QVIX_THR_YEARS}个自然年" if window is None else f"{window}个交易日"
+    print(f"加载数据... (窗口={window_name}, 分位={pct}, 排名依据={ret_col}, "
           f"方向={pick}, 相关系数门槛={min_corr}, 波动率比值下限={min_vol_ratio}, "
           f"回撤线除数={dd_divisor})")
     qvix = fetcher.load_qvix_self_history()
@@ -893,17 +892,15 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     qvix["date"] = pd.to_datetime(qvix["date"])
     qvix["close"] = pd.to_numeric(qvix["close"], errors="coerce")
     qvix = qvix.sort_values("date").reset_index(drop=True)
-    minp = int(window * minp_ratio)
-    # .shift(1):信号日 d 比的是"截至 d-1 收盘"的分位, 不含 d 当天——实盘
-    # 就是拿网站盘中实时值比昨日阈值，回测不 shift 的话暴涨日
-    # 自己会把当日阈值抬高一点, 口径比实盘严一天。生产阈值列(fetcher.
-    # update_qvix_self_daily)不 shift, 因为那列存的是"截至该日收盘"的值,
-    # 次日实盘拿最后一行来比, 语义正好等价于这里的 shift(1)。
-    qvix["thr"] = qvix["close"].rolling(window, min_periods=minp).quantile(pct).shift(1)
-
     sse = load_cached_json(conn, "sse")
     sse["close"] = pd.to_numeric(sse["close"], errors="coerce")
     sse = sse.sort_values("date").reset_index(drop=True)
+    if window is None:
+        qvix["thr"] = fetcher.qvix_rolling_thresholds(qvix.rename(columns={"close": "qvix"}),
+                                                     sse["date"], before=True, pct=pct,
+                                                     minp_ratio=minp_ratio)
+    else:
+        qvix["thr"] = qvix["close"].rolling(window, min_periods=int(window * minp_ratio)).quantile(pct).shift(1)
 
     # 候选池须覆盖所选自然月窗口。净值库主批历史始于 2020-01-02。
     # 起点取"每只基金最早净值日"的1%分位, 而不是全表 MIN(date)。全表 MIN
@@ -1271,8 +1268,8 @@ def _sync_before_run():
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="QVIX恐慌信号回测")
-    parser.add_argument("--window", type=int, default=490, help="滚动窗口(交易日),默认490(约2年,线上口径)")
-    parser.add_argument("--pct", type=float, default=0.90, help="分位数,默认0.90(线上口径)")
+    parser.add_argument("--window", type=int, help="以固定交易日数复现旧阈值，默认按自然年")
+    parser.add_argument("--pct", type=float, default=fetcher.QVIX_THR_PCT, help="分位数，默认0.90")
     parser.add_argument("--min-corr", type=lambda s: None if s.lower() == "none" else float(s),
                         default=None,
                         help="冠军候选与上证指数近3月相关系数门槛,默认不启用"
@@ -1369,6 +1366,8 @@ def main():
     parser.add_argument("--no-sync", action="store_true",
                         help="跳过启动时的云端数据同步(离线跑时用)")
     args = parser.parse_args()
+    if args.window is not None and args.window < 1:
+        parser.error("--window 须为正数")
 
     if not args.no_sync:
         _sync_before_run()
@@ -1402,7 +1401,7 @@ def main():
     # fetcher.save_strategy_run 说明)。每跑一次都追加一条, 不覆盖历史;
     # 跑默认参数那次额外标记 is_standard, 主复盘表读最新的标准跑批。
     # 策略库是独立文件(fund_strategy.db), 跟行情主库分开发布。
-    _is_standard = (args.window == 490 and args.pct == 0.90
+    _is_standard = (args.window is None and args.pct == fetcher.QVIX_THR_PCT
                     and args.min_corr is None and args.lookback == "3m"
                     and args.pick == "bottom" and args.min_vol_ratio == 1.5
                     and args.dd_divisor == 5.0 and args.min_aum == 2.0
@@ -1419,6 +1418,7 @@ def main():
                     and not args.no_require_drop)
     _params = {
         "window": args.window, "pct": args.pct, "ret_col": _ret_col,
+        "threshold_years": fetcher.QVIX_THR_YEARS if args.window is None else None,
         "lookback_basis": "calendar_months",
         "lookback_months": int(args.lookback[:-1]),
         "require_sse_down": not args.any_sse_direction,
@@ -1468,8 +1468,10 @@ def main():
                   f"`python3 push_dbs.py strategy`。")
 
     df = pd.DataFrame(trades)
+    window_name = (f"{fetcher.QVIX_THR_YEARS}个自然年" if args.window is None
+                   else f"{args.window}个交易日")
     print(f"\n{'='*110}")
-    print(f"回测结果(窗口={args.window} 分位={args.pct}): {len(df)} 笔交易, 耗时 {elapsed:.0f}s")
+    print(f"回测结果(窗口={window_name} 分位={args.pct}): {len(df)} 笔交易, 耗时 {elapsed:.0f}s")
     print(f"{'='*110}\n")
 
     # 未平仓那笔的标记在「卖出日」上("YYYY-MM-DD(持仓中)"), 不在「卖出原因」
