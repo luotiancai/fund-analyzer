@@ -3,7 +3,7 @@ name: 每日数据跑批
 on:
   repository_dispatch:
     # GitHub 的 schedule 多次延迟数小时或漏跑。定时由 VPS 的 fund-nav-trigger.timer 执行。
-    types: [fund-nav-update]
+    types: [fund-nav-update, fund-nav-metrics]
   workflow_dispatch:      # 手动触发测试 / 单项补数据用
     inputs:
       mode:
@@ -31,6 +31,7 @@ jobs:
     env:
       FUND_ANALYZER_DATA: ${{ github.workspace }}/.data
       GH_TOKEN: ${{ github.token }}
+      BATCH_MODE: ${{ github.event.inputs.mode || (github.event.action == 'fund-nav-metrics' && 'metrics-only') || 'full' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -43,9 +44,9 @@ jobs:
         run: |
           mkdir -p "$FUND_ANALYZER_DATA"
           dbs="fund_rank fund_nav fund_scale"
-          if [ "${{ github.event.inputs.mode }}" = "inception-only" ]; then
+          if [ "$BATCH_MODE" = "inception-only" ]; then
             dbs="fund_rank"
-          elif [ "${{ github.event.inputs.mode }}" = "metrics-only" ]; then
+          elif [ "$BATCH_MODE" = "metrics-only" ]; then
             dbs="fund_rank fund_nav"
           fi
           for db in $dbs; do
@@ -55,7 +56,7 @@ jobs:
               rm "$db.db.gz"
               echo "取回 $db.db ($(du -h "$FUND_ANALYZER_DATA/$db.db" | cut -f1))"
             else
-              if [ "${{ github.event.inputs.mode }}" = "metrics-only" ]; then
+              if [ "$BATCH_MODE" = "metrics-only" ]; then
                 echo "::error::$db.db.gz 下载失败，停止重算"
                 exit 1
               fi
@@ -66,21 +67,21 @@ jobs:
       # 规模单独放最后、单独回传, 避免季报到期时拖慢净值发布。
       # scales-only 只刷规模。VPS 的 repository_dispatch 没有 inputs，按 full 执行。
       - name: 跑批(增量补净值 + 重算指标)
-        if: github.event.inputs.mode != 'scales-only' && github.event.inputs.mode != 'inception-only' && github.event.inputs.mode != 'metrics-only'
+        if: env.BATCH_MODE == 'full'
         run: python update_daily.py --no-scales
       - name: 仅重算收益和回撤
-        if: github.event.inputs.mode == 'metrics-only'
+        if: env.BATCH_MODE == 'metrics-only'
         run: python update_daily.py --recompute-only
       - name: 补充 C 份额成立日期
-        if: github.event.inputs.mode == 'inception-only'
+        if: env.BATCH_MODE == 'inception-only'
         run: python update_daily.py --inception-only
       - name: 压缩并回传 净值/榜单
-        if: github.event.inputs.mode != 'scales-only'
+        if: env.BATCH_MODE != 'scales-only'
         run: |
           cd "$FUND_ANALYZER_DATA"
           up=""
           dbs="fund_rank fund_nav"
-          if [ "${{ github.event.inputs.mode }}" = "inception-only" ] || [ "${{ github.event.inputs.mode }}" = "metrics-only" ]; then
+          if [ "$BATCH_MODE" = "inception-only" ] || [ "$BATCH_MODE" = "metrics-only" ]; then
             dbs="fund_rank"
           fi
           for db in $dbs; do
@@ -93,10 +94,10 @@ jobs:
             --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
           gh release upload data $up --clobber --repo "$GITHUB_REPOSITORY"
       - name: 刷新基金规模
-        if: github.event.inputs.mode != 'inception-only' && github.event.inputs.mode != 'metrics-only'
+        if: env.BATCH_MODE == 'full' || env.BATCH_MODE == 'scales-only'
         run: python update_daily.py --scales-only
       - name: 压缩并回传 规模
-        if: github.event.inputs.mode != 'inception-only' && github.event.inputs.mode != 'metrics-only'
+        if: env.BATCH_MODE == 'full' || env.BATCH_MODE == 'scales-only'
         run: |
           cd "$FUND_ANALYZER_DATA"
           gzip -9 -c fund_scale.db > fund_scale.db.gz
