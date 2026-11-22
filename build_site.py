@@ -19,6 +19,7 @@ import os
 import sys
 import time
 
+import pandas as pd
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -61,10 +62,13 @@ def collect() -> dict:
     if sse is None or sse.empty:
         raise SystemExit("上证行情是空的(market.db 没同步?), 不生成")
     sse = sse.sort_values("date").reset_index(drop=True)
+    last_date = pd.Timestamp(sse["date"].iloc[-1])
 
     out = {
         "gen": sse_view.fmt_cst(time.time(), "%Y-%m-%d %H:%M"),
-        "ranges": [[k, v] for k, v in sse_view.SSE_RANGES.items()],
+        "ranges": [[label, (last_date - pd.DateOffset(months=months)).date().isoformat()
+                    if months is not None else None]
+                   for label, months in sse_view.SSE_RANGES.items()],
         "rdef": sse_view.SSE_RANGE_DEFAULT,
         "qcolor": sse_view.QVIX_COLOR,
         "bg": sse_view.TRIG_BG,

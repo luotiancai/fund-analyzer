@@ -25,9 +25,9 @@ COL_POOL_PCT = "可买池分位"
 QVIX_COLOR = "#f28e2b"
 
 # 时间区间 → 自然日数(None=全部)。静态页的 JS 按同一张表切窗口。
-SSE_RANGES = {"近1月": 30, "近3月": 91, "近6月": 182,
-              "近1年": 365, "近2年": 365 * 2, "近3年": 365 * 3,
-              "近5年": 365 * 5, "近10年": 365 * 10, "全部": None}
+SSE_RANGES = {"近1月": 1, "近3月": 3, "近6月": 6,
+              "近1年": 12, "近2年": 24, "近3年": 36,
+              "近5年": 60, "近10年": 120, "全部": None}
 SSE_RANGE_DEFAULT = "近1年"
 
 # 止损染色: 触发哪条线就给哪一格上色。both=同日双触发, 两格都染。
@@ -141,7 +141,7 @@ def chain_broken_mask(qvix_hist: pd.DataFrame) -> pd.Series:
 # 跑批推一次库页面自动跟着变, 不用改代码。
 
 REVIEW_INTRO = (
-    "**QVIX 2年90%信号 + 近3月跌幅最大**"
+    "**QVIX 490 个交易日的 90% 分位 + 近3月跌幅最大**"
     "(波动率比值≥1.5 + 规模≥2亿 + 近3月跌幅≤30%;没有真跌的合格候选就"
     "放弃当天、顺延到下一个信号日)**+ 基金/大盘双止损逐日盯盘**"
     "。卖出后隔 2 个交易日才允许下一次买入(赎回款 T+2 到账,"
@@ -193,8 +193,12 @@ def review_summary(bt_df: pd.DataFrame, bt_id, bt_at, params=None) -> str:
                  if len(_loss) else "无")
     merged = (params or {}).get("aum_basis", "single") == "merged"
     basis = "A/C 等份额合并" if merged else "C 类自身"
+    calendar = (params or {}).get("lookback_basis") == "calendar_months"
+    require_sse_down = (params or {}).get("require_sse_down", False)
     return (
         f"本次跑批规模口径：**{basis}**。"
+        + ("近3月收益按自然月计算。" if calendar else "")
+        + ("入场须满足**上证当日收跌**。" if require_sse_down else "")
         + ("这是历史合并口径跑批，当前选基已改为 C 类自身规模，尚未按新口径重跑。"
            if merged else "")
         + f"{_n} 笔已完成:胜率 {_wins / _n * 100:.1f}%({_wins}/{_n}),"
@@ -202,9 +206,8 @@ def review_summary(bt_df: pd.DataFrame, bt_id, bt_at, params=None) -> str:
         f"平均持有 {_days.mean():.0f} 天,"
         f"平均费后 {_rets.mean():+.2f}%,"
         f"最佳 {_rets.max():+.2f}% / 最差 {_rets.min():+.2f}%。"
-        f"最佳那笔是单只小微盘主题基金的极端案例,剔除它其余 "
-        f"{_n - 1} 笔累计仍有 {_cum_ex:+.2f}%——别把它当期望值,"
-        f"不依赖那笔运气结论也成立。亏损笔:{_loss_txt}。"
+        f"剔除收益最高的一笔，其余 {_n - 1} 笔累计 {_cum_ex:+.2f}%。"
+        f"亏损笔:{_loss_txt}。"
         "样本只有个位数、跨度6年,统计上很薄,别当成可靠预期。"
         "「可买池分位」是这一笔在当天**本来可以买的所有基金**(规模≥2亿、"
         "排除QDII/海外和持有期锁定和净值脏数据"

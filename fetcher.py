@@ -427,17 +427,17 @@ def get_risk_free_rate(force_refresh: bool = False) -> float:
     return value if value is not None else RISK_FREE_RATE
 
 
-# Look-back windows in CALENDAR days, matching how EastMoney defines 近1月/3月/
-# 6月/1年 (date-to-date from the latest NAV date), so the computed drawdown
-# covers the same period as the 近X 收益率 columns shown alongside it.
-DRAWDOWN_DAYS = {"mdd_1m": 30, "mdd_3m": 91, "mdd_6m": 182, "mdd_1y": 365}
+# Returns and drawdowns share the same calendar windows.
+PERIOD_OFFSETS = {
+    "1m": pd.DateOffset(months=1), "3m": pd.DateOffset(months=3),
+    "6m": pd.DateOffset(months=6), "1y": pd.DateOffset(years=1),
+}
+RETURN_WINDOWS = {f"ret_{period}": offset for period, offset in PERIOD_OFFSETS.items()}
+DRAWDOWN_WINDOWS = {f"mdd_{period}": offset for period, offset in PERIOD_OFFSETS.items()}
+METRICS_CALENDAR_VERSION = 1
 
-# Period returns (%), matching the rank list's 近1月/3月/6月/1年 columns; used
-# when metrics are recomputed as of a past date and the list values don't apply.
-RETURN_DAYS = {"ret_1m": 30, "ret_3m": 91, "ret_6m": 182, "ret_1y": 365}
 
-
-def effective_daily_ret(df: pd.DataFrame) -> pd.Series:
+def effective_daily_ret(df: pd.DataFrame, *, groups=None, exact_nav=False) -> pd.Series:
     """每日实际收益率(小数),供收益/回撤/分红检测统一使用。
 
     优先取官方日增长率(daily_ret_pct);但当它与净值环比矛盾(差>0.3pp)
@@ -446,6 +446,7 @@ def effective_daily_ret(df: pd.DataFrame) -> pd.Series:
     1.7 万行、3 千余只基金,如 008092 的 2020 年初,直接累乘会把当时的
     股灾算成 0 波动)。真正的分红日(累计净值走势与日增长率一致、单位
     净值跳水)仍信官方日增长率。缺失值回退净值环比。
+    自然月口径在累计净值与单位净值差额不变时用单位净值环比，避免日涨幅舍入累积。
     """
     nav = pd.to_numeric(df["nav"], errors="coerce")
     acc = pd.to_numeric(df["acc_nav"], errors="coerce").fillna(nav) \
@@ -453,12 +454,17 @@ def effective_daily_ret(df: pd.DataFrame) -> pd.Series:
     r = pd.to_numeric(df["daily_ret_pct"], errors="coerce") / 100.0 \
         if "daily_ret_pct" in df.columns \
         else pd.Series(np.nan, index=df.index)
-    implied_nav = nav / nav.shift(1) - 1.0
-    implied_acc = acc / acc.shift(1) - 1.0
+    prev_nav = nav.shift() if groups is None else nav.groupby(groups, sort=False).shift()
+    prev_acc = acc.shift() if groups is None else acc.groupby(groups, sort=False).shift()
+    implied_nav = nav / prev_nav - 1.0
+    implied_acc = acc / prev_acc - 1.0
     conflict = (r - implied_nav).abs() > 0.003
     dividendish = (r - implied_acc).abs() <= 0.003
     out = r.copy()
     use_implied = (conflict & ~dividendish & implied_nav.notna()) | r.isna()
+    if exact_nav:
+        stable_gap = ((acc - nav) - (prev_acc - prev_nav)).abs() <= 1e-7
+        use_implied |= stable_gap & implied_nav.notna()
     out[use_implied] = implied_nav[use_implied]
     # 巨额赎回:惩罚性赎回费摊入剩余净值时,净值/累计净值/官方日增长率
     # 三者一致地单日暴涨(014939 2025-03-31 +68.7%、018658 +38.2%、
@@ -469,17 +475,10 @@ def effective_daily_ret(df: pd.DataFrame) -> pd.Series:
     return out
 
 
-# A window anchor may miss by a few days when the ideal start lands in a
-# holiday gap or just before the stored history begins (data starts NAV_START,
-# but 01-01 itself is a holiday). Accept the earliest NAV as anchor when it is
-# at most this many days late; beyond that the fund is genuinely too young.
-ANCHOR_GRACE_DAYS = 10
-
-
-def _window_by_date(df: pd.DataFrame, days_back: int) -> Optional[pd.DataFrame]:
+def _window_by_date(df: pd.DataFrame, offset: pd.DateOffset) -> Optional[pd.DataFrame]:
     """Rows from the anchor through the latest NAV, for a trailing date window.
 
-    The anchor is the last NAV on or before (latest_date - days_back); it is the
+    The anchor is the last NAV on or before (latest_date - offset); it is the
     base point one period ago (e.g. the NAV "one year ago"). It is kept in the
     slice so it can serve as the drawdown peak candidate and as the base for the
     first in-window daily return. Returns None when the fund has no NAV old
@@ -488,12 +487,9 @@ def _window_by_date(df: pd.DataFrame, days_back: int) -> Optional[pd.DataFrame]:
     `df` must be sorted ascending by `date` with a 0..n-1 RangeIndex.
     """
     end_date = df["date"].max()
-    start_date = end_date - timedelta(days=days_back)
+    start_date = end_date - offset
     older = df[df["date"] <= start_date]
     if older.empty:
-        first = df["date"].iloc[0]
-        if (first - start_date).days <= ANCHOR_GRACE_DAYS:
-            return df
         return None
     return df.loc[older.index[-1]:]
 
@@ -535,11 +531,11 @@ def _annualized(r: pd.Series, span_days: int):
     return ann_return, ann_vol
 
 
-def _period_return(df: pd.DataFrame, days_back: int) -> Optional[float]:
-    """Compounded % return over the trailing `days_back` calendar-day window
+def _period_return(df: pd.DataFrame, offset: pd.DateOffset) -> Optional[float]:
+    """Compounded % return over the trailing calendar window
     (daily growth rates multiplied up, so dividends are handled). None when
     the fund lacks history old enough to anchor the window."""
-    window = _window_by_date(df, days_back)
+    window = _window_by_date(df, offset)
     if window is None:
         return None
     r = window["r"].iloc[1:].dropna()
@@ -548,14 +544,14 @@ def _period_return(df: pd.DataFrame, days_back: int) -> Optional[float]:
     return float(((1.0 + r).prod() - 1.0) * 100.0)
 
 
-def _period_mdd(df: pd.DataFrame, days_back: int) -> Optional[float]:
-    """Max drawdown over the trailing `days_back` window, 按校正日收益率的
+def _period_mdd(df: pd.DataFrame, offset: pd.DateOffset) -> Optional[float]:
+    """Max drawdown over the trailing calendar window, 按校正日收益率的
     复利增长指数计算(分红视作再投)。
 
     此前用累计净值:它把历史分红单利加回,对分红基金会低估回撤
     (002583 近1年 14.51% vs 复利口径 16.45%)。
     需要 df 已带校正收益列 r(_metrics_from_nav 保证)。"""
-    window = _window_by_date(df, days_back)
+    window = _window_by_date(df, offset)
     if window is None:
         return None
     r = window["r"].iloc[1:].fillna(0.0)   # 首行是窗口锚点,其收益属窗口外
@@ -1146,21 +1142,18 @@ def _metrics_from_nav(nav_df: pd.DataFrame,
         df["acc_nav"] = df["nav"]
     df = df.sort_values("date").reset_index(drop=True)
     # 官方日增长率经 effective_daily_ret 校正(建仓期假 0 → 净值环比)。
-    df["r"] = effective_daily_ret(df)
+    df["r"] = effective_daily_ret(df, exact_nav=True)
 
     returns = df["r"].dropna()
     if len(returns) < 20:
         return None
 
-    # Per-period max drawdown over trailing calendar-day windows, date-aligned
-    # with EastMoney's 近X 收益率. A fund younger than a window gets None for it
-    # (no anchor) rather than a misleadingly short reading.
-    # Drawdown runs on accumulated NAV so dividends aren't mistaken for drops.
-    mdd = {key: _period_mdd(df, days)
-           for key, days in DRAWDOWN_DAYS.items()
+    # Both metrics use the same anchor and dividend-adjusted returns.
+    mdd = {key: _period_mdd(df, offset)
+           for key, offset in DRAWDOWN_WINDOWS.items()
            if cols is None or key in cols}
-    rets = {key: _period_return(df, days)
-            for key, days in RETURN_DAYS.items()
+    rets = {key: _period_return(df, offset)
+            for key, offset in RETURN_WINDOWS.items()
             if cols is None or key in cols}
 
     if cols is not None:
@@ -2385,21 +2378,25 @@ def recompute_all(progress_callback: Optional[Callable] = None) -> int:
             saved += 1
         if progress_callback and (done % 500 == 0 or done == total):
             progress_callback(done, total)
-    conn.commit()
     # Record WHICH data these metrics were computed from — the newest NAV
     # trading date and how many funds carry it — so metrics_stale() compares
     # data versions, not wall-clock timestamps ("今天的数据算今天的,明天的
     # 数据来了才失效").
     date_num, at_date = _nav_data_version(conn)
-    conn.close()
     if date_num is not None:
-        _set_meta("metrics_nav_date", date_num)
-        _set_meta("metrics_nav_date_rows", at_date)
+        now = time.time()
+        conn.executemany("INSERT OR REPLACE INTO app_meta (key,value,saved_at) VALUES (?,?,?)", [
+            ("metrics_nav_date", date_num, now),
+            ("metrics_nav_date_rows", at_date, now),
+            ("metrics_calendar_version", METRICS_CALENDAR_VERSION, now),
+        ])
+    conn.commit()
+    conn.close()
     return saved
 
 
 def _asof_returns_vectorized(conn, asof: str, cols: set, codes=None):
-    """compute_metrics_asof 的向量化快路: 只算区间收益列(cols ⊆ RETURN_DAYS)。
+    """compute_metrics_asof 的向量化快路: 只算区间收益列。
 
     逐只路径(下面那个 for 循环)的耗时**不在 SQL 上**: 实测 5722 只共 13.0s,
     其中一次性把数据读出来只要 1s, 剩下 9~12s 全花在"每只基金构造一个
@@ -2407,10 +2404,7 @@ def _asof_returns_vectorized(conn, asof: str, cols: set, codes=None):
     所以这里把整段计算搬到**一整张表**上做, 5722 次 pandas 调用变成十几次。
 
     口径与逐只路径**完全一致**(切换前逐只比对过 5722 只, 见下面几条保证):
-      · 切片起点取 min(每只最后净值日) - 窗口天数 - 宽限, 保证每只基金的
-        区间窗口(锚点在内)整段落在切片里 —— 锚点是"最后净值日往回 days_back
-        天之前的最后一个净值日", 切片截短了会让锚点前移/落空, 算出来的收益
-        就变了(实测直接按 asof-130天 切会有 8 只对不上、2 只消失);
+      · 切片起点由各基金最早终点与所需自然期限推得。切片缺少锚点时查全历史；
       · 切片内行数 < 60 的稀疏基金(定开/按周披露)一律退回逐只路径 —— 那两道
         "至少 20 个点"的门槛在全历史上判和在切片上判不是一回事;
       · effective_daily_ret 的第一行拿不到环比(shift 出 NaN), 但切片第一行
@@ -2422,9 +2416,9 @@ def _asof_returns_vectorized(conn, asof: str, cols: set, codes=None):
         "WHERE date < ?" + code_clause + " GROUP BY code", (asof, *(codes or []))).fetchall()
     if not ends:
         return {}, set()
-    need = max(RETURN_DAYS[c] for c in cols) + ANCHOR_GRACE_DAYS + 5
-    slice_start = (pd.Timestamp(min(r["e"] for r in ends))
-                   - timedelta(days=need)).strftime("%Y-%m-%d")
+    earliest_end = pd.Timestamp(min(r["e"] for r in ends))
+    earliest_start = min(earliest_end - RETURN_WINDOWS[c] for c in cols)
+    slice_start = (earliest_start - pd.Timedelta(days=15)).strftime("%Y-%m-%d")
     full_n = {r["code"]: r["n"] for r in ends}
     big = pd.read_sql_query(
         "SELECT code, date, nav, daily_ret_pct, acc_nav FROM fund_nav_daily "
@@ -2453,44 +2447,23 @@ def _asof_returns_vectorized(conn, asof: str, cols: set, codes=None):
             return {}, fallback
 
     dates = pd.to_datetime(big["date"])
-    nav = pd.to_numeric(big["nav"], errors="coerce")
-    acc = pd.to_numeric(big["acc_nav"], errors="coerce").fillna(nav)
-    r = pd.to_numeric(big["daily_ret_pct"], errors="coerce") / 100.0
-    implied_nav = nav / nav.groupby(code, sort=False).shift(1) - 1.0
-    implied_acc = acc / acc.groupby(code, sort=False).shift(1) - 1.0
-    # 下面五行是 effective_daily_ret 的逐字向量化版, 改那边记得改这里
-    conflict = (r - implied_nav).abs() > 0.003
-    dividendish = (r - implied_acc).abs() <= 0.003
-    use_implied = (conflict & ~dividendish & implied_nav.notna()) | r.isna()
-    rr = r.mask(use_implied, implied_nav)
-    rr = rr.mask(rr.abs() > 0.30, 0.0)      # mask 不碰 NaN, 与逐只版一致
-
     pos = pd.Series(np.arange(len(big)), index=big.index)
     last_pos = pos.groupby(code, sort=False).max()
-    first_pos = pos.groupby(code, sort=False).min()
     end_f = dates.groupby(code, sort=False).transform("max")
-    first_date = dates.groupby(code, sort=False).transform("min")
-    # (1+r) 的组内累乘: NaN 当因子 1(等价于逐只版先 dropna 再连乘),
-    # 另开一列数非 NaN 个数, 用来复现"窗口内一个有效收益都没有→None"。
-    fac = (1.0 + rr).fillna(1.0)
-    cum = fac.groupby(code, sort=False).cumprod()
-    nn = rr.notna().astype(int).groupby(code, sort=False).cumsum()
-
+    rr = effective_daily_ret(big, groups=code, exact_nav=True)
+    factors = (1.0 + rr).fillna(1.0)
+    cum_v = factors.groupby(code, sort=False).cumprod().to_numpy()
+    nn_v = rr.notna().astype(int).groupby(code, sort=False).cumsum().to_numpy()
     out = {}
-    cum_v, nn_v = cum.to_numpy(), nn.to_numpy()
     for key in cols:
-        days = RETURN_DAYS[key]
-        start_f = end_f - pd.Timedelta(days=days)
+        start_f = end_f - RETURN_WINDOWS[key]
         older = dates <= start_f
         anchor = pos.where(older).groupby(code, sort=False).max()   # NaN=没有
-        # 没有锚点时的宽限: 全历史第一条比理想起点晚不超过 ANCHOR_GRACE_DAYS
-        # 就拿第一条当锚点(逐只版 _window_by_date 的同一条规则), 否则该只无值
-        grace_ok = ((first_date.groupby(code, sort=False).first()
-                     - start_f.groupby(code, sort=False).first()).dt.days
-                    <= ANCHOR_GRACE_DAYS)
-        anchor = anchor.fillna(first_pos.where(grace_ok))
         for c, a in anchor.items():
             if pd.isna(a):
+                # 自然月窗口的锚点可能落在切片之外的长休市前。
+                if full_n[c] > n_slice[c]:
+                    fallback.add(c)
                 out.setdefault(c, {})[key] = None
                 continue
             a, e = int(a), int(last_pos[c])
@@ -2523,7 +2496,7 @@ def compute_metrics_asof(asof: str,
     # 只要区间收益列(今日候选/回测/pct_rank 都是 cols={"ret_3m"})时走向量化
     # 快路, 实测 13.0s → 见 _asof_returns_vectorized。回撤列还没向量化(窗口内
     # cummax 麻烦), 带 mdd_* 的调用(筛选页的「截至日期」)照旧逐只算。
-    if cols and all(c in RETURN_DAYS for c in cols):
+    if cols and all(c in RETURN_WINDOWS for c in cols):
         if low_memory:
             fast, fallback = {}, set()
             for start in range(0, len(codes), 100):
@@ -2625,7 +2598,8 @@ def metrics_stale() -> bool:
         return False   # no NAV data at all — nothing to recompute from
     met_date, _ = _get_meta("metrics_nav_date")
     met_rows, _ = _get_meta("metrics_nav_date_rows")
-    return met_date != date_num or met_rows != at_date
+    version, _ = _get_meta("metrics_calendar_version")
+    return met_date != date_num or met_rows != at_date or version != METRICS_CALENDAR_VERSION
 
 
 def _backfill_codes(codes: list, workers: int = MAX_WORKERS,

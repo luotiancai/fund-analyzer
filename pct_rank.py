@@ -75,8 +75,6 @@ def compute(run_id: int, dry_run: bool = False):
     sse["close"] = pd.to_numeric(sse["close"], errors="coerce")
     sse = sse.sort_values("date").reset_index(drop=True)
     sse_close = sse.set_index("date")["close"]
-    sse_ret = sse_close.pct_change()
-    need = fetcher.RETURN_DAYS["ret_3m"]
 
     row = conn.execute("SELECT label, trades, params FROM strategy_runs WHERE id=?",
                        (run_id,)).fetchone()
@@ -86,6 +84,8 @@ def compute(run_id: int, dry_run: bool = False):
 
     for t in trades:
         buy, thr = pd.Timestamp(t["买入日"]), t["恐慌阈值"]
+        last_close_date = sse_close.index[sse_close.index < buy][-1]
+        win_lo = last_close_date - fetcher.PERIOD_OFFSETS["3m"]
         metrics = fetcher.compute_metrics_asof(t["买入日"], cols={"ret_3m"})
         cand = {c for c, m in metrics.items()
                 if m.get("ret_3m") is not None and c not in exclude}
@@ -98,7 +98,7 @@ def compute(run_id: int, dry_run: bool = False):
                 if aums.get(c) is not None and aums[c] >= 2.0
                 and c not in restricted}
 
-        lo = (buy - pd.Timedelta(days=need + 20)).strftime("%Y-%m-%d")
+        lo = win_lo.strftime("%Y-%m-%d")
         hi = (buy + pd.Timedelta(days=500)).strftime("%Y-%m-%d")
         raw = pd.read_sql_query(
             "SELECT code, date, nav, daily_ret_pct FROM fund_nav_daily "
@@ -108,9 +108,7 @@ def compute(run_id: int, dry_run: bool = False):
         raw["r"] = pd.to_numeric(raw["daily_ret_pct"], errors="coerce") / 100.0
         raw = raw[raw["code"].isin(cand)]
 
-        win_lo = buy - pd.Timedelta(days=need)
-        m_pre = sse_ret[(sse_ret.index >= win_lo)
-                        & (sse_ret.index < buy)].dropna().values
+        m_pre = sse_close[(sse_close.index >= win_lo) & (sse_close.index < buy)].pct_change().dropna().values
         m_std = np.std(m_pre) if len(m_pre) >= 20 else None
         days_after = sse[sse["date"] >= buy]["date"].values
         buy_sse = float(sse_close.loc[buy])

@@ -155,11 +155,7 @@ def filter_funds(fetcher, funds, connection, args):
             # The consumer must not recompute/publish an inconsistent generation.
             raise ValueError("净值与预计算指标版本不一致，等待下一次数据同步。")
         metric_df = pd.DataFrame.from_dict(metrics, orient="index").rename_axis("code").reset_index()
-        work = funds.merge(metric_df, on="code", how="left", suffixes=("_list", ""))
-        for col in fetcher.RETURN_DAYS:
-            if col + "_list" in work:
-                work[col] = pd.to_numeric(work[col], errors="coerce").fillna(
-                    pd.to_numeric(work[col + "_list"], errors="coerce"))
+        work = funds[["code", "name", "type"]].merge(metric_df, on="code", how="left")
     work = work[~work["type"].fillna("").map(fetcher.is_bond)]
     work = work.loc[[not fetcher.is_fof(t, n) and not is_locked_fund(n)
                      for t, n in zip(work["type"], work["name"])]]
@@ -168,8 +164,8 @@ def filter_funds(fetcher, funds, connection, args):
     first = fetcher.nav_first_dates()
     if not first.empty:
         work = work.merge(first, on="code", how="left")
-        too_young = work["first_nav_date"].notna() & (
-            (pd.Timestamp(ref) - work["first_nav_date"]).dt.days < fetcher.RETURN_DAYS[ret])
+        cutoff = pd.Timestamp(state["need_date"]) - fetcher.RETURN_WINDOWS[ret]
+        too_young = work["first_nav_date"] > cutoff
         work = work[~too_young]
     for col in (ret, mdd):
         work[col] = pd.to_numeric(work[col], errors="coerce")
@@ -202,11 +198,14 @@ def detail(fetcher, funds, connection, code):
     info = funds[funds["code"] == code]
     info = info.iloc[0].to_dict() if not info.empty else {"code": code, "name": code}
     metrics = fetcher._metrics_from_nav(nav)
+    nav_end = nav["date"].max()
+    nav_starts = {period: (nav_end - offset).date().isoformat()
+                  for period, offset in fetcher.PERIOD_OFFSETS.items()}
     with contextlib.closing(connection()) as c:
         scales = [dict(r) for r in c.execute(
             "SELECT quarter_end,aum,publish_date FROM fund_scale_hist WHERE code=? ORDER BY quarter_end DESC",
             (code,))]
-    return dict(info=info, metrics=metrics, nav=nav.to_dict("records"),
+    return dict(info=info, metrics=metrics, nav=nav.to_dict("records"), nav_starts=nav_starts,
                 scales=scales, source=source)
 
 

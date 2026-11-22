@@ -231,7 +231,7 @@ class DailyMetricsTests(unittest.TestCase):
             self.assertEqual(pct_rank._pool_universe(c)[2], {"000001", "000002"})
 
     def test_batch_skips_annualization_and_preserves_all_eight_period_metrics(self):
-        period_cols = set(fetcher.RETURN_DAYS) | set(fetcher.DRAWDOWN_DAYS)
+        period_cols = set(fetcher.RETURN_WINDOWS) | set(fetcher.DRAWDOWN_WINDOWS)
         expected = fetcher._metrics_from_nav(self.nav, cols=period_cols)
         with patch.object(fetcher, "_annualized", side_effect=AssertionError("batch annualized")) as annualized:
             self.assertEqual(fetcher.recompute_all(), 2)
@@ -241,6 +241,20 @@ class DailyMetricsTests(unittest.TestCase):
         for col, value in expected.items():
             self.assertAlmostEqual(stored["000001"][col], value, places=12)
         self.assertEqual(stored["000002"]["mdd_1y"], 0)
+
+    def test_calendar_returns_and_drawdowns_share_the_leap_day_anchor(self):
+        asof = "2024-03-01"
+        expected_starts = {"1m": "2024-01-29", "3m": "2023-11-29",
+                           "6m": "2023-08-29", "1y": "2023-02-28"}
+        fast = fetcher.compute_metrics_asof(asof, cols=set(fetcher.RETURN_WINDOWS))["000001"]
+        slow = fetcher.compute_metrics_asof(
+            asof, cols=set(fetcher.RETURN_WINDOWS) | set(fetcher.DRAWDOWN_WINDOWS))["000001"]
+        for period, anchor in expected_starts.items():
+            nav = self.nav.loc[self.nav["date"].between(anchor, "2024-02-29"), "nav"]
+            expected_return = (nav.iloc[-1] / nav.iloc[0] - 1) * 100
+            self.assertAlmostEqual(fast[f"ret_{period}"], expected_return, places=10)
+            self.assertAlmostEqual(slow[f"ret_{period}"], expected_return, places=10)
+            self.assertAlmostEqual(slow[f"mdd_{period}"], (1 - nav / nav.cummax()).max(), places=10)
 
     def test_existing_storage_is_migrated_without_losing_period_values(self):
         if sqlite3.sqlite_version_info < (3, 35):

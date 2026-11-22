@@ -57,7 +57,8 @@ def _std_params():
          inspect.signature(B.run_backtest).parameters.items()
          if v.default is not inspect.Parameter.empty}
     return {k: d[k] for k in ("min_vol_ratio", "min_aum", "max_aum",
-                              "max_drop", "dd_divisor", "window", "pct", "aum_basis")}
+                              "max_drop", "dd_divisor", "window", "pct", "aum_basis",
+                              "require_sse_down")}
 
 
 STD = _std_params()
@@ -124,23 +125,13 @@ def data_freshness(conn, asof=None, nav_max=None):
 
 
 def _ret3m_window(conn, code: str, asof_s: str):
-    """这只基金「近3月」实际用的窗口 (起点, 终点)。
-
-    口径照抄 fetcher._window_by_date: 终点 = 该基金**早于 asof** 的最后一个
-    净值日(当日净值当晚才公布, 决策时看不到); 起点 = 终点往回 91 个自然日、
-    取该日或之前最近的一个净值日。
-    ⚠️ 这跟支付宝/东财的"近3月"不是一回事: 它们按**整3个自然月**取起点。
-    实测 025778 同一个终点(2026-08-12), 91天口径起点落在 05-13 得 -27.32%,
-    而支付宝的起点是 05-12、得 -28.13%, 差一个交易日就差 0.8 个百分点。
-    """
+    """取决策前最后一个净值日及该日往回3个自然月的净值锚点。"""
     end = conn.execute(
         "SELECT MAX(date) d FROM fund_nav_daily WHERE code=? AND date<?",
         (code, asof_s)).fetchone()["d"]
     if not end:
         return None, None
-    start_limit = (pd.Timestamp(end)
-                   - pd.Timedelta(days=fetcher.RETURN_DAYS["ret_3m"])
-                   ).strftime("%Y-%m-%d")
+    start_limit = (pd.Timestamp(end) - fetcher.PERIOD_OFFSETS["3m"]).strftime("%Y-%m-%d")
     anchor = conn.execute(
         "SELECT MAX(date) d FROM fund_nav_daily WHERE code=? AND date<=?",
         (code, start_limit)).fetchone()["d"]
@@ -161,8 +152,7 @@ def _gates(conn, sse, code, asof_s, aum):
     → (淘汰原因 or None, 波动率比值 or None, 规模 or None)。
 
     僵化-补涨这道排在最后: 前面几道全是便宜的库内判断, 它要扫一段净值。"""
-    if not B._has_full_window(conn, code, asof_s,
-                              fetcher.RETURN_DAYS["ret_3m"]):
+    if _ret3m_window(conn, code, asof_s)[0] is None:
         return "回看窗口不完整", None, aum
     beta = B.compute_beta(conn, sse, code, asof_s)
     if beta < STD["min_vol_ratio"]:
@@ -174,7 +164,7 @@ def _gates(conn, sse, code, asof_s, aum):
     if STD["max_aum"] and aum > STD["max_aum"]:
         return f"规模{aum:.2f}亿>{STD['max_aum']}", beta, aum
     end = pd.Timestamp(asof_s)
-    if B._has_stale_catchup(conn, code, end - pd.Timedelta(days=101),
+    if B._has_stale_catchup(conn, code, end - fetcher.PERIOD_OFFSETS["3m"] - pd.Timedelta(days=10),
                             end - pd.Timedelta(days=1)):
         return "净值僵化-补涨", beta, aum
     return None, beta, aum
@@ -190,7 +180,7 @@ def _mature_codes(conn, codes, asof):
 
 def _require_complete_nav(conn, trading_dates, need_date, codes):
     """按 T-1 对齐校验, 避免缺净值的基金把整个检查窗口往前挪。"""
-    start_limit = need_date - pd.Timedelta(days=fetcher.RETURN_DAYS["ret_3m"])
+    start_limit = need_date - fetcher.PERIOD_OFFSETS["3m"]
     anchor = trading_dates[trading_dates <= start_limit].max()
     if pd.isna(anchor):
         raise IncompleteNavError("交易日历未覆盖完整的近3个月窗口，已停止本次选基。")
@@ -237,14 +227,17 @@ def scan(asof) -> dict:
     asof = pd.Timestamp(asof)
     qdate, qvix, thr, broken = _threshold(asof)
     nav_max, sse_max, behind, need_date, missing = data_freshness(conn, asof)
+    sse_change = B.sse_day_change(sse, asof)
     # 链失效日直接算触发(见 _threshold): 那天没有 QVIX 值可跟阈值比, 但
     # "算不出来"这件事本身就是行情极端的证据, 跟回测口径一致
     # (backtest_qvix 的信号集合同样把它们算进去)。
+    qvix_hit = (qdate == asof and thr is not None and not pd.isna(thr)
+                and (broken or (qvix is not None and not pd.isna(qvix) and qvix > thr)))
     out = {"asof": asof, "qdate": qdate, "qvix": qvix, "thr": thr,
            "broken": broken,
-           "hit": (thr is not None and not pd.isna(thr)
-                   and (broken or (qvix is not None and not pd.isna(qvix)
-                                   and qvix > thr))),
+           "sse_change": sse_change, "qvix_hit": qvix_hit,
+           "hit": qvix_hit and (not STD["require_sse_down"] or
+                                (sse_change is not None and sse_change < 0)),
            "nav_max": nav_max, "sse_max": sse_max, "behind": behind,
            "need_date": need_date, "missing": missing,
            "std": STD, "rows": [], "too_deep": 0, "chosen": None,

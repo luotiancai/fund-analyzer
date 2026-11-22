@@ -102,9 +102,10 @@ function renderPick(result) {
   let html = notice(`本次净值截止日为 ${result.need_date}，净值库最新日期为 ${result.nav_max}。`);
   const s = result.std;
   html += `<p class="muted">近3月跌幅最大 · 跌幅 ≤ ${num(s.max_drop,0)}% · 波动率比值 ≥ ${s.min_vol_ratio} · C类自身规模 ≥ ${s.min_aum} 亿${s.max_aum?'，上限 '+s.max_aum+' 亿':''}。${result.too_deep} 只跌幅超过上限。</p>`;
-  if (result.asof !== state.today && result.thr != null) {
-    html += notice(result.broken ? `${result.qdate} 期权链失效，按触发信号处理，与回测一致。` :
-      `${result.qdate} QVIX ${num(result.qvix)}，阈值 ${num(result.thr)}：${result.hit?'触发买入信号。':'没有信号，下面仅展示假如买会选哪只。'}`, result.hit?'':'warn');
+  if (result.asof === result.qdate && result.thr != null) {
+    const qvix = result.broken ? '期权链失效' : `QVIX ${num(result.qvix)}，阈值 ${num(result.thr)}`;
+    const direction = result.sse_change == null ? '上证收盘涨跌待确认' : `上证 ${num(result.sse_change)}%`;
+    html += notice(`${qvix}，${direction}。${result.hit?'触发买入信号。':'下面展示当日的选基候选。'}`, result.hit?'':'warn');
   }
   if (result.thr == null) html += notice('这一天没有足够的 QVIX 阈值历史，请换个日期。','warn');
   else html += table(result.rows, pickColumns);
@@ -201,7 +202,7 @@ function renderDetail(result){
   html+='<h3>季度规模</h3>'+table(result.scales,[{key:'quarter_end',label:'报告日期'},{key:'aum',label:'期末净资产(亿)',render:v=>num(v)},{key:'publish_date',label:'估算披露日期'}]);
   html+='<details><summary>净值历史（'+result.nav.length+' 个数据点）</summary>'+table([...result.nav].reverse(),[{key:'date',label:'净值日期'},{key:'nav',label:'单位净值',render:v=>num(v,4)},{key:'acc_nav',label:'累计净值',render:v=>num(v,4)},{key:'daily_ret_pct',label:'日增长(%)',render:v=>num(v)}])+'</details>';
   $('detail-output').innerHTML=html;$('holdings-panel').hidden=false;$('holdings-output').innerHTML='';$('holdings-history-button').hidden=true;
-  state.chart={rows:result.nav,range:'1y'};
+  state.chart={rows:result.nav,starts:result.nav_starts,range:'1y'};
   $('chart-ranges').onclick=e=>{const button=e.target.closest('[data-range]');if(button)drawChart(button.dataset.range);};
   drawChart('1y');
 }
@@ -211,9 +212,10 @@ $('detail-form').addEventListener('submit',event=>{
 });
 function drawChart(range){
   if(!state.chart||!$('nav-chart'))return;state.chart.range=range;
-  const source=state.chart.rows;const days={'1m':30,'3m':91,'6m':182,'1y':365};
-  const cutoff=Date.parse(source.at(-1).date)-(days[range]||100000)*86400000;
-  const rows=source.filter(r=>Date.parse(r.date)>=cutoff&&Number.isFinite(r.nav));if(!rows.length)return;
+  const source=state.chart.rows.filter(r=>Number.isFinite(r.nav));
+  const cutoff=state.chart.starts[range];
+  const anchor=cutoff?source.findLastIndex(r=>r.date.slice(0,10)<=cutoff):0;
+  const rows=source.slice(Math.max(anchor,0));if(!rows.length)return;
   const svg=$('nav-chart'),w=Math.max(svg.clientWidth,300),h=svg.clientHeight||300,L=52,R=12,T=16,B=30;
   const vals=rows.map(r=>r.nav),low=Math.min(...vals),high=Math.max(...vals),pad=Math.max((high-low)*.08,.001),min=low-pad,max=high+pad;
   const t0=Date.parse(rows[0].date),span=Math.max(Date.parse(rows.at(-1).date)-t0,1);

@@ -105,9 +105,9 @@ $("fresh").textContent = "上证截至 " + S.d[N - 1]
   + " · 页面生成于 " + D.gen + "(北京时间)";
 
 // ── 时间窗口: 保留锚点行(起点当天或之前最后一个收盘)
-function startIdx(days) {
-  if (days == null) return 0;
-  const st = T[N - 1] - days * 864e5;
+function startIdx(startDate) {
+  if (startDate == null) return 0;
+  const st = Date.parse(startDate);
   let i = -1;
   for (let k = 0; k < N && T[k] <= st; k++) i = k;
   return i < 0 ? 0 : i;

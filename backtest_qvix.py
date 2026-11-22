@@ -446,26 +446,6 @@ def _metrics_asof_cached(asof_date, ret_col):
     return fetcher.compute_metrics_asof(asof_date, cols={ret_col})
 
 
-def _has_full_window(conn, code, asof_date, need_days):
-    """这只标的在 asof_date 之前有没有**完整**的回看窗口。
-
-    compute_metrics_asof 只要求 20 行(约1个月)就出 ret_3m, 所以一只刚上市
-    两个多月的标的也能挂着"近3月涨跌幅"参与排名 —— 那个数是在残缺窗口上
-    算的, 跟别人的 91 天口径不可比, 极端值还特别容易排到榜首/榜尾。
-
-    2026-08-10 加。起因是场内 ETF 版回测里 2020-03-18 选中的证券ETF鹏华
-    上市才 83 天(36个交易日)。这跟文件头记的 2020-03-24 那次假信号是同一
-    类问题, 当时只修了全表级下限护栏(_signal_floor), 没管单只标的。
-    场外同样会中招——一只上市两个月的新基金照样能进"近3月跌幅最大"。
-    """
-    row = conn.execute(
-        "SELECT MIN(date) FROM fund_nav_daily WHERE code=? AND date<?",
-        (code, asof_date)).fetchone()
-    if not row or not row[0]:
-        return False
-    return (pd.Timestamp(asof_date) - pd.Timestamp(row[0])).days >= need_days
-
-
 def find_champion_on_date(conn, asof_date, exclude_codes=None,
                           sse_df=None, min_corr=None,
                           ret_col="ret_3m", pick="top", min_vol_ratio=None,
@@ -480,8 +460,8 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
     (T日决策只能看到T-1日收盘净值), 与基金筛选页"截至日期"
     筛选完全同口径, 已用 2020-07-16 001644 vs 009163 交叉验证过。
 
-    ret_col: 排名依据的区间收益列, "ret_1m"(近1月,30天)或"ret_3m"
-    (近3月,91天), 见 fetcher.RETURN_DAYS。pick="top" 选该列最高的
+    ret_col: 排名依据的区间收益列, "ret_1m"(近1个自然月)或"ret_3m"
+    (近3个自然月)。pick="top" 选该列最高的
     (动量/冠军), pick="bottom" 选最低的(跌幅最大/反转候选)——起因:
     实测11次QVIX恐慌信号里有7次是"近3月跌幅最大的20只"反弹幅度反而
     超过"近3月涨幅最大的20只"(2026-07-24分析, 恐慌信号触发点本身就是
@@ -527,7 +507,7 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
 
     end = pd.Timestamp(asof_date)
     window_end = end - timedelta(days=1)
-    window_start = end - timedelta(days=fetcher.RETURN_DAYS[ret_col] + 10)
+    window_start = end - fetcher.RETURN_WINDOWS[ret_col] - timedelta(days=10)
 
     for code in sorted(candidates, key=candidates.get, reverse=(pick == "top")):
         if require_drop and pick == "bottom" and candidates[code] >= 0:
@@ -543,9 +523,6 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
             # 跌幅深度上限: 跌得比它还狠的直接跳过(只对跌幅分支生效)。
             # 放在贵检查之前 —— 排序从最深开始, 这一段全是要跳的。
             continue
-        if not _has_full_window(conn, code, asof_date,
-                                fetcher.RETURN_DAYS[ret_col]):
-            continue      # 回看窗口不完整, 排名数不可比(见 _has_full_window)
         if _has_stale_catchup(conn, code, window_start, window_end):
             continue
         if min_corr is not None:
@@ -573,8 +550,8 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
     return None, 0
 
 
-def sse_change_asof(sse_df, asof_date, days=91):
-    """信号日视角下上证相对 ~days 天前的涨跌幅(%), **截至前一交易日**。
+def sse_change_asof(sse_df, asof_date, offset=fetcher.PERIOD_OFFSETS["3m"]):
+    """按自然月计算上证区间涨跌幅(%), **截至前一交易日**。
 
     跟 sse_day_change 是两种择向依据, 各有各的道理, 由 --regime-basis 选:
       · "window"(本函数): 跟基金排名对齐。基金排名只能是 T-1 口径(净值
@@ -584,9 +561,7 @@ def sse_change_asof(sse_df, asof_date, days=91):
         指数也是实时的, 决策那一刻就能看见今天这根K线。
     这套系统本来就混时间轴(信号看 T、排名看 T-1), 没有唯一正确的对齐方式。
 
-    基准点取"最后一个可见交易日往前 days 个自然日"的最近收盘, 落在非
-    交易日就顺延到之前最近那天。days 由调用方按 ret_col 传
-    (fetcher.RETURN_DAYS: ret_1m=30/ret_3m=91)。
+    基准点从最后一个可见交易日按 `offset` 回推，取该日或之前最近收盘。
     """
     end = pd.Timestamp(asof_date)
     hist = sse_df[sse_df["date"] < end]
@@ -594,7 +569,7 @@ def sse_change_asof(sse_df, asof_date, days=91):
         return None
     last_date = hist.iloc[-1]["date"]
     last_close = float(hist.iloc[-1]["close"])
-    ref = hist[hist["date"] <= last_date - timedelta(days=days)]
+    ref = hist[hist["date"] <= last_date - offset]
     if ref.empty or not ref.iloc[-1]["close"]:
         return None
     ref_close = float(ref.iloc[-1]["close"])
@@ -627,7 +602,7 @@ def sse_day_change(sse_df, asof_date):
 
 
 def compute_beta(conn, sse_df, code, buy_date):
-    """买入日前91天窗口的波动率比值(基金日收益率std / 大盘日收益率std).
+    """截至买入前一交易日的近3个自然月波动率比值(基金日收益率std / 大盘日收益率std).
 
     纯波动对比,不按相关系数加权——目的是衡量基金相对大盘的振幅倍数,
     而非系统性风险敞口(标准 Beta 会被低相关性拉低,弱化真实波动)。
@@ -645,7 +620,10 @@ def compute_beta(conn, sse_df, code, buy_date):
     除权影响, 所以只有这一个函数踩了坑。daily_ret_pct 全表缺失率 0%。
     """
     end = pd.Timestamp(buy_date)
-    start = end - timedelta(days=91)
+    history = sse_df[sse_df["date"] < end]
+    if history.empty:
+        return 1.0
+    start = history["date"].iloc[-1] - fetcher.PERIOD_OFFSETS["3m"]
 
     nav_df = pd.read_sql_query(
         "SELECT date, daily_ret_pct FROM fund_nav_daily "
@@ -663,7 +641,7 @@ def compute_beta(conn, sse_df, code, buy_date):
     # 换用 daily_ret_pct 后除权已经不会跳了, 这道过滤留着兜脏数据。
     f_ret = f_ret[np.abs(f_ret) <= 0.35]
 
-    sse_w = sse_df[(sse_df["date"] >= start) & (sse_df["date"] < end)]
+    sse_w = history[history["date"] >= start]
     m_ret = sse_w["close"].pct_change().dropna().values
 
     if len(f_ret) < 20 or len(m_ret) < 20:
@@ -719,7 +697,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                  top_min_vol_ratio=None,
                  signal_mode: str = "threshold",
                  jump_days: int = 3, jump_pct: float = 0.20,
-                 max_drop: float = 30.0):
+                 max_drop: float = 30.0, require_sse_down: bool = True):
     """window=滚动窗口(交易日), pct=分位数, minp_ratio=窗口内至少要有
     多大比例的有效数据才出阈值(容错缺失日,同 fetcher.update_qvix_self_daily
     的 475/490 那套道理)。默认 490/0.90 是当前线上在用的参数
@@ -927,13 +905,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     sse["close"] = pd.to_numeric(sse["close"], errors="coerce")
     sse = sse.sort_values("date").reset_index(drop=True)
 
-    # 冠军排名要看"近3月涨幅",净值库(fund_nav_daily)实测最早只到
-    # 2020-01-02(不是曾经以为的2018-01,那是旧注释,已过时)——早于
-    # "库起点+91天"的信号日虽然 fetcher.ANCHOR_GRACE_DAYS=10 的宽限期
-    # 偶尔能让某天擦边通过(2020-03-24 精确压线10天),但那是"近3月"窗口
-    # 被截断到只有81天的假数据,不能真实代表冠军排名,直接从信号池剔除,
-    # 不指望宽限期兜底(宽限期本是为容忍个别基金上市日不对齐设计的,不
-    # 该被整个数据库的起点边界借用)。
+    # 候选池须覆盖所选自然月窗口。净值库主批历史始于 2020-01-02。
     # 起点取"每只基金最早净值日"的1%分位, 而不是全表 MIN(date)。全表 MIN
     # 会被极个别离群基金拉到很早: 实测 005696 华安睿明两年定开混合C 有
     # 2018-04-23 的数据(定开基金, 全程仅488条), 而其余5681只**全部**始于
@@ -948,7 +920,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     _firsts = pd.to_datetime(pd.read_sql(
         "SELECT MIN(date) AS f FROM fund_nav_daily GROUP BY code", conn)["f"])
     _nav_floor = _firsts.quantile(0.01)
-    _signal_floor = _nav_floor + pd.Timedelta(days=91)
+    _signal_floor = _nav_floor + fetcher.RETURN_WINDOWS[ret_col]
     # 显式下限优先: 场内和场外要横向比较时必须锁到同一个起点, 否则两边
     # 各按自己的数据起点算, 比的是不同的时间段。
     if min_signal_date:
@@ -959,7 +931,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
     else:
         print(f"净值库起点 {_nav_floor.date()}(1%分位; 全表最早 "
               f"{_firsts.min().date()}, 离群不采信), "
-              f"近3月冠军窗口最早可信信号日 {_signal_floor.date()}")
+              f"{ret_col} 最早可信信号日 {_signal_floor.date()}")
 
     # Signal days: 两种来源(见 signal_mode 说明)。两种都要求 thr 有值 ——
     # 不是因为 thr 决定信号(jump 模式下不决定), 而是止损线的宽度要用它。
@@ -979,6 +951,10 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
         signals = qvix[((qvix["close"] > qvix["thr"]) | _broken)
                        & (qvix["thr"].notna())]
     signals = signals[signals["date"] >= _signal_floor]
+    if require_sse_down:
+        down_days = sse.loc[sse["close"].diff() < 0, "date"]
+        signals = signals[signals["date"].isin(down_days)]
+        print("入场条件: 上证当日收跌")
     _n_broken = (0 if signal_mode == "jump"
                  else int(signals["note"].map(qvix_calc.is_chain_broken).sum()))
     print(f"信号日(QVIX > 阈值): {len(signals)} 天"
@@ -1086,7 +1062,7 @@ def run_backtest(window: int = 490, pct: float = 0.90, minp_ratio: float = 0.97,
                        else top_min_vol_ratio)
             if regime_basis == "window":
                 sse_chg = sse_change_asof(sse, day_str,
-                                          fetcher.RETURN_DAYS[ret_col])
+                                          fetcher.RETURN_WINDOWS[ret_col])
             else:
                 sse_chg = sse_day_change(sse, day_str)
             if pick == "regime":
@@ -1303,8 +1279,9 @@ def main():
                              "(2026-07-24起改回默认关闭,见 run_backtest 说明);"
                              "传具体数值(如0.6)启用")
     parser.add_argument("--lookback", choices=["1m", "3m"], default="3m",
-                        help="排名依据的区间,默认3m(近3月,91天);"
-                             "1m=近1月(30天)")
+                        help="按自然月排名，默认3m(近3个月)，1m=近1个月")
+    parser.add_argument("--any-sse-direction", action="store_true",
+                        help="允许上证上涨或收平时入场，默认只允许当日收跌时入场")
     parser.add_argument("--pick", choices=["top", "bottom", "regime"], default="bottom",
                         help="默认bottom=选区间跌幅最大(反转候选,"
                              "2026-07-24定为标准策略);"
@@ -1413,7 +1390,8 @@ def main():
                           top_min_vol_ratio=args.top_min_vol_ratio,
                           max_drop=args.max_drop,
                           signal_mode=args.signal_mode,
-                          jump_days=args.jump_days, jump_pct=args.jump_pct)
+                          jump_days=args.jump_days, jump_pct=args.jump_pct,
+                          require_sse_down=not args.any_sse_direction)
     elapsed = time.time() - t0
 
     if not trades:
@@ -1437,9 +1415,13 @@ def main():
                     and args.signal_mode == "threshold"
                     and args.max_drop == 30.0
                     and args.sell_cooldown == 2
+                    and not args.any_sse_direction
                     and not args.no_require_drop)
     _params = {
         "window": args.window, "pct": args.pct, "ret_col": _ret_col,
+        "lookback_basis": "calendar_months",
+        "lookback_months": int(args.lookback[:-1]),
+        "require_sse_down": not args.any_sse_direction,
         "pick": args.pick, "min_vol_ratio": args.min_vol_ratio,
         "dd_divisor": args.dd_divisor, "min_aum": args.min_aum,
         "max_aum": args.max_aum,
@@ -1467,6 +1449,9 @@ def main():
     if args.no_save:
         print("--no-save: 这次不落库")
     else:
+        conn = fetcher._conn()
+        _params["data_asof"] = conn.execute("SELECT MAX(last_date) FROM fund_nav_meta").fetchone()[0]
+        conn.close()
         _rid = fetcher.save_strategy_run(trades, _params, label=args.label,
                                          is_standard=_is_standard)
         _lbl = args.label or fetcher.describe_run(_params)

@@ -14,6 +14,7 @@ on:
           - full          # 完整跑批(和定时一样)
           - scales-only   # 只刷基金季度规模(覆盖范围扩大后的一次性补全)
           - inception-only # 只补充筛选范围内 C 份额的成立日
+          - metrics-only  # 只用已有净值重算收益和回撤
 
 permissions:
   contents: write   # gh release upload 需要
@@ -44,6 +45,8 @@ jobs:
           dbs="fund_rank fund_nav fund_scale"
           if [ "${{ github.event.inputs.mode }}" = "inception-only" ]; then
             dbs="fund_rank"
+          elif [ "${{ github.event.inputs.mode }}" = "metrics-only" ]; then
+            dbs="fund_rank fund_nav"
           fi
           for db in $dbs; do
             if gh release download data --pattern "$db.db.gz" \
@@ -52,6 +55,10 @@ jobs:
               rm "$db.db.gz"
               echo "取回 $db.db ($(du -h "$FUND_ANALYZER_DATA/$db.db" | cut -f1))"
             else
+              if [ "${{ github.event.inputs.mode }}" = "metrics-only" ]; then
+                echo "::error::$db.db.gz 下载失败，停止重算"
+                exit 1
+              fi
               echo "::warning::$db.db.gz 不存在, 该库将从零开始"
             fi
           done
@@ -59,8 +66,11 @@ jobs:
       # 规模单独放最后、单独回传, 避免季报到期时拖慢净值发布。
       # scales-only 只刷规模。VPS 的 repository_dispatch 没有 inputs，按 full 执行。
       - name: 跑批(增量补净值 + 重算指标)
-        if: github.event.inputs.mode != 'scales-only' && github.event.inputs.mode != 'inception-only'
+        if: github.event.inputs.mode != 'scales-only' && github.event.inputs.mode != 'inception-only' && github.event.inputs.mode != 'metrics-only'
         run: python update_daily.py --no-scales
+      - name: 仅重算收益和回撤
+        if: github.event.inputs.mode == 'metrics-only'
+        run: python update_daily.py --recompute-only
       - name: 补充 C 份额成立日期
         if: github.event.inputs.mode == 'inception-only'
         run: python update_daily.py --inception-only
@@ -70,7 +80,7 @@ jobs:
           cd "$FUND_ANALYZER_DATA"
           up=""
           dbs="fund_rank fund_nav"
-          if [ "${{ github.event.inputs.mode }}" = "inception-only" ]; then
+          if [ "${{ github.event.inputs.mode }}" = "inception-only" ] || [ "${{ github.event.inputs.mode }}" = "metrics-only" ]; then
             dbs="fund_rank"
           fi
           for db in $dbs; do
@@ -83,10 +93,10 @@ jobs:
             --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
           gh release upload data $up --clobber --repo "$GITHUB_REPOSITORY"
       - name: 刷新基金规模
-        if: github.event.inputs.mode != 'inception-only'
+        if: github.event.inputs.mode != 'inception-only' && github.event.inputs.mode != 'metrics-only'
         run: python update_daily.py --scales-only
       - name: 压缩并回传 规模
-        if: github.event.inputs.mode != 'inception-only'
+        if: github.event.inputs.mode != 'inception-only' && github.event.inputs.mode != 'metrics-only'
         run: |
           cd "$FUND_ANALYZER_DATA"
           gzip -9 -c fund_scale.db > fund_scale.db.gz
