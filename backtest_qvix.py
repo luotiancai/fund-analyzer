@@ -85,8 +85,7 @@ NAV_ANOMALIES = {
 #   **下面那些参数扫描记录全是变更前跑的, 数字不能跟这里直接比。**
 #
 #   跑批 #52「信号换成沪深300波指(对照)」是 2026-08-31 那次多标的实验留下
-#   的记录, 代码里已经没有 --qvix-series 这个选项了(整套撤掉, 原委见
-#   qvix_calc._UNDERLYING 上方)。那条跑批留着当证据: 同区间 300 是 +801.22%,
+#   的旧口径记录。同区间 300 是 +801.22%,
 #   不如 50 的 +878.95%(两边都是 sell_cooldown=0 之前的口径, 可比)。
 #
 #   样本只有9笔、跨6年, 高胜率是"一笔小亏变成小赚"的结果, 统计上毫无
@@ -684,7 +683,7 @@ def run_backtest(window: int | None = None, pct: float = fetcher.QVIX_THR_PCT,
                  signal_mode: str = "threshold",
                  jump_days: int = 3, jump_pct: float = 0.20,
                  max_drop: float = 30.0, require_sse_down: bool = True,
-                 require_fund_age: bool = True):
+                 require_fund_age: bool = True, qvix_series: str = "50"):
     """阈值默认取前一交易日前的滚动自然两年 90% 分位（含前一交易日）。
     window 可显式指定交易日数量以复现旧口径。minp_ratio 为窗口有效数据比例。
     默认按买入信号日核对份额成立满6个自然月，未查到成立日的份额不参选。
@@ -874,10 +873,12 @@ def run_backtest(window: int | None = None, pct: float = fetcher.QVIX_THR_PCT,
     # Load QVIX —— 自算(qvix_self_history,上交所逐合约收盘价,
     # 不再是 optbbs 的 index_daily_cache)。按信号日前可见的历史计算阈值。
     window_name = f"{fetcher.QVIX_THR_YEARS}个自然年" if window is None else f"{window}个交易日"
-    print(f"加载数据... (窗口={window_name}, 分位={pct}, 排名依据={ret_col}, "
+    print(f"加载数据... (QVIX={qvix_series}ETF, 窗口={window_name}, 分位={pct}, 排名依据={ret_col}, "
           f"方向={pick}, 相关系数门槛={min_corr}, 波动率比值下限={min_vol_ratio}, "
           f"回撤线除数={dd_divisor})")
-    qvix = fetcher.load_qvix_self_history()
+    qvix = fetcher.load_qvix_self_history(series=qvix_series)
+    if qvix is None:
+        raise ValueError(f"缺少 {qvix_series}ETF 日线 QVIX 历史，请先同步或回填。")
     qvix = qvix.rename(columns={"qvix": "close"})
     qvix["date"] = pd.to_datetime(qvix["date"])
     qvix["close"] = pd.to_numeric(qvix["close"], errors="coerce")
@@ -1259,6 +1260,8 @@ def _sync_before_run():
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="QVIX恐慌信号回测")
+    parser.add_argument("--qvix-series", choices=qvix_calc.UNDERLYINGS, default="50",
+                        help="期权标的：50=上证50ETF，300=沪深300ETF")
     parser.add_argument("--window", type=int, help="以固定交易日数复现旧阈值，默认按自然年")
     parser.add_argument("--pct", type=float, default=fetcher.QVIX_THR_PCT, help="分位数，默认0.90")
     parser.add_argument("--min-corr", type=lambda s: None if s.lower() == "none" else float(s),
@@ -1384,7 +1387,7 @@ def main():
                           signal_mode=args.signal_mode,
                           jump_days=args.jump_days, jump_pct=args.jump_pct,
                           require_sse_down=not args.any_sse_direction,
-                          require_fund_age=not args.no_fund_age)
+                          require_fund_age=not args.no_fund_age, qvix_series=args.qvix_series)
     elapsed = time.time() - t0
 
     if not trades:
@@ -1403,7 +1406,7 @@ def main():
                     and args.aum_basis == "single"
                     # 候选池也得是标准的那个 —— 场内 ETF 版参数可以全默认,
                     # 但它是另一个市场的对照实验, 绝不能顶掉主复盘表。
-                    and args.min_signal_date is None
+                    and args.min_signal_date is None and args.qvix_series == "50"
                     and args.top_min_vol_ratio is None
                     and args.signal_mode == "threshold"
                     and args.max_drop == 30.0
@@ -1413,6 +1416,7 @@ def main():
                     and not args.no_require_drop)
     _params = {
         "window": args.window, "pct": args.pct, "ret_col": _ret_col,
+        "qvix_series": args.qvix_series,
         "threshold_years": fetcher.QVIX_THR_YEARS if args.window is None else None,
         "lookback_basis": "calendar_months",
         "lookback_months": int(args.lookback[:-1]),

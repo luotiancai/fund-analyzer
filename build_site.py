@@ -57,6 +57,18 @@ def _num(v, nd):
         else round(float(v), nd)
 
 
+def _qvix_data(hist, trading_days):
+    hist = hist.sort_values("date").reset_index(drop=True)
+    thr = sse_view.qvix_thresholds(hist, trading_days)
+    data = {"d": hist["date"].astype(str).tolist(),
+            "v": [_num(v, 2) for v in hist["qvix"]],
+            "t": [_num(v, 3) for v in thr["thr"]],
+            "bk": [int(b) for b in sse_view.chain_broken_mask(hist)]}
+    if "qvix_rt" in hist:
+        data["r"] = [_num(v, 2) for v in hist["qvix_rt"]]
+    return data
+
+
 def collect() -> dict:
     sse = fetcher.fetch_sse_daily()
     if sse is None or sse.empty:
@@ -77,18 +89,10 @@ def collect() -> dict:
                 "p": [_num(v, 3) for v in sse["pct"]]},
     }
 
-    hist = fetcher.load_qvix_self_history()
-    if hist is not None and not hist.empty:
-        hist = hist.sort_values("date").reset_index(drop=True)
-        thr = sse_view.qvix_thresholds(hist, sse["date"])
-        out["qv"] = {"d": hist["date"].astype(str).tolist(),
-                     "v": [_num(v, 2) for v in hist["qvix"]],
-                     "t": [_num(v, 3) for v in thr["thr"]],
-                     # 实时路径收盘值(只作展示), 老库没有这列就全空
-                     "r": [_num(v, 2) for v in hist.get("qvix_rt",
-                                                        [None] * len(hist))],
-                     "bk": [1 if b else 0
-                            for b in sse_view.chain_broken_mask(hist)]}
+    for key, series in (("qv", "50"), ("q300", "300")):
+        hist = fetcher.load_qvix_self_history(series=series)
+        if hist is not None and not hist.empty:
+            out[key] = _qvix_data(hist, sse["date"])
 
     rv = {"intro": sse_view.md_inline(sse_view.REVIEW_INTRO)}
     bt_df, _p, bt_at, bt_id = fetcher.load_backtest_trades()

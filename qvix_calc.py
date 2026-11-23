@@ -1,4 +1,4 @@
-"""50ETF 日线 QVIX。上交所风险指标表只提供当日合约编码，取价用逐合约日 K 线的收盘价。
+"""上证50ETF、沪深300ETF 日线 QVIX，使用上交所逐合约日 K 线收盘价。
 
 2026-11-20 两张有正常成交的认购合约被风险指标表填了零隐波。用它反推
 期权价格会漏掉这两张，算出 13.99，而上交所、东方财富和新浪收盘价都得到
@@ -9,7 +9,6 @@
 到期日为第四个星期三，休市顺延。现货价格和上交所隐波均不参与计算，
 远期价通过认购认沽平价反推。SHIBOR 期限结构按到期天数插值。
 
-沪深300期权曾以同口径试跑，2026-08-31 的回测不如 50ETF，已撤。
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -26,8 +25,9 @@ import qvix_core
 
 
 log = logging.getLogger(__name__)
-_UNDERLYING = "510050"
-_CONTRACT_RE = re.compile(rf"^{_UNDERLYING}([CP])(\d{{4}})M(\d{{5}})$")
+UNDERLYINGS = {"50": "510050", "300": "510300"}
+START_DATES = {"50": dt.date(2018, 1, 1), "300": dt.date(2019, 12, 23)}
+_CONTRACT_RE = re.compile(r"^(\d{6})([CP])(\d{4})M(\d{5})$")
 _SSE_HEADERS = {"Referer": "https://www.sse.com.cn/", "User-Agent": "Mozilla/5.0"}
 _CONTRACT_URL = "https://query.sse.com.cn/commonQuery.do"
 _CLOSE_URL = "https://yunhq.sse.com.cn:32042/v1/sho/dayk/"
@@ -126,13 +126,14 @@ def _expiry_for_yymm(month, trading_days):
                  if base + dt.timedelta(days=i) in trading_days), base)
 
 
-def _plan(day, trading_days):
+def _plan(day, trading_days, series="50"):
+    underlying = UNDERLYINGS[series]
     months = {}
     for code, symbol in _fetch_contracts(day):
         match = _CONTRACT_RE.fullmatch(code)
-        if not match:
+        if not match or match[1] != underlying:
             continue
-        kind, month, strike = match.groups()
+        _, kind, month, strike = match.groups()
         symbol = str(symbol)
         if not re.fullmatch(r"\d{8}", symbol):
             raise ValueError("合约编码异常")
@@ -199,7 +200,7 @@ def _calculate(day, pairs, closes, curve):
     return None, "收盘价计算未得到有效的30天方差"
 
 
-def compute_qvix_history(dates, *, trading_days=None, delay=0.0):
+def compute_qvix_history(dates, *, trading_days=None, delay=0.0, series="50"):
     """按日计算 QVIX。每张合约只查一次日线，回填和每日跑批共用。"""
     dates = sorted(set(dates))
     if not dates:
@@ -210,7 +211,7 @@ def compute_qvix_history(dates, *, trading_days=None, delay=0.0):
     plans, results = {}, {}
     for i, day in enumerate(dates, 1):
         try:
-            plans[day] = _plan(day, trading_days)
+            plans[day] = _plan(day, trading_days, series=series)
         except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
             results[day] = (None, f"上交所合约名单获取失败: {exc}")
         if i % 100 == 0:

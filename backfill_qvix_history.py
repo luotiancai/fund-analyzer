@@ -2,7 +2,7 @@
 """用上交所逐合约收盘价回填日线 QVIX，同时更新滚动阈值。
 
 2015–2017 年合约较少，按现有策略口径从 2018 年开始保留历史。
-例如：python3 backfill_qvix_history.py --start 2024-01-01
+例如：python3 backfill_qvix_history.py --series 300 --start 2024-01-01
 """
 
 import argparse
@@ -15,14 +15,15 @@ from qvix_core import CST
 
 
 log = logging.getLogger(__name__)
-_MIN_DATE = dt.date(2018, 1, 1)
 
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
     parser = argparse.ArgumentParser(description="用上交所期权收盘价重算历史 QVIX")
-    parser.add_argument("--start", type=dt.date.fromisoformat, default=_MIN_DATE,
-                        help="起始日 YYYY-MM-DD，最早 2018-01-01")
+    parser.add_argument("--series", choices=qvix_calc.UNDERLYINGS, default="50",
+                        help="期权标的：50=上证50ETF，300=沪深300ETF")
+    parser.add_argument("--start", type=dt.date.fromisoformat,
+                        help="起始日 YYYY-MM-DD，默认从所选序列的最早可用日期开始")
     parser.add_argument("--end", type=dt.date.fromisoformat,
                         help="截止日 YYYY-MM-DD，默认最近已收盘日")
     parser.add_argument("--delay", type=float, default=0.15, help="交易日合约名单查询间隔秒数")
@@ -35,15 +36,18 @@ def main():
         raise SystemExit("拿不到交易日历")
     now = dt.datetime.now(CST)
     latest = now.date() if now.time() >= dt.time(15) else now.date() - dt.timedelta(days=1)
-    start, end = max(args.start, _MIN_DATE), min(args.end or latest, latest)
+    first = qvix_calc.START_DATES[args.series]
+    start, end = max(args.start or first, first), min(args.end or latest, latest)
     dates = sorted(day for day in trading_days if start <= day <= end)
     if not dates:
         raise SystemExit("指定区间内没有已收盘的交易日")
 
-    data = qvix_calc.compute_qvix_history(dates, trading_days=trading_days, delay=args.delay)
+    data = qvix_calc.compute_qvix_history(dates, trading_days=trading_days, delay=args.delay,
+                                          series=args.series)
     fetcher.init_db()
     fetcher.save_qvix_self_history([{"date": day.isoformat(), "qvix": value, "note": note}
-                                   for day, (value, note) in data.items()], trading_days=trading_days)
+                                   for day, (value, note) in data.items()],
+                                  trading_days=trading_days, series=args.series)
     for day, (value, note) in data.items():
         if value is None:
             log.warning("%s：%s", day, note)

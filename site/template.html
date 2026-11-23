@@ -66,7 +66,8 @@ code{font-size:12px}
 <div class="fresh" id="fresh"></div>
 <div class="seg" id="ranges"></div>
 <div class="opts">
-  <label><input type="checkbox" id="vix" checked>VIX恐慌指数(右轴)</label>
+  <label><input type="checkbox" id="vix" checked>上证50 QVIX</label>
+  <label><input type="checkbox" id="vix300" checked>沪深300 QVIX</label>
   <label><input type="checkbox" id="bands">标记跌超1%的交易日</label>
 </div>
 <div class="kpis" id="kpis"></div>
@@ -88,7 +89,7 @@ code{font-size:12px}
 (function () {
 "use strict";
 const D = JSON.parse(document.getElementById("data").textContent);
-const S = D.sse, N = S.d.length, Q = D.qv || null;
+const S = D.sse, N = S.d.length;
 const T = S.d.map(d => Date.parse(d));          // UTC 零点, 只用来算天数差
 const $ = id => document.getElementById(id);
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
@@ -97,11 +98,16 @@ const f2 = v => v.toLocaleString("en-US", {minimumFractionDigits: 2, maximumFrac
 const sg = v => (v >= 0 ? "+" : "") + v.toFixed(2);
 const localTs = d => new Date(d + "T00:00:00").getTime();   // echarts 按本地时区解析日期
 
-const state = {rng: D.rdef, vix: true, bands: false, tab: "review"};
+const state = {rng: D.rdef, bands: false, tab: "review"};
 const RANGES = Object.fromEntries(D.ranges);
+const qvixSeries = [
+  {id: "vix", name: "上证50", color: D.qcolor, data: D.qv},
+  {id: "vix300", name: "沪深300", color: "#a86de0", data: D.q300},
+];
 
 $("fresh").textContent = "上证截至 " + S.d[N - 1]
-  + (Q ? " · QVIX截至 " + Q.d[Q.d.length - 1] : "")
+  + qvixSeries.filter(q => q.data).map(({name, data}) =>
+      ` · ${name} QVIX截至 ${data.d[data.d.length - 1]}`).join("")
   + " · 页面生成于 " + D.gen + "(北京时间)";
 
 // ── 时间窗口: 保留锚点行(起点当天或之前最后一个收盘)
@@ -123,14 +129,14 @@ seg.addEventListener("click", e => {
   seg.querySelectorAll("button").forEach(x => x.classList.toggle("on", x === b));
   renderTop();
 });
-$("vix").addEventListener("change", e => { state.vix = e.target.checked; renderTop(); });
+qvixSeries.forEach(q => $(q.id).addEventListener("change", renderTop));
 $("bands").addEventListener("change", e => { state.bands = e.target.checked; renderTop(); });
 
 // ── 图
 const chart = echarts.init($("chart"));
 window.addEventListener("resize", () => chart.resize());
 
-function qvixIn(d0, d1) {
+function qvixIn(Q, d0, d1) {
   const line = [], thr = [], bk = [];
   if (!Q) return {line, thr, bk};
   for (let k = 0; k < Q.d.length; k++) {
@@ -149,7 +155,6 @@ function qvixIn(d0, d1) {
 function renderChart(i0) {
   const d0 = S.d[i0], d1 = S.d[N - 1];
   const muted = css("--muted"), line = css("--line"), fg = css("--fg"), drop = css("--drop");
-  const qc = D.qcolor;
   const sse = [];
   for (let k = i0; k < N; k++) sse.push([S.d[k], S.c[k], S.p[k]]);
 
@@ -159,25 +164,26 @@ function renderChart(i0) {
     emphasis: {disabled: true},
   }];
 
-  let vixOk = false;
-  if (state.vix) {
-    const q = qvixIn(d0, d1);
-    vixOk = q.line.length > 0;
-    $("vixwarn").textContent = vixOk ? "" : "⚠️ VIX恐慌指数数据暂不可用";
-    if (vixOk) {
-      series.push({name: "VIX恐慌指数(QVIX,自算)", type: "line", data: q.line, yAxisIndex: 1,
-        showSymbol: false, lineStyle: {width: 1.3, color: qc}, itemStyle: {color: qc},
-        emphasis: {disabled: true}});
-      if (q.thr.length) series.push({name: "恐慌阈值(2年90%)", type: "line", data: q.thr,
-        yAxisIndex: 1, showSymbol: false, lineStyle: {width: 1.2, color: qc, type: "dashed"},
-        itemStyle: {color: qc}, emphasis: {disabled: true}});
-      if (q.bk.length) series.push({name: "链失效(按信号处理)", type: "scatter", data: q.bk,
-        yAxisIndex: 1, symbol: "path://M2,0L5,3L8,0L10,2L7,5L10,8L8,10L5,7L2,10L0,8L3,5L0,2Z",
-        symbolSize: 11, itemStyle: {color: qc}});
+  const missing = [];
+  for (const {id, name, color, data} of qvixSeries) {
+    if (!$(id).checked) continue;
+    const q = qvixIn(data, d0, d1);
+    if (!q.line.length) {
+      missing.push(name + " QVIX");
+      continue;
     }
-  } else {
-    $("vixwarn").textContent = "";
+    series.push({name: name + " QVIX", type: "line", data: q.line, yAxisIndex: 1,
+      showSymbol: false, lineStyle: {width: 1.3, color}, itemStyle: {color},
+      emphasis: {disabled: true}});
+    if (q.thr.length) series.push({name: name + "阈值(2年90%)", type: "line", data: q.thr,
+      yAxisIndex: 1, showSymbol: false, lineStyle: {width: 1.2, color, type: "dashed"},
+      itemStyle: {color}, emphasis: {disabled: true}});
+    if (q.bk.length) series.push({name: name + "链失效", type: "scatter", data: q.bk,
+      yAxisIndex: 1, symbol: "path://M2,0L5,3L8,0L10,2L7,5L10,8L8,10L5,7L2,10L0,8L3,5L0,2Z",
+      symbolSize: 11, itemStyle: {color}});
   }
+  $("vixwarn").textContent = missing.length ? missing.join("、") + "在所选区间无数据" : "";
+  const vixOk = series.length > 1;
 
   if (state.bands) {
     const areas = [];
@@ -200,7 +206,7 @@ function renderChart(i0) {
   chart.setOption({
     animation: false,
     textStyle: {fontFamily: getComputedStyle(document.body).fontFamily},
-    grid: {left: 8, right: 8, top: state.bands ? 78 : (vixOk ? 48 : 16), bottom: 8, containLabel: true},
+    grid: {left: 8, right: 8, top: state.bands ? 89 : (vixOk ? (wide ? 48 : 66) : 16), bottom: 8, containLabel: true},
     legend: {show: vixOk, top: 0, left: 0, itemWidth: 16, itemHeight: 8,
       textStyle: {color: muted, fontSize: wide ? 12 : 11}},
     tooltip: {
@@ -212,9 +218,8 @@ function renderChart(i0) {
           if (p.value[0] !== day) continue;      // 稀疏序列(×)会吸附到别的日子, 只要当天的
           const m = p.marker;
           if (p.seriesIndex === 0) rows.push(`${m}收盘 ${f2(p.value[1])} · 日涨跌 ${p.value[2] == null ? "—" : sg(p.value[2]) + "%"}`);
-          else if (p.seriesName.startsWith("VIX")) rows.push(`${m}VIX ${p.value[1].toFixed(2)}`);
-          else if (p.seriesName.startsWith("恐慌")) rows.push(`${m}阈值 ${p.value[1].toFixed(2)}`);
-          else rows.push(`${m}那天算不出来——跌出期权链行权价范围,公式失效,按信号处理`);
+          else if (p.seriesType === "scatter") rows.push(`${m}${p.seriesName}（远期价低于最低挂牌行权价）`);
+          else rows.push(`${m}${p.seriesName} ${p.value[1].toFixed(2)}`);
         }
         return rows.join("<br>");
       },
@@ -227,7 +232,7 @@ function renderChart(i0) {
       {type: "value", scale: true, splitLine: {lineStyle: {color: line}},
         axisLabel: {color: muted, formatter: v => v.toLocaleString("en-US")}},
       {type: "value", scale: true, show: vixOk, position: "right", splitLine: {show: false},
-        axisLabel: {color: qc}},
+        axisLabel: {color: muted}},
     ],
     series,
   }, {notMerge: true});
@@ -317,17 +322,26 @@ function renderRuns() {
 }
 
 function renderDaily(i0) {
-  const vq = {}, vr = {};
-  const withVix = state.vix && Q;
-  // 实时口径收盘值(新浪买卖盘 15:00 现算, 只作对照): 2026-10 才开始攒, 更早的日子是空的
-  if (withVix) Q.d.forEach((d, k) => { vq[d] = Q.v[k]; if (Q.r) vr[d] = Q.r[k]; });
   const f2 = x => x == null ? "" : x.toFixed(2);
-  const cols = ["日期", "收盘点位", "日涨跌(%)"]
-    .concat(withVix ? ["VIX恐慌指数", "VIX实时口径收盘"] : []);
+  const cols = ["日期", "收盘点位", "日涨跌(%)"];
+  const histories = [];
+  for (const {id, name, data} of qvixSeries) {
+    if (!$(id).checked || !data) continue;
+    cols.push(name + " QVIX", name + "阈值");
+    const values = [data.v, data.t];
+    if (data.r) {
+      cols.push(name + "实时口径收盘");
+      values.push(data.r);
+    }
+    histories.push({values, index: new Map(data.d.map((d, i) => [d, i]))});
+  }
   const rows = [];
   for (let k = N - 1; k >= i0; k--) {
     const r = [S.d[k], S.c[k].toFixed(2), S.p[k] == null ? "" : S.p[k].toFixed(2)];
-    if (withVix) r.push(f2(vq[S.d[k]]), f2(vr[S.d[k]]));
+    for (const {values, index} of histories) {
+      const pos = index.get(S.d[k]);
+      r.push(...values.map(col => f2(col[pos])));
+    }
     rows.push(r);
   }
   $("p-daily").innerHTML = tableHtml({cols, rows});

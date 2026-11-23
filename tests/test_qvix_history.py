@@ -54,11 +54,17 @@ class QvixHistoryTests(unittest.TestCase):
                     {"date": day, "qvix": None, "note": "接口超时"}
                     for day in ("2026-11-19", "2026-11-20")
                 ], trading_days=calendar)
+                fetcher.save_qvix_self_history([
+                    {"date": day, "qvix": 25.0} for day in calendar
+                ], trading_days=calendar, series="300")
                 with closing(fetcher._conn()) as conn:
                     rows = conn.execute("SELECT qvix,note,threshold FROM qvix.qvix_self_history ORDER BY date")
                     self.assertEqual([tuple(row) for row in rows],
                                      [(12.0, None, None), (14.0, None, None),
                                       (None, broken, None), (16.0, None, 15.6)])
+                hist = fetcher.load_qvix_self_history(series="300")
+                self.assertEqual(hist["qvix"].tolist(), [25.0] * len(calendar))
+                self.assertEqual(hist["threshold"].iloc[-1], 25.0)
 
     def test_calendar_year_threshold_uses_prior_close_and_calendar_coverage(self):
         days = pd.bdate_range("2022-02-28", "2024-03-01")

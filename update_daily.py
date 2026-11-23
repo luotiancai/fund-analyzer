@@ -46,10 +46,10 @@ def _log_progress(phase, done, total):
         _last_log[phase] = time.time()
 
 
-def _qvix_dates_with_value() -> set:
+def _qvix_dates_with_value(series) -> set:
     """qvix_self_history 里**已经有值**(qvix 非空)的日期集合。
     用来判断一次补跑到底补上了什么:没补上任何东西就不必推一次库。"""
-    hist = fetcher.load_qvix_self_history()
+    hist = fetcher.load_qvix_self_history(series=series)
     if hist is None:
         return set()
     return set(hist[hist["qvix"].notna()]["date"].astype(str))
@@ -57,20 +57,6 @@ def _qvix_dates_with_value() -> set:
 
 def run_qvix_only() -> list:
     """VPS 用上交所合约收盘价补日线 QVIX 和阈值，返回新增有效值的日期。"""
-    before = _qvix_dates_with_value()
-    vix, note = fetcher.update_qvix_self_daily()
-    filled = sorted(_qvix_dates_with_value() - before)
-
-    if vix is not None:
-        log.info("   QVIX(自算) %.2f", vix)
-    else:
-        log.warning("   QVIX 自算仍未成功: %s", note)
-
-    if filled:
-        log.info("   本次补上 %d 天: %s", len(filled), ", ".join(filled))
-    else:
-        log.info("   没有新补上的值(凌晨那次已经算好了,或接口这会儿还是不通)")
-
     # 实时路径(新浪买卖盘)的收盘值, 只作展示/对照, 见 fetcher.update_qvix_rt_close。
     # 必须赶在下一次开盘前算: 新浪没有历史盘口, 错过就永久空着。失败不影响上面。
     try:
@@ -80,7 +66,18 @@ def run_qvix_only() -> list:
     except Exception as e:
         log.warning("   QVIX 实时口径收盘值失败(不影响日度值): %s", e)
 
-    return filled
+    filled = set()
+    for series in ("50", "300"):
+        before = _qvix_dates_with_value(series)
+        vix, note = fetcher.update_qvix_self_daily(series=series)
+        new_days = _qvix_dates_with_value(series) - before
+        if vix is None:
+            log.warning("   %sETF QVIX 更新未成功: %s", series, note)
+        if new_days:
+            log.info("   %sETF QVIX 补上 %d 天: %s", series, len(new_days),
+                     ", ".join(sorted(new_days)))
+        filled.update(new_days)
+    return sorted(filled)
 
 
 def main():

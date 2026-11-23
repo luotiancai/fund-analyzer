@@ -336,6 +336,12 @@ def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
     # 拿 pick 去套会把规则描述得完全不对。这类跑批自己在
     # params 里带 rule_note/exit_note, 有就顶掉自动拼的那句。
     _rule = x_params.get("rule_note") or _rule
+    if x_params.get("qvix_series") == "300" and x_params.get("threshold_years") is not None:
+        years, pct = x_params["threshold_years"], x_params["pct"]
+        start, end = x_params.get("min_signal_date"), x_params.get("data_asof")
+        period = f"回测区间 {start} 至 {end}。" if start and end else ""
+        _rule = (f"{period}用**沪深300 ETF QVIX**及其滚动{years}个自然年 {pct:.0%} 分位。"
+                 + ("入场须上证收跌。" if x_params.get("require_sse_down") else "") + _rule)
 
     # 过滤条件逐项列出来, 不写"与标准策略一致"——对照实验
     # 改的可能正是其中某一项(如规模门槛), 那句话会自相矛盾。
@@ -373,8 +379,9 @@ def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
            f"规模≥{_mark(_aum, 2.0)}亿")
         + ("(合并份额口径)" if _basis == "merged" else "(单份额口径)")
         + (f"。候选池:{_mkt}" if _mkt else "")
-        + (f",{x_params['exit_note']}"
-           if x_params.get("exit_note") else ",双止损口径同标准策略")
+        + (f",{x_params['exit_note']}" if x_params.get("exit_note") else
+           ",双止损沿用标准公式，宽度按沪深300阈值计算"
+           if x_params.get("qvix_series") == "300" else ",双止损口径同标准策略")
         + f"(粗体=与标准策略不同的参数)。"
         f"　{_x_n} 笔已完成:胜率 {_x_wins / _x_n * 100:.1f}%"
         f"({_x_wins}/{_x_n}),费后复利 {_x_cum:+.2f}%,"

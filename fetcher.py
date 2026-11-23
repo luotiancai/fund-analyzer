@@ -100,7 +100,7 @@ DB_LAYOUT = (
     # 排在 market 前面: 迁移期线上那份 market.db 里还留着一张同名的
     # qvix_self_history, 而不带库名的表名解析是按 ATTACH 顺序走的(先挂的先
     # 命中, 实测过), 排前面保证读写都落在新库上, 旧那张只是死重量。
-    ("qvix", "qvix.db", ("qvix_self_history",)),
+    ("qvix", "qvix.db", ("qvix_self_history", "qvix_300_history")),
     ("market", "market.db",
      ("index_daily_cache",)),
     ("strategy", "fund_strategy.db",
@@ -237,6 +237,8 @@ _DDL = {
     CREATE TABLE IF NOT EXISTS qvix.qvix_self_history (
         date TEXT PRIMARY KEY, qvix REAL, note TEXT, threshold REAL,
         qvix_rt REAL);
+    CREATE TABLE IF NOT EXISTS qvix.qvix_300_history (
+        date TEXT PRIMARY KEY, qvix REAL, note TEXT, threshold REAL);
 """,
 
 "market": """
@@ -342,11 +344,7 @@ def init_db():
             conn.execute(f"ALTER TABLE rank.fund_sharpe DROP COLUMN {col}")
         except sqlite3.OperationalError:
             pass  # 列不存在(新库)或 SQLite 太老
-    # 反向迁移(2026-08-31): 试过并行产出一条沪深300波指(qvix300/note300/
-    # threshold300), 回测不如 50, 整套撤掉——原委记在 qvix_calc._UNDERLYING
-    # 上方那段。云端那份库是每日跑批"下载→改→传回"一路继承的, 本地不显式
-    # DROP 就永远留在里面。DROP COLUMN 要 SQLite 3.35+; 跑在老 SQLite 上就
-    # 跳过, 残留列没人读也没人写。
+    # 2026-08 的试跑曾使用以下列。现有沪深300序列按统一的收盘价口径存在独立表中。
     for col in ("qvix300", "note300", "threshold300"):
         try:
             conn.execute(f"ALTER TABLE qvix.qvix_self_history DROP COLUMN {col}")
@@ -1780,37 +1778,42 @@ def _trading_days() -> Optional[set]:
 
 # 日度跑批补算最近一次收盘的实时口径值。
 _CLOSE = dt_time(15, 0)
+_QVIX_TABLES = {"50": "qvix_self_history", "300": "qvix_300_history"}
 
 
-def save_qvix_self_history(rows: list, *, trading_days) -> None:
+def save_qvix_self_history(rows: list, *, trading_days, series="50") -> None:
     """保存日线与滚动阈值。临时取数失败时保留已确认的值或链失效标记。"""
     from qvix_calc import CHAIN_BROKEN
 
     if not rows:
         return
     chain_broken = CHAIN_BROKEN + "%"
+    table = _QVIX_TABLES[series]
     with closing(_conn()) as conn, conn:
         conn.executemany(
-            "INSERT INTO qvix.qvix_self_history (date, qvix, note) VALUES (?, ?, ?) "
+            f"INSERT INTO qvix.{table} (date, qvix, note) VALUES (?, ?, ?) "
             "ON CONFLICT(date) DO UPDATE SET qvix=excluded.qvix, note=excluded.note "
             "WHERE excluded.qvix IS NOT NULL OR excluded.note LIKE ? "
-            "OR (qvix_self_history.qvix IS NULL AND coalesce(qvix_self_history.note, '') NOT LIKE ?)",
+            f"OR ({table}.qvix IS NULL AND coalesce({table}.note, '') NOT LIKE ?)",
             [(r["date"], r.get("qvix"), r.get("note"), chain_broken, chain_broken) for r in rows],
         )
-        _write_qvix_thresholds(conn, trading_days)
+        _write_qvix_thresholds(conn, trading_days, series=series)
 
 
-def _write_qvix_thresholds(conn, trading_days) -> int:
+def _write_qvix_thresholds(conn, trading_days, *, series="50") -> int:
     trading_days = list(trading_days)
-    cols = {row[1] for row in conn.execute("PRAGMA qvix.table_info(qvix_self_history)")}
+    table = _QVIX_TABLES[series]
+    cols = {row[1] for row in conn.execute(f"PRAGMA qvix.table_info({table})")}
     if "threshold" not in cols:
-        conn.execute("ALTER TABLE qvix.qvix_self_history ADD COLUMN threshold REAL")
-    hist = pd.read_sql("SELECT date, qvix FROM qvix.qvix_self_history ORDER BY date", conn)
-    if not trading_days or hist.empty or pd.Timestamp(max(trading_days)) < pd.Timestamp(hist["date"].iloc[-1]):
+        conn.execute(f"ALTER TABLE qvix.{table} ADD COLUMN threshold REAL")
+    hist = pd.read_sql(f"SELECT date, qvix FROM qvix.{table} ORDER BY date", conn)
+    if hist.empty:
+        return 0
+    if not trading_days or pd.Timestamp(max(trading_days)) < pd.Timestamp(hist["date"].iloc[-1]):
         raise ValueError("上证交易日历未覆盖已有 QVIX 历史。")
     thresholds = qvix_rolling_thresholds(hist, trading_days)
     conn.executemany(
-        "UPDATE qvix.qvix_self_history SET threshold=? WHERE date=?",
+        f"UPDATE qvix.{table} SET threshold=? WHERE date=?",
         [(None if pd.isna(t) else t, date) for t, date in zip(thresholds, hist["date"])],
     )
     return int(thresholds.notna().sum())
@@ -1825,14 +1828,14 @@ def recompute_qvix_thresholds() -> int:
         dates = pd.read_json(io.StringIO(row["data"]), orient="split", convert_dates=False)["date"]
         if dates.empty:
             raise ValueError("本地上证交易日历为空。")
-        return _write_qvix_thresholds(conn, dates)
+        return sum(_write_qvix_thresholds(conn, dates, series=series) for series in _QVIX_TABLES)
 
 
-def load_qvix_self_history() -> Optional[pd.DataFrame]:
+def load_qvix_self_history(*, series="50") -> Optional[pd.DataFrame]:
     """读取自算QVIX历史,按日期排序;没有数据时返回 None。"""
-    conn = _conn()
-    df = pd.read_sql("SELECT * FROM qvix_self_history ORDER BY date", conn)
-    conn.close()
+    table = _QVIX_TABLES[series]
+    with closing(_conn()) as conn:
+        df = pd.read_sql(f"SELECT * FROM qvix.{table} ORDER BY date", conn)
     return df if not df.empty else None
 
 
@@ -1866,6 +1869,8 @@ def describe_run(params: dict) -> str:
     else:
         head = f"{win}跌幅最大"
     bits = [head]
+    if p.get("qvix_series") == "300":
+        bits.insert(0, "沪深300 QVIX")
     if p.get("require_drop"):
         bits.append("跌向须真跌")
     if p.get("min_vol_ratio"):
@@ -2053,7 +2058,7 @@ def qvix_rolling_thresholds(history: pd.DataFrame, trading_days, *, before=False
     return pd.Series(result, index=history.index)
 
 
-def update_qvix_self_daily() -> tuple:
+def update_qvix_self_daily(*, series="50") -> tuple:
     """用上交所期权收盘价补最近一个交易日和过去 15 天的缺口。"""
     import qvix_calc
 
@@ -2061,26 +2066,27 @@ def update_qvix_self_daily() -> tuple:
     trading_days = _trading_days()
     if not trading_days:
         return None, "拿不到交易日历"
-    cutoff = today - timedelta(days=15)
+    cutoff = max(today - timedelta(days=15), qvix_calc.START_DATES[series])
     recent = sorted(day for day in trading_days if cutoff <= day < today)
     if not recent:
         return None, "近 15 天没有可补的交易日"
 
     target = recent[-1]
-    hist = load_qvix_self_history()
+    hist = load_qvix_self_history(series=series)
     already_known = set()
     if hist is not None:
         known = hist["qvix"].notna() | hist["note"].map(qvix_calc.is_chain_broken)
         already_known = set(hist.loc[known, "date"].astype(str))
     pending = [day for day in recent if day == target or day.isoformat() not in already_known]
-    results = qvix_calc.compute_qvix_history(pending, trading_days=trading_days)
+    results = qvix_calc.compute_qvix_history(pending, trading_days=trading_days, series=series)
     save_qvix_self_history([{"date": day.isoformat(), "qvix": value, "note": note}
-                            for day, (value, note) in results.items()], trading_days=trading_days)
+                            for day, (value, note) in results.items()],
+                           trading_days=trading_days, series=series)
     for day, (value, note) in results.items():
         if value is None:
-            logger.warning("日线 QVIX %s：%s", day, note)
+            logger.warning("%sETF QVIX %s：%s", series, day, note)
         else:
-            logger.info("日线 QVIX %s = %.2f", day, value)
+            logger.info("%sETF QVIX %s = %.2f", series, day, value)
     return results[target]
 
 
