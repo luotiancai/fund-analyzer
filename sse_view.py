@@ -369,6 +369,7 @@ def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
            else "**跌幅不设上限**、")
         + (f"规模**{_aum}~{x_params['max_aum']}亿**"
            if x_params.get("max_aum") else
+           f"规模**>{_aum:g}亿**" if x_params.get("min_aum_exclusive") else
            f"规模≥{_mark(_aum, 2.0)}亿")
         + ("(合并份额口径)" if _basis == "merged" else "(单份额口径)")
         + (f"。候选池:{_mkt}" if _mkt else "")
@@ -384,17 +385,17 @@ def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
         f"亏损笔:"
         + ("、".join(f"{v:+.2f}%" for v in _x_loss)
            if len(_x_loss) else "无") +
-        "。历史跑批，仅供对比，非当前标准策略；"
-        "样本十几笔、跨度6年,统计上很薄。"
+        "。历史跑批，仅供对比。"
         + (f"(跑批 #{run_id},跑于 {fmt_cst(x_at, '%Y-%m-%d %H:%M')})"
            if x_at else ""))
 
     # 择向策略逐笔方向不同(有的买涨幅最大、有的买跌幅最大),
     # 标的那列只能中性叫"选中标的",具体方向看「选向」列。
     _x_ret = f"{_x_win}涨跌(前日口径)"
-    view = x_df.rename(columns={_RAW_TGT: TGT_COL, _RAW_RET: _x_ret})
+    target_col = "选中标的" if _x_pick == "hindsight_best" else TGT_COL
+    view = x_df.rename(columns={_RAW_TGT: target_col, _RAW_RET: _x_ret})
     view = view[[c for c in [
-        TGT_COL, "持有收益", "买入日", "卖出日", "类型", "买入时规模(亿)",
+        target_col, "持有收益", "买入日", "卖出日", "类型", "买入时规模(亿)",
         "波动率比值(近3月)", "恐慌阈值", FUND_LINE_COL,
         SSE_LINE_COL, _x_ret, "上证当日涨跌", "选向",
         "期间最高", "期间最大回撤", "同期上证",
