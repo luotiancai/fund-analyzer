@@ -7,7 +7,8 @@ Wants=network-online.target
 Type=oneshot
 Environment=FUND_WEB_ROOT=/var/lib/fund-web
 Environment=GH_CONFIG_DIR=/root/.config/gh
-ExecStart=/opt/fund-web/venv/bin/python /opt/fund-web/current/web_sync.py --warm
+Environment=PATH=/opt/fund-web/current/.venv/bin:/opt/fund-web/venv/bin:/usr/local/bin:/usr/bin
+ExecStart=/usr/bin/env python /opt/fund-web/current/web_sync.py --warm
 TimeoutStartSec=1200
 Nice=10
 IOSchedulingClass=idle

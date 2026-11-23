@@ -10,7 +10,8 @@ WorkingDirectory=/opt/fund-web/current
 Environment=FUND_WEB_ROOT=/var/lib/fund-web
 Environment=OPENBLAS_NUM_THREADS=1
 Environment=OMP_NUM_THREADS=1
-ExecStart=/opt/fund-web/venv/bin/uvicorn web_service:app --host 127.0.0.1 --port 8010 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1
+Environment=PATH=/opt/fund-web/current/.venv/bin:/opt/fund-web/venv/bin:/usr/local/bin:/usr/bin
+ExecStart=/usr/bin/env uvicorn web_service:app --host 127.0.0.1 --port 8010 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=15

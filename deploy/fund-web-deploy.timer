@@ -1,0 +1,10 @@
+[Unit]
+Description=Check GitHub main for Fund Analyzer web deployments every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=5s
+Unit=fund-web-deploy.service
+
+[Install]
+WantedBy=timers.target

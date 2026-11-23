@@ -45,9 +45,20 @@
 部署
 ----
 
-执行 `python3 deploy_web.py`，默认部署搬瓦工；打包仅包含代码和网页，
-自动排除 macOS 元数据，不上传配置密钥或本地数据库。每次生成独立 release。
-安装脚本保留 nginx 备份，先生成当天缓存、健康检查再开放入口。它不改原有跑批环境和 cron。
+VPS 的 `fund-web-deploy.timer` 每分钟检查 GitHub 的 `main`。新提交打包为独立
+release，复用现有数据快照和未变更的依赖环境。新版本先预热，再在本机端口
+8011 通过健康检查后切换。重启后的 8010 服务还要通过健康检查并返回候选版本的代码标识。
+切换失败时恢复上一 release，计时器会再次检查。回测结果仍由策略库单独发布。
+
+首次安装或维护系统配置时执行 `python3 deploy_web.py`。启用或更新自动部署时，
+从已审核的仓库版本在 VPS 上执行：
+
+```bash
+install -D -m 755 deploy/deploy_main.sh /opt/fund-web/automation/deploy_main.sh
+install -m 644 deploy/fund-web{,-sync,-deploy}.service deploy/fund-web-deploy.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now fund-web-deploy.timer
+```
 
 迁移基金跑批触发器时，把 `deploy/fund-nav-trigger.service` 和 `deploy/fund-nav-trigger.timer`
 安装到 VPS 的 `/etc/systemd/system/`，执行 `systemctl daemon-reload` 和
@@ -57,13 +68,14 @@
 检查：
 
 ```bash
-systemctl status fund-web fund-web-sync.timer
-journalctl -u fund-web -u fund-web-sync -n 80 --no-pager
+systemctl status fund-web fund-web-sync.timer fund-web-deploy.timer
+journalctl -u fund-web -u fund-web-sync -u fund-web-deploy -n 80 --no-pager
 curl http://127.0.0.1:8010/api/v1/health
 curl http://127.0.0.1:8010/api/v1/status
 ```
 
-升级后若需回退代码，将 `/opt/fund-web/current` 指回上一 release，再
+升级后若需手动回退代码，先停止 `fund-web-deploy.timer`，等待正在运行的
+`fund-web-deploy.service` 结束。将 `/opt/fund-web/current` 指回上一 release，再
 `systemctl restart fund-web`。数据回退则把 `/var/lib/fund-web/current`
 指回保留的快照；API 下一次请求即使用该代数据。两者均不影响原有数据生产者。
 

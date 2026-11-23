@@ -1,0 +1,11 @@
+[Unit]
+Description=Deploy Fund Analyzer web code from GitHub main
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/fund-web/automation/deploy_main.sh
+TimeoutStartSec=900
+Nice=5
+IOSchedulingClass=idle
