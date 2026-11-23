@@ -14,6 +14,12 @@ class PurchaseRulesTests(unittest.TestCase):
         self.assertNotIn("017518", restricted_codes_on("2024-09-26"))
         self.assertIn("017518", restricted_codes_on("2024-10-11"))
 
+    def test_resuming_subscription_does_not_clear_the_new_large_order_limit(self):
+        date = "2024-10-15"
+        self.assertTrue({"017513", "017516", "017518"} <= restricted_codes_on(date))
+        self.assertEqual(purchase_rules()["by_date"][date]["017518"]["scopes"],
+                         {"large": "AN202410151640297503"})
+
     def test_recovered_funds_are_not_permanently_blacklisted(self):
         self.assertIn("017520", restricted_codes_on("2025-04-07"))
         self.assertNotIn("017520", restricted_codes_on("2026-03-23"))
