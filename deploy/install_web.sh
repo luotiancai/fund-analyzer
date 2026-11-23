@@ -28,11 +28,14 @@ PREVIOUS_VENV="$BASE/venv"
 if [[ -n "$PREVIOUS" && -x "$PREVIOUS/.venv/bin/uvicorn" ]]; then
     PREVIOUS_VENV=$(readlink -e "$PREVIOUS/.venv")
 fi
-if [[ -n "$PREVIOUS" && -x "$PREVIOUS_VENV/bin/uvicorn" ]] &&
-   cmp -s "$RELEASE/requirements-web.txt" "$PREVIOUS/requirements-web.txt"; then
+requirements_hash() {
+    sha256sum "$1" | cut -d ' ' -f 1
+}
+REQUIREMENTS=$(requirements_hash "$RELEASE/requirements-web.txt")
+if [[ -n "$PREVIOUS" && -x "$PREVIOUS_VENV/bin/uvicorn" && -f "$PREVIOUS/requirements-web.txt" ]] &&
+   [[ "$REQUIREMENTS" == "$(requirements_hash "$PREVIOUS/requirements-web.txt")" ]]; then
     VENV="$PREVIOUS_VENV"
 else
-    REQUIREMENTS=$(sha256sum "$RELEASE/requirements-web.txt" | cut -d ' ' -f 1)
     VENV="$BASE/venvs/$REQUIREMENTS"
     if [[ ! -f "$VENV/.ready" ]]; then
         /opt/fund-analyzer/venv/bin/python -m venv --clear "$VENV"
