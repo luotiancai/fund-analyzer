@@ -67,7 +67,6 @@ code{font-size:12px}
 <div class="seg" id="ranges"></div>
 <div class="opts">
   <label><input type="checkbox" id="vix" checked>上证50 QVIX</label>
-  <label><input type="checkbox" id="vix300" checked>沪深300 QVIX</label>
   <label><input type="checkbox" id="bands">标记跌超1%的交易日</label>
 </div>
 <div class="kpis" id="kpis"></div>
@@ -89,7 +88,7 @@ code{font-size:12px}
 (function () {
 "use strict";
 const D = JSON.parse(document.getElementById("data").textContent);
-const S = D.sse, N = S.d.length;
+const S = D.sse, N = S.d.length, Q = D.qv;
 const T = S.d.map(d => Date.parse(d));          // UTC 零点, 只用来算天数差
 const $ = id => document.getElementById(id);
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
@@ -100,14 +99,10 @@ const localTs = d => new Date(d + "T00:00:00").getTime();   // echarts 按本地
 
 const state = {rng: D.rdef, bands: false, tab: "review"};
 const RANGES = Object.fromEntries(D.ranges);
-const qvixSeries = [
-  {id: "vix", name: "上证50", color: D.qcolor, data: D.qv},
-  {id: "vix300", name: "沪深300", color: "#a86de0", data: D.q300},
-];
+const qvixIndex = Q ? new Map(Q.d.map((d, i) => [d, i])) : null;
 
 $("fresh").textContent = "上证截至 " + S.d[N - 1]
-  + qvixSeries.filter(q => q.data).map(({name, data}) =>
-      ` · ${name} QVIX截至 ${data.d[data.d.length - 1]}`).join("")
+  + (Q ? " · 上证50 QVIX截至 " + Q.d[Q.d.length - 1] : "")
   + " · 页面生成于 " + D.gen + "(北京时间)";
 
 // ── 时间窗口: 保留锚点行(起点当天或之前最后一个收盘)
@@ -129,16 +124,15 @@ seg.addEventListener("click", e => {
   seg.querySelectorAll("button").forEach(x => x.classList.toggle("on", x === b));
   renderTop();
 });
-qvixSeries.forEach(q => $(q.id).addEventListener("change", renderTop));
+$("vix").addEventListener("change", renderTop);
 $("bands").addEventListener("change", e => { state.bands = e.target.checked; renderTop(); });
 
 // ── 图
 const chart = echarts.init($("chart"));
 window.addEventListener("resize", () => chart.resize());
 
-function qvixIn(Q, d0, d1) {
+function qvixIn(d0, d1) {
   const line = [], thr = [], bk = [];
-  if (!Q) return {line, thr, bk};
   for (let k = 0; k < Q.d.length; k++) {
     const d = Q.d[k];
     if (d < d0 || d > d1) continue;
@@ -154,7 +148,7 @@ function qvixIn(Q, d0, d1) {
 
 function renderChart(i0) {
   const d0 = S.d[i0], d1 = S.d[N - 1];
-  const muted = css("--muted"), line = css("--line"), fg = css("--fg"), drop = css("--drop");
+  const muted = css("--muted"), line = css("--line"), drop = css("--drop");
   const sse = [];
   for (let k = i0; k < N; k++) sse.push([S.d[k], S.c[k], S.p[k]]);
 
@@ -164,26 +158,22 @@ function renderChart(i0) {
     emphasis: {disabled: true},
   }];
 
-  const missing = [];
-  for (const {id, name, color, data} of qvixSeries) {
-    if (!$(id).checked) continue;
-    const q = qvixIn(data, d0, d1);
-    if (!q.line.length) {
-      missing.push(name + " QVIX");
-      continue;
-    }
-    series.push({name: name + " QVIX", type: "line", data: q.line, yAxisIndex: 1,
+  const showVix = $("vix").checked;
+  const q = showVix && Q ? qvixIn(d0, d1) : null;
+  const vixOk = Boolean(q && q.line.length);
+  if (vixOk) {
+    const color = D.qcolor;
+    series.push({name: "上证50 QVIX", type: "line", data: q.line, yAxisIndex: 1,
       showSymbol: false, lineStyle: {width: 1.3, color}, itemStyle: {color},
       emphasis: {disabled: true}});
-    if (q.thr.length) series.push({name: name + "阈值(2年90%)", type: "line", data: q.thr,
+    if (q.thr.length) series.push({name: "上证50阈值(2年90%)", type: "line", data: q.thr,
       yAxisIndex: 1, showSymbol: false, lineStyle: {width: 1.2, color, type: "dashed"},
       itemStyle: {color}, emphasis: {disabled: true}});
-    if (q.bk.length) series.push({name: name + "链失效", type: "scatter", data: q.bk,
+    if (q.bk.length) series.push({name: "上证50链失效", type: "scatter", data: q.bk,
       yAxisIndex: 1, symbol: "path://M2,0L5,3L8,0L10,2L7,5L10,8L8,10L5,7L2,10L0,8L3,5L0,2Z",
       symbolSize: 11, itemStyle: {color}});
   }
-  $("vixwarn").textContent = missing.length ? missing.join("、") + "在所选区间无数据" : "";
-  const vixOk = series.length > 1;
+  $("vixwarn").textContent = showVix && !vixOk ? "上证50 QVIX在所选区间无数据" : "";
 
   if (state.bands) {
     const areas = [];
@@ -206,7 +196,7 @@ function renderChart(i0) {
   chart.setOption({
     animation: false,
     textStyle: {fontFamily: getComputedStyle(document.body).fontFamily},
-    grid: {left: 8, right: 8, top: state.bands ? 89 : (vixOk ? (wide ? 48 : 66) : 16), bottom: 8, containLabel: true},
+    grid: {left: 8, right: 8, top: state.bands ? 78 : (vixOk ? 48 : 16), bottom: 8, containLabel: true},
     legend: {show: vixOk, top: 0, left: 0, itemWidth: 16, itemHeight: 8,
       textStyle: {color: muted, fontSize: wide ? 12 : 11}},
     tooltip: {
@@ -324,23 +314,18 @@ function renderRuns() {
 function renderDaily(i0) {
   const f2 = x => x == null ? "" : x.toFixed(2);
   const cols = ["日期", "收盘点位", "日涨跌(%)"];
-  const histories = [];
-  for (const {id, name, data} of qvixSeries) {
-    if (!$(id).checked || !data) continue;
-    cols.push(name + " QVIX", name + "阈值");
-    const values = [data.v, data.t];
-    if (data.r) {
-      cols.push(name + "实时口径收盘");
-      values.push(data.r);
-    }
-    histories.push({values, index: new Map(data.d.map((d, i) => [d, i]))});
+  const withVix = Q && $("vix").checked;
+  if (withVix) {
+    cols.push("上证50 QVIX", "上证50阈值");
+    if (Q.r) cols.push("上证50实时口径收盘");
   }
   const rows = [];
   for (let k = N - 1; k >= i0; k--) {
     const r = [S.d[k], S.c[k].toFixed(2), S.p[k] == null ? "" : S.p[k].toFixed(2)];
-    for (const {values, index} of histories) {
-      const pos = index.get(S.d[k]);
-      r.push(...values.map(col => f2(col[pos])));
+    if (withVix) {
+      const pos = qvixIndex.get(S.d[k]);
+      r.push(f2(Q.v[pos]), f2(Q.t[pos]));
+      if (Q.r) r.push(f2(Q.r[pos]));
     }
     rows.push(r);
   }

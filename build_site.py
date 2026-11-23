@@ -89,10 +89,9 @@ def collect() -> dict:
                 "p": [_num(v, 3) for v in sse["pct"]]},
     }
 
-    for key, series in (("qv", "50"), ("q300", "300")):
-        hist = fetcher.load_qvix_self_history(series=series)
-        if hist is not None and not hist.empty:
-            out[key] = _qvix_data(hist, sse["date"])
+    hist = fetcher.load_qvix_self_history()
+    if hist is not None and not hist.empty:
+        out["qv"] = _qvix_data(hist, sse["date"])
 
     rv = {"intro": sse_view.md_inline(sse_view.REVIEW_INTRO)}
     bt_df, _p, bt_at, bt_id = fetcher.load_backtest_trades()

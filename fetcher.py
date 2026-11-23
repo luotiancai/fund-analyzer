@@ -2058,35 +2058,35 @@ def qvix_rolling_thresholds(history: pd.DataFrame, trading_days, *, before=False
     return pd.Series(result, index=history.index)
 
 
-def update_qvix_self_daily(*, series="50") -> tuple:
-    """用上交所期权收盘价补最近一个交易日和过去 15 天的缺口。"""
+def update_qvix_self_daily() -> tuple:
+    """用上证50ETF期权收盘价补最近一个交易日和过去 15 天的缺口。"""
     import qvix_calc
 
     today = datetime.now(_CST).date()
     trading_days = _trading_days()
     if not trading_days:
         return None, "拿不到交易日历"
-    cutoff = max(today - timedelta(days=15), qvix_calc.START_DATES[series])
+    cutoff = today - timedelta(days=15)
     recent = sorted(day for day in trading_days if cutoff <= day < today)
     if not recent:
         return None, "近 15 天没有可补的交易日"
 
     target = recent[-1]
-    hist = load_qvix_self_history(series=series)
+    hist = load_qvix_self_history()
     already_known = set()
     if hist is not None:
         known = hist["qvix"].notna() | hist["note"].map(qvix_calc.is_chain_broken)
         already_known = set(hist.loc[known, "date"].astype(str))
     pending = [day for day in recent if day == target or day.isoformat() not in already_known]
-    results = qvix_calc.compute_qvix_history(pending, trading_days=trading_days, series=series)
+    results = qvix_calc.compute_qvix_history(pending, trading_days=trading_days)
     save_qvix_self_history([{"date": day.isoformat(), "qvix": value, "note": note}
                             for day, (value, note) in results.items()],
-                           trading_days=trading_days, series=series)
+                           trading_days=trading_days)
     for day, (value, note) in results.items():
         if value is None:
-            logger.warning("%sETF QVIX %s：%s", series, day, note)
+            logger.warning("日线 QVIX %s：%s", day, note)
         else:
-            logger.info("%sETF QVIX %s = %.2f", series, day, value)
+            logger.info("日线 QVIX %s = %.2f", day, value)
     return results[target]
 
 
