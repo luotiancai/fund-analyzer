@@ -17,12 +17,11 @@
 import sys, os, time, sqlite3, io, re, functools
 import numpy as np
 import pandas as pd
-from datetime import timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fetcher
 import qvix_calc
-from fund_rules import HOLD_PERIOD_RE
+from fund_rules import HOLD_PERIOD_RE, MIN_FUND_AGE_MONTHS
 
 # 数据分成若干独立的库(见 fetcher.DB_LAYOUT), 连接统一走 fetcher._conn():
 # 它把各库 ATTACH 到一个连接上, 不带库名的表名照常解析, 所以下面的 SQL
@@ -373,23 +372,19 @@ STALE_MIN_RUN = 5
 STALE_JUMP_THRESH = 0.08
 
 
-def _has_stale_catchup(conn, code, window_start, window_end):
-    """排名窗口 [window_start, window_end] 内是否出现净值僵化-补涨模式.
-
-    用 daily_ret_pct 而不是单位净值 pct_change: 分红除权日单位净值会跳水,
-    正好长得像这里要抓的"跳变", 前面若碰巧有几天净值几乎不动就会误判成
-    僵化-补涨、把一只正常基金整个剔出候选池(见 compute_beta 的说明)。
-    """
+def _fund_period_returns(conn, code, window):
+    """Read reported daily returns after the NAV anchor through the last NAV."""
     df = pd.read_sql_query(
         "SELECT date, daily_ret_pct FROM fund_nav_daily "
-        "WHERE code=? AND date>=? AND date<=? ORDER BY date",
-        conn, params=(code, window_start.strftime("%Y-%m-%d"), window_end.strftime("%Y-%m-%d")))
-    if len(df) < STALE_MIN_RUN + 1:
-        return False
-    ret = (pd.to_numeric(df["daily_ret_pct"], errors="coerce")
-           .dropna().values / 100.0)
+        "WHERE code=? AND date>? AND date<=? ORDER BY date", conn, params=(code, *window))
+    returns = pd.to_numeric(df["daily_ret_pct"], errors="coerce").to_numpy() / 100.0
+    return pd.Series(returns, index=pd.to_datetime(df["date"])).dropna()
+
+
+def _is_stale_catchup(returns):
+    """Detect a flat run followed by a spike using dividend-adjusted daily returns."""
     run = 0
-    for r in ret:
+    for r in returns:
         if abs(r) < STALE_FLAT_EPS:
             run += 1
             continue
@@ -399,30 +394,38 @@ def _has_stale_catchup(conn, code, window_start, window_end):
     return False
 
 
-def _corr_with_market(conn, sse_df, code, window_start, window_end):
-    """基金近3月窗口日收益率与上证指数日收益率的相关系数(Pearson).
+def _market_period_returns(sse_df, window):
+    if sse_df.empty:
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
+    dates = sse_df["date"]
+    start = dates.searchsorted(pd.Timestamp(window[0]), side="right")
+    stop = dates.searchsorted(pd.Timestamp(window[1]), side="right")
+    # Include the last close at or before the anchor to compute the first return.
+    close = sse_df.iloc[max(start - 1, 0):stop].set_index("date")["close"]
+    return pd.to_numeric(close, errors="coerce").pct_change(fill_method=None).dropna()
 
-    数据不够(<20个共同交易日)返回 None, 由调用方决定怎么处理(通常当
-    "过不了筛选"处理, 而不是当0分——0是"完全不相关", 数据不够是"不
-    知道", 两者含义不同)。
 
-    同样用 daily_ret_pct: 除权日的净值跳水会被当成一次剧烈的独立波动,
-    把相关系数压低(见 compute_beta 的说明)。
-    """
-    df = pd.read_sql_query(
-        "SELECT date, daily_ret_pct FROM fund_nav_daily "
-        "WHERE code=? AND date>=? AND date<=? ORDER BY date",
-        conn, params=(code, window_start.strftime("%Y-%m-%d"), window_end.strftime("%Y-%m-%d")))
-    if len(df) < 20:
+def _matched_returns(fund_returns, market_returns):
+    return pd.DataFrame({"fund": fund_returns, "market": market_returns.reindex(fund_returns.index)}).dropna()
+
+
+def _volatility_ratio(fund_returns, market_returns):
+    # Exclude technical NAV jumps and measure both volatilities on the same dates.
+    common = _matched_returns(fund_returns[fund_returns.abs() <= 0.35], market_returns)
+    if len(common) < 20:
         return None
-    df["date"] = pd.to_datetime(df["date"])
-    df["ret"] = pd.to_numeric(df["daily_ret_pct"], errors="coerce") / 100.0
-    sse_w = sse_df[(sse_df["date"] >= window_start) & (sse_df["date"] <= window_end)].copy()
-    sse_w["ret"] = pd.to_numeric(sse_w["close"], errors="coerce").pct_change()
-    m = df.merge(sse_w[["date", "ret"]], on="date", suffixes=("_f", "_m")).dropna()
-    if len(m) < 20:
+    std = common.std(ddof=0)
+    if not np.isfinite(std["market"]) or std["market"] == 0:
         return None
-    c = m["ret_f"].corr(m["ret_m"])
+    return round(float(std["fund"] / std["market"]), 2)
+
+
+def _corr_with_market(fund_returns, market_returns):
+    """Pearson correlation on at least 20 common trading days."""
+    common = _matched_returns(fund_returns, market_returns)
+    if len(common) < 20:
+        return None
+    c = common["fund"].corr(common["market"])
     return None if pd.isna(c) else c
 
 
@@ -450,7 +453,7 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
                           sse_df=None, min_corr=None,
                           ret_col="ret_3m", pick="top", min_vol_ratio=None,
                           min_aum=None, require_drop=True, max_aum=None,
-                          aum_basis="single", max_drop=None):
+                          aum_basis="single", max_drop=None, maturity_dates=None):
     """找 asof_date 当天视角下排名第一的标的(排除 exclude_codes). 返回 (code, ret).
 
     复用 fetcher.compute_metrics_asof——按日收益率连乘计算区间收益(正确
@@ -476,7 +479,7 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
     exclude_codes 用于剔除 QDII 等跟踪境外市场的基金——策略买入逻辑
     建立在"大盘恐慌信号→买入国内标的"上, QDII 收益与 QVIX/大盘走势
     脱钩, 选入会削弱大盘回撤线对该笔仓位的意义。命中净值僵化-补涨
-    模式(见 _has_stale_catchup)的基金也一并跳过, 逐个往下找下一名,
+    模式(见 _is_stale_catchup)的基金也一并跳过, 逐个往下找下一名,
     直到选出一个数据正常的真实候选。
 
     sse_df/min_corr 是可选的"共振"过滤(默认不启用, 2026-07-24实测
@@ -501,13 +504,10 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
         c: m[ret_col] for c, m in metrics.items()
         if m.get(ret_col) is not None
         and (not exclude_codes or c not in exclude_codes)
+        and (maturity_dates is None or (c in maturity_dates and maturity_dates[c] <= asof_date))
     }
     if not candidates:
         return None, 0
-
-    end = pd.Timestamp(asof_date)
-    window_end = end - timedelta(days=1)
-    window_start = end - fetcher.RETURN_WINDOWS[ret_col] - timedelta(days=10)
 
     for code in sorted(candidates, key=candidates.get, reverse=(pick == "top")):
         if require_drop and pick == "bottom" and candidates[code] >= 0:
@@ -523,14 +523,24 @@ def find_champion_on_date(conn, asof_date, exclude_codes=None,
             # 跌幅深度上限: 跌得比它还狠的直接跳过(只对跌幅分支生效)。
             # 放在贵检查之前 —— 排序从最深开始, 这一段全是要跳的。
             continue
-        if _has_stale_catchup(conn, code, window_start, window_end):
+        window = fetcher.nav_period_bounds(conn, code, asof_date, fetcher.RETURN_WINDOWS[ret_col])
+        if window[0] is None:
             continue
+        fund_returns = _fund_period_returns(conn, code, window)
+        if _is_stale_catchup(fund_returns):
+            continue
+        compare_market = min_corr is not None or (min_vol_ratio is not None and ret_col == "ret_3m")
+        market_returns = _market_period_returns(sse_df, window) if compare_market else None
         if min_corr is not None:
-            c = _corr_with_market(conn, sse_df, code, window_start, window_end)
+            c = _corr_with_market(fund_returns, market_returns)
             if c is None or c < min_corr:
                 continue
         if min_vol_ratio is not None:
-            vr = compute_beta(conn, sse_df, code, asof_date)
+            if ret_col == "ret_3m":
+                ratio = _volatility_ratio(fund_returns, market_returns)
+                vr = 1.0 if ratio is None else ratio
+            else:
+                vr = compute_beta(conn, sse_df, code, asof_date)
             if vr < min_vol_ratio:
                 continue
         if min_aum is not None or max_aum is not None:
@@ -601,7 +611,7 @@ def sse_day_change(sse_df, asof_date):
     return (cur_close / prev_close - 1) * 100
 
 
-def compute_beta(conn, sse_df, code, buy_date):
+def compute_beta(conn, sse_df, code, buy_date, *, window=None):
     """截至买入前一交易日的近3个自然月波动率比值(基金日收益率std / 大盘日收益率std).
 
     纯波动对比,不按相关系数加权——目的是衡量基金相对大盘的振幅倍数,
@@ -619,38 +629,13 @@ def compute_beta(conn, sse_df, code, buy_date):
     排名那边(fetcher.compute_metrics_asof)一直是按日收益率连乘的, 不受
     除权影响, 所以只有这一个函数踩了坑。daily_ret_pct 全表缺失率 0%。
     """
-    end = pd.Timestamp(buy_date)
-    history = sse_df[sse_df["date"] < end]
-    if history.empty:
+    if window is None:
+        window = fetcher.nav_period_bounds(conn, code, str(buy_date)[:10], fetcher.PERIOD_OFFSETS["3m"])
+    if window[0] is None or sse_df.empty:
         return 1.0
-    start = history["date"].iloc[-1] - fetcher.PERIOD_OFFSETS["3m"]
-
-    nav_df = pd.read_sql_query(
-        "SELECT date, daily_ret_pct FROM fund_nav_daily "
-        "WHERE code=? AND date>=? AND date<? ORDER BY date",
-        conn, params=(code, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")))
-    if len(nav_df) < 20:
-        return 1.0
-    f_ret = (pd.to_numeric(nav_df["daily_ret_pct"], errors="coerce")
-             .dropna().values / 100.0)
-    # 剔除净值重置/份额折算等技术性跳变(单日|收益率|>35%非真实市场波动)。
-    # 阈值定在35%: 北交所个股涨跌幅上限±30%, 021299 2024-09-30/10-08 曾真实
-    # 单日+21.9%/+25.2%(924行情后北证50补涨, 广发017513同日+22.5%/+25.6%
-    # 交叉验证非脏数据), 20%阈值曾把这两天真实波动误判成技术性跳变, 把该
-    # 笔波动率比值从~2.6压到1.19。35%仍能拦住014939那种+68.7%的净值断层。
-    # 换用 daily_ret_pct 后除权已经不会跳了, 这道过滤留着兜脏数据。
-    f_ret = f_ret[np.abs(f_ret) <= 0.35]
-
-    sse_w = history[history["date"] >= start]
-    m_ret = sse_w["close"].pct_change().dropna().values
-
-    if len(f_ret) < 20 or len(m_ret) < 20:
-        return 1.0
-
-    m_std = np.std(m_ret)
-    if m_std == 0 or np.isnan(m_std):
-        return 1.0
-    return round(float(np.std(f_ret) / m_std), 2)
+    ratio = _volatility_ratio(_fund_period_returns(conn, code, window),
+                              _market_period_returns(sse_df, window))
+    return 1.0 if ratio is None else ratio
 
 
 def get_fund_nav_after(conn, code, from_date):
@@ -698,9 +683,11 @@ def run_backtest(window: int | None = None, pct: float = fetcher.QVIX_THR_PCT,
                  top_min_vol_ratio=None,
                  signal_mode: str = "threshold",
                  jump_days: int = 3, jump_pct: float = 0.20,
-                 max_drop: float = 30.0, require_sse_down: bool = True):
+                 max_drop: float = 30.0, require_sse_down: bool = True,
+                 require_fund_age: bool = True):
     """阈值默认取前一交易日前的滚动自然两年 90% 分位（含前一交易日）。
     window 可显式指定交易日数量以复现旧口径。minp_ratio 为窗口有效数据比例。
+    默认按买入信号日核对份额成立满6个自然月，未查到成立日的份额不参选。
 
     min_corr: 冠军候选与上证指数近3月相关系数门槛, 见
     find_champion_on_date 的 sse_df/min_corr 说明。2026-07-24 起默认
@@ -880,6 +867,9 @@ def run_backtest(window: int | None = None, pct: float = fetcher.QVIX_THR_PCT,
     hold_codes = {c for c, n in fund_names.items() if _HOLD_PERIOD_RE.search(n)}
     fof_codes = {c for c, t in fund_types.items() if fetcher.is_fof(t, fund_names[c])}
     exclude_codes = qdii_codes | hold_codes | fof_codes
+    maturity_dates = fetcher.fund_maturity_dates(conn) if require_fund_age else None
+    if require_fund_age and not maturity_dates:
+        raise ValueError("缺少基金份额成立日期，请同步榜单库后再回测。")
 
     # Load QVIX —— 自算(qvix_self_history,上交所逐合约收盘价,
     # 不再是 optbbs 的 index_daily_cache)。按信号日前可见的历史计算阈值。
@@ -1084,7 +1074,8 @@ def run_backtest(window: int | None = None, pct: float = fetcher.QVIX_THR_PCT,
                                                  require_drop=_req_drop,
                                                  max_aum=max_aum,
                                                  aum_basis=aum_basis,
-                                                 max_drop=max_drop)
+                                                 max_drop=max_drop,
+                                                 maturity_dates=maturity_dates)
             # 跌幅耗尽(没有真正跌过的合格候选)就放弃这一天, 顺延到下一个
             # 信号日。2026-08-12 之前这里有一条 fallback_top 兜底: 改买涨幅
             # 最大的那只。删掉的理由是它跟入场信号自相矛盾——阈值信号的前提
@@ -1279,6 +1270,8 @@ def main():
                         help="按自然月排名，默认3m(近3个月)，1m=近1个月")
     parser.add_argument("--any-sse-direction", action="store_true",
                         help="允许上证上涨或收平时入场，默认只允许当日收跌时入场")
+    parser.add_argument("--no-fund-age", action="store_true",
+                        help="对照实验可关闭成立满6个自然月的门槛")
     parser.add_argument("--pick", choices=["top", "bottom", "regime"], default="bottom",
                         help="默认bottom=选区间跌幅最大(反转候选,"
                              "2026-07-24定为标准策略);"
@@ -1390,7 +1383,8 @@ def main():
                           max_drop=args.max_drop,
                           signal_mode=args.signal_mode,
                           jump_days=args.jump_days, jump_pct=args.jump_pct,
-                          require_sse_down=not args.any_sse_direction)
+                          require_sse_down=not args.any_sse_direction,
+                          require_fund_age=not args.no_fund_age)
     elapsed = time.time() - t0
 
     if not trades:
@@ -1415,12 +1409,14 @@ def main():
                     and args.max_drop == 30.0
                     and args.sell_cooldown == 2
                     and not args.any_sse_direction
+                    and not args.no_fund_age
                     and not args.no_require_drop)
     _params = {
         "window": args.window, "pct": args.pct, "ret_col": _ret_col,
         "threshold_years": fetcher.QVIX_THR_YEARS if args.window is None else None,
         "lookback_basis": "calendar_months",
         "lookback_months": int(args.lookback[:-1]),
+        "min_fund_age_months": 0 if args.no_fund_age else MIN_FUND_AGE_MONTHS,
         "require_sse_down": not args.any_sse_direction,
         "pick": args.pick, "min_vol_ratio": args.min_vol_ratio,
         "dd_divisor": args.dd_divisor, "min_aum": args.min_aum,

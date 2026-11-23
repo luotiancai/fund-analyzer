@@ -38,6 +38,22 @@ def quote_date():
         raise ValueError("50ETF 行情日期无效，请稍后重试。") from None
 
 
+def previous_trading_day(path, day):
+    """Look up the prior market session independently of any gaps in QVIX."""
+    with contextlib.closing(connection(path, "market")) as c:
+        row = c.execute("SELECT data FROM index_daily_cache WHERE key='sse'").fetchone()
+    if row is None:
+        return None
+    sse = json.loads(row[0])
+    if isinstance(sse, dict):
+        column = sse["columns"].index("date")
+        rows = (r[column] for r in sse["data"])
+    else:
+        rows = (r["date"] for r in sse)
+    dates = (str(value)[:10] for value in rows)
+    return max((date for date in dates if date < day), default=None)
+
+
 def calculate(path, now=None):
     now = now or dt.datetime.now(qvix_core.CST)
     phase, as_of = qvix_core.market_phase(now, now.weekday() < 5)
@@ -54,14 +70,20 @@ def calculate(path, now=None):
         row = c.execute("SELECT date,qvix,threshold FROM qvix_self_history "
                         "WHERE date < ? ORDER BY date DESC LIMIT 1",
                         (now.date().isoformat(),)).fetchone()
-    if row is None:
-        raise ValueError("没有可用的 QVIX 历史，请等待数据同步。")
-    day, historical, threshold = row
+        if row is None:
+            raise ValueError("没有可用的 QVIX 历史，请等待数据同步。")
+        day, historical, threshold = row
+        threshold_date = day
+        if phase == "prev":
+            if quoted and day != quoted.isoformat():
+                raise ValueError("行情日期与 QVIX 历史不一致，请等待数据同步后重试。")
+            if historical is None:
+                raise ValueError("最近交易日的 QVIX 缺失，请等待数据同步。")
+            threshold_date = previous_trading_day(path, day)
+            previous = c.execute("SELECT threshold FROM qvix_self_history WHERE date=?",
+                                 (threshold_date,)).fetchone()
+            threshold = previous[0] if previous is not None else None
     if phase == "prev":
-        if quoted and day != quoted.isoformat():
-            raise ValueError("行情日期与 QVIX 历史不一致，请等待数据同步后重试。")
-        if historical is None:
-            raise ValueError("最近交易日的 QVIX 缺失，请等待数据同步。")
         value, date, clock = historical, day, "15:00:00"
     else:
         with contextlib.closing(connection(path, "rank")) as c:
@@ -73,7 +95,7 @@ def calculate(path, now=None):
         value, clock = result
         date = now.date().isoformat()
     return dict(qvix=value, date=date, time=clock, phase=phase, threshold=threshold,
-                threshold_date=day, gap=round(value - threshold, 2) if threshold is not None else None,
+                threshold_date=threshold_date, gap=round(value - threshold, 2) if threshold is not None else None,
                 hit=value >= threshold if threshold is not None else None,
                 checked_at=time.time())
 

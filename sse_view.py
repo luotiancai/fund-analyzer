@@ -190,11 +190,13 @@ def review_summary(bt_df: pd.DataFrame, bt_id, bt_at, params=None) -> str:
     calendar = (params or {}).get("lookback_basis") == "calendar_months"
     require_sse_down = (params or {}).get("require_sse_down", False)
     threshold_years = (params or {}).get("threshold_years")
+    min_age_months = (params or {}).get("min_fund_age_months")
     return (
         f"本次跑批规模口径：**{basis}**。"
         + (f"QVIX 阈值取截至前一交易日的滚动 {threshold_years} 个自然年 90% 分位。"
            if threshold_years else "")
         + ("近3月收益按自然月计算。" if calendar else "")
+        + (f"参选份额须成立满 {min_age_months} 个自然月。" if min_age_months else "")
         + ("入场须满足**上证当日收跌**。" if require_sse_down else "")
         + ("这是历史合并口径跑批，当前选基已改为 C 类自身规模，尚未按新口径重跑。"
            if merged else "")

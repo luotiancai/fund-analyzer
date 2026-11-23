@@ -26,6 +26,7 @@
   · 排除买入日已核实的历史限购，包括大额限额、暂停申购及暂停个人申购；
     公告证据和逐日快照保存在 fund_purchase_limits.json，不按基金永久拉黑。
     当前覆盖标准 #54 的九个买入日；新增买入日需先补公告核查，不能默认不限购。
+  · 对有成立年限门槛的跑批，只纳入买入日已满 6 个自然月的份额。
   · 其余**不设**条件: 不要求真跌、无跌幅上限、无波动率门槛、无规模上限。
   · 每只候选都用**它自己的**双止损线(基金线=当日阈值/5×自身波动率比值,
     大盘线=阈值/5)逐日盯出卖点, 再按实现收益(扣完赎回费)排名 —— 跟策略
@@ -80,64 +81,46 @@ def compute(run_id: int, dry_run: bool = False):
                        (run_id,)).fetchone()
     params = json.loads(row["params"] or "{}")
     trades = json.loads(row["trades"])
+    maturity_dates = fetcher.fund_maturity_dates(conn) if params.get("min_fund_age_months") else None
     print(f"跑批 #{run_id}「{row['label']}」{len(trades)} 笔\n", flush=True)
 
     for t in trades:
         buy, thr = pd.Timestamp(t["买入日"]), t["恐慌阈值"]
-        last_close_date = sse_close.index[sse_close.index < buy][-1]
-        win_lo = last_close_date - fetcher.PERIOD_OFFSETS["3m"]
-        metrics = fetcher.compute_metrics_asof(t["买入日"], cols={"ret_3m"})
+        asof = t["买入日"]
+        restricted = restricted_codes_on(asof)
+        metrics = fetcher.compute_metrics_asof(asof, cols={"ret_3m"})
         cand = {c for c, m in metrics.items()
-                if m.get("ret_3m") is not None and c not in exclude}
+                if m.get("ret_3m") is not None and c not in exclude and c not in restricted
+                and (maturity_dates is None or (c in maturity_dates and maturity_dates[c] <= asof))}
         # 规模≥2亿: 用批量版一次 SQL 取完, 纯读库不触网(逐只 fund_aum_asof
         # 要查两万多次, 会把这个脚本拖到小时级)。
-        aums = fetcher.funds_aum_asof(sorted(cand), t["买入日"],
+        aums = fetcher.funds_aum_asof(sorted(cand), asof,
                                     merge_classes=(params.get("aum_basis", "single") == "merged"))
-        restricted = restricted_codes_on(t["买入日"])
-        cand = {c for c in cand
-                if aums.get(c) is not None and aums[c] >= 2.0
-                and c not in restricted}
+        cand = [c for c in sorted(cand) if aums.get(c) is not None and aums[c] >= 2.0]
 
-        lo = win_lo.strftime("%Y-%m-%d")
         hi = (buy + pd.Timedelta(days=500)).strftime("%Y-%m-%d")
-        raw = pd.read_sql_query(
-            "SELECT code, date, nav, daily_ret_pct FROM fund_nav_daily "
-            "WHERE date>=? AND date<=?", conn, params=(lo, hi))
-        raw["date"] = pd.to_datetime(raw["date"])
-        raw["nav"] = pd.to_numeric(raw["nav"], errors="coerce")
-        raw["r"] = pd.to_numeric(raw["daily_ret_pct"], errors="coerce") / 100.0
-        raw = raw[raw["code"].isin(cand)]
-
-        m_pre = sse_close[(sse_close.index >= win_lo) & (sse_close.index < buy)].pct_change().dropna().values
-        m_std = np.std(m_pre) if len(m_pre) >= 20 else None
         days_after = sse[sse["date"] >= buy]["date"].values
         buy_sse = float(sse_close.loc[buy])
+        market_returns = sse_close.pct_change(fill_method=None)
 
         rets = []
-        for code, g in raw.groupby("code", sort=False):
-            g = g.sort_values("date")
-            pre = g[(g["date"] >= win_lo) & (g["date"] < buy)]["r"].dropna()
-            if len(pre) < 20 or not m_std:
+        for code in cand:
+            window = fetcher.nav_period_bounds(conn, code, asof, fetcher.PERIOD_OFFSETS["3m"])
+            if window[0] is None:
                 continue
-            v = pre.values[np.abs(pre.values) <= 0.35]
-            if len(v) < 20:
+            pre = B._fund_period_returns(conn, code, window)
+            if B._is_stale_catchup(pre):
                 continue
-            beta = round(float(np.std(v) / m_std), 2)
-            # 净值僵化-补涨: 连续多日几乎不动后单日跳变, 脏数据
-            run, stale = 0, False
-            for x in pre.values:
-                if abs(x) < B.STALE_FLAT_EPS:
-                    run += 1
-                    continue
-                if run >= B.STALE_MIN_RUN and abs(x) > B.STALE_JUMP_THRESH:
-                    stale = True
-                    break
-                run = 0
-            if stale:
+            beta = B._volatility_ratio(pre, market_returns)
+            if beta is None:
                 continue
-            post = g[g["date"] >= buy]
+            post = pd.read_sql_query(
+                "SELECT date, nav, daily_ret_pct FROM fund_nav_daily "
+                "WHERE code=? AND date>=? AND date<=? ORDER BY date", conn, params=(code, asof, hi))
             if post.empty or pd.isna(post["nav"].iloc[0]) or not post["nav"].iloc[0]:
                 continue
+            post["date"] = pd.to_datetime(post["date"])
+            post["r"] = pd.to_numeric(post["daily_ret_pct"], errors="coerce") / 100.0
             cur = float(post["nav"].iloc[0])
             series = {}
             for i, (d, r) in enumerate(zip(post["date"].values, post["r"].values)):
@@ -159,8 +142,8 @@ def compute(run_id: int, dry_run: bool = False):
                     n_days = (pd.Timestamp(d) - buy).days
                     rets.append((nav / buy_nav - 1) * 100 - _fee(n_days))
                     break
-        del raw
-
+        if not rets:
+            raise ValueError(f"{asof} 没有可计算分位的已平仓候选。")
         mine = float(t["费后收益"])
         pct = 100.0 * sum(1 for v in rets if v < mine) / len(rets)
         t[COL] = f"{pct:.1f}%"

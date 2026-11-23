@@ -43,7 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backtest_qvix as B      # noqa: E402
 import fetcher                 # noqa: E402
 import qvix_calc               # noqa: E402
-from fund_rules import MIN_FUND_AGE_MONTHS, fund_maturity_date
+from fund_rules import MIN_FUND_AGE_MONTHS
 
 def _std_params():
     """标准策略的参数, **直接读 run_backtest 的签名默认值**。
@@ -125,16 +125,7 @@ def data_freshness(conn, asof=None, nav_max=None):
 
 def _ret3m_window(conn, code: str, asof_s: str):
     """取决策前最后一个净值日及该日往回3个自然月的净值锚点。"""
-    end = conn.execute(
-        "SELECT MAX(date) d FROM fund_nav_daily WHERE code=? AND date<?",
-        (code, asof_s)).fetchone()["d"]
-    if not end:
-        return None, None
-    start_limit = (pd.Timestamp(end) - fetcher.PERIOD_OFFSETS["3m"]).strftime("%Y-%m-%d")
-    anchor = conn.execute(
-        "SELECT MAX(date) d FROM fund_nav_daily WHERE code=? AND date<=?",
-        (code, start_limit)).fetchone()["d"]
-    return anchor, end
+    return fetcher.nav_period_bounds(conn, code, asof_s, fetcher.PERIOD_OFFSETS["3m"])
 
 
 def _row(code, name, r3, beta, aum, why, role, win_a, win_e, rank):
@@ -146,14 +137,14 @@ def _row(code, name, r3, beta, aum, why, role, win_a, win_e, rank):
             "rank": rank}
 
 
-def _gates(conn, sse, code, asof_s, aum):
+def _gates(conn, sse, code, asof_s, aum, window):
     """三道门槛(窗口完整/波动率/规模)+净值僵化, 按策略的短路顺序判。
     → (淘汰原因 or None, 波动率比值 or None, 规模 or None)。
 
     僵化-补涨这道排在最后: 前面几道全是便宜的库内判断, 它要扫一段净值。"""
-    if _ret3m_window(conn, code, asof_s)[0] is None:
+    if window[0] is None:
         return "回看窗口不完整", None, aum
-    beta = B.compute_beta(conn, sse, code, asof_s)
+    beta = B.compute_beta(conn, sse, code, asof_s, window=window)
     if beta < STD["min_vol_ratio"]:
         return f"波动{beta:.2f}<{STD['min_vol_ratio']}", beta, aum
     if aum is None:
@@ -162,19 +153,17 @@ def _gates(conn, sse, code, asof_s, aum):
         return f"规模{aum:.2f}亿<{STD['min_aum']}", beta, aum
     if STD["max_aum"] and aum > STD["max_aum"]:
         return f"规模{aum:.2f}亿>{STD['max_aum']}", beta, aum
-    end = pd.Timestamp(asof_s)
-    if B._has_stale_catchup(conn, code, end - fetcher.PERIOD_OFFSETS["3m"] - pd.Timedelta(days=10),
-                            end - pd.Timedelta(days=1)):
+    if B._is_stale_catchup(B._fund_period_returns(conn, code, window)):
         return "净值僵化-补涨", beta, aum
     return None, beta, aum
 
 
 def _mature_codes(conn, codes, asof):
-    dates = fetcher.fund_inception_dates(conn)
+    dates = fetcher.fund_maturity_dates(conn)
     if any(code not in dates for code in codes):
         raise IncompleteNavError("基金成立日期尚未同步完整，已停止本次选基。")
     asof_s = pd.Timestamp(asof).strftime("%Y-%m-%d")
-    return {code for code in codes if fund_maturity_date(dates[code]) <= asof_s}
+    return {code for code in codes if dates[code] <= asof_s}
 
 
 def _require_complete_nav(conn, trading_dates, need_date, codes):
@@ -276,21 +265,20 @@ def scan(asof) -> dict:
         if r3 < -STD["max_drop"]:
             too_deep += 1
             continue
-        why, beta, aum = _gates(conn, sse, code, asof_s, aums.get(code))
+        window = _ret3m_window(conn, code, asof_s)
+        why, beta, aum = _gates(conn, sse, code, asof_s, aums.get(code), window)
         role = ""
         if why is None:
             chosen, role = code, "★ 选中"
-        _a, _e = _ret3m_window(conn, code, asof_s)
         rows.append(_row(code, names.get(code, code), r3, beta, aum, why,
-                         role, _a, _e, ranks.get(code)))
+                         role, *window, ranks.get(code)))
         if chosen is not None:
             break
 
     out.update(rows=rows, too_deep=too_deep, chosen=chosen, cand=cand,
                ranks=ranks)
     if chosen is not None:
-        b = B.compute_beta(conn, sse, chosen, asof_s)
-        out["fund_line"] = thr / STD["dd_divisor"] * b
+        out["fund_line"] = thr / STD["dd_divisor"] * beta
         out["sse_line"] = thr / STD["dd_divisor"]
     return out
 
@@ -319,8 +307,8 @@ def probe(asof, codes, res: dict = None) -> list:
     sse = sse.sort_values("date").reset_index(drop=True)
 
     asof_s = pd.Timestamp(asof).strftime("%Y-%m-%d")
-    inception = fetcher.fund_inception_dates(conn)
-    mature = {code for code, date in inception.items() if fund_maturity_date(date) <= asof_s}
+    maturity_dates = fetcher.fund_maturity_dates(conn)
+    mature = {code for code, date in maturity_dates.items() if date <= asof_s}
     cand = (res or {}).get("cand")
     ranks = (res or {}).get("ranks")
     if cand is None:
@@ -347,7 +335,7 @@ def probe(asof, codes, res: dict = None) -> list:
             out.append(_row(code, names.get(code, code), None, None, aums.get(code),
                             "规则排除: 定开或持有期锁定基金", "", None, None, None))
             continue
-        if code in inception and code not in mature:
+        if code in maturity_dates and code not in mature:
             out.append(_row(code, names.get(code, code), None, None, aums.get(code),
                             "成立未满6个月，暂不参与选基", "", None, None, None))
             continue
@@ -374,16 +362,16 @@ def probe(asof, codes, res: dict = None) -> list:
             out.append(_row(code, n or code, None, None, aums.get(code),
                             miss, "", None, None, None))
             continue
+        window = _ret3m_window(conn, code, asof_s)
         if r3 >= 0:
             why, beta, aum = "没真跌(近3月为正)", None, aums.get(code)
         elif r3 < -STD["max_drop"]:
             # 门槛照样跑一遍再把跌幅上限写在最前面: 用户要知道的是"除了跌太多
             # 之外它还差在哪", 只报一条最先短路的没用。
-            _w, beta, aum = _gates(conn, sse, code, asof_s, aums.get(code))
+            _w, beta, aum = _gates(conn, sse, code, asof_s, aums.get(code), window)
             why = f"跌幅{r3:.2f}%超上限{STD['max_drop']:.0f}%" + (f" + {_w}" if _w else "")
         else:
-            why, beta, aum = _gates(conn, sse, code, asof_s, aums.get(code))
-        a, e = _ret3m_window(conn, code, asof_s)
+            why, beta, aum = _gates(conn, sse, code, asof_s, aums.get(code), window)
         out.append(_row(code, names.get(code, code), r3, beta, aum, why,
-                        "" if why else "过了全部门槛", a, e, ranks.get(code)))
+                        "" if why else "过了全部门槛", *window, ranks.get(code)))
     return out

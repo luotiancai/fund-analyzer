@@ -156,6 +156,73 @@ class DailyMetricsTests(unittest.TestCase):
                 c.commit()
                 self.assertEqual(B.find_champion_on_date(c, asof, **args)[0], "000001")
 
+    def test_strategy_volatility_uses_the_same_dates_after_the_nav_anchor(self):
+        import backtest_qvix as B
+        days = pd.bdate_range("2024-03-01", "2024-06-28")
+        returns = np.where(np.arange(len(days)) % 2, -.005, .005)
+        returns[days.get_loc("2024-03-28")] = .20  # the anchor's return belongs to the previous period
+        returns[days.get_loc("2024-04-18")] = .12  # the market has a return but the fund has no NAV
+        close = (1 + returns).cumprod()
+        market = pd.DataFrame(dict(date=days, close=close))
+        nav = pd.DataFrame(dict(date=days, nav=close, daily_ret_pct=100 * returns, acc_nav=close))
+        nav = nav[nav["date"] != "2024-04-18"]
+        with contextlib.closing(fetcher._conn()) as c:
+            fetcher._write_nav_rows(c, "000003", nav)
+            asof = "2024-07-01"
+            window = fetcher.nav_period_bounds(c, "000003", asof, fetcher.PERIOD_OFFSETS["3m"])
+            self.assertEqual(window, ("2024-03-28", "2024-06-28"))
+            self.assertEqual(B.compute_beta(c, market, "000003", asof), 1.0)
+            common = B._fund_period_returns(c, "000003", window)
+            self.assertAlmostEqual(B._corr_with_market(common, B._market_period_returns(market, window)), 1.0)
+
+    def test_backtest_filters_share_age_and_stale_returns_within_the_ranking_window(self):
+        import backtest_qvix as B
+        asof = "2024-03-01"
+        anchor = pd.Timestamp("2023-11-29")
+        # All four funds have ranking data. The first three are missing an inception date,
+        # one day too young, or have the stale-return pattern inside the window.
+        returns = {f"{i:06d}": {"ret_3m": -20 + i} for i in range(3, 7)}
+        with contextlib.closing(fetcher._conn()) as c:
+            for code in returns:
+                nav = self.nav.copy()
+                nav["daily_ret_pct"] = 0.5
+                jump_pos = nav.index[nav["date"] == anchor][0] + (6 if code == "000005" else 0)
+                nav.loc[jump_pos - 5:jump_pos - 1, "daily_ret_pct"] = 0
+                nav.loc[jump_pos, "daily_ret_pct"] = 10
+                fetcher._write_nav_rows(c, code, nav)
+            c.executemany("INSERT INTO fund_inception VALUES (?,?,?,?)", [
+                ("000004", "2023-09-02", "fixture", time.time()),
+                ("000005", "2023-09-01", "fixture", time.time()),
+                ("000006", "2023-09-01", "fixture", time.time())])
+            with patch.object(B, "_metrics_asof_cached", return_value=returns):
+                selected, _ = B.find_champion_on_date(
+                    c, asof, pick="bottom", maturity_dates=fetcher.fund_maturity_dates(c))
+            self.assertEqual(selected, "000006")
+
+    def test_comparison_pool_obeys_the_saved_share_age_requirement(self):
+        import pct_rank
+        asof = "2024-03-01"
+        market = pd.DataFrame({"date": self.nav["date"], "close": 3000 * self.nav["nav"]})
+        market.loc[market["date"] > asof, "close"] *= .8
+        params = json.dumps({"min_fund_age_months": 6})
+        trades = json.dumps([{"买入日": asof, "恐慌阈值": 20, "费后收益": 0}])
+        with contextlib.closing(fetcher._conn()) as c:
+            c.executemany("INSERT INTO fund_inception VALUES (?,?,?,?)", [
+                ("000001", "2023-09-01", "fixture", time.time()),
+                ("000002", "2023-09-02", "fixture", time.time())])
+            run_id = c.execute("INSERT INTO strategy_runs(label,params,trades) VALUES (?,?,?)",
+                               ("fixture", params, trades)).lastrowid
+            with patch.object(pct_rank.B, "get_conn", return_value=c), \
+                    patch.object(pct_rank.B, "load_cached_json", return_value=market), \
+                    patch.object(pct_rank, "_pool_universe", return_value=({}, {}, set())), \
+                    patch.object(pct_rank, "restricted_codes_on", return_value=set()), \
+                    patch.object(fetcher, "compute_metrics_asof", return_value={
+                        code: {"ret_3m": -10} for code in ("000001", "000002", "000003")}), \
+                    patch.object(fetcher, "funds_aum_asof", return_value={"000001": 3}) as aums, \
+                    patch("builtins.print"):
+                pct_rank.compute(run_id, dry_run=True)
+            aums.assert_called_once_with(["000001"], asof, merge_classes=False)
+
     def test_inception_uses_share_class_estabdate_and_rejects_bad_responses(self):
         response = Mock()
         response.json.return_value = dict(ErrCode=0, Datas=dict(

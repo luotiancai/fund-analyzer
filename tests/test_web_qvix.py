@@ -2,6 +2,7 @@
 import asyncio
 import datetime as dt
 import hashlib
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -30,6 +31,11 @@ class QvixTests(unittest.TestCase):
         with sqlite3.connect(self.path / "fund_rank.db") as c:
             c.execute("CREATE TABLE app_meta (key TEXT,value REAL)")
             c.execute("INSERT INTO app_meta VALUES ('rf_rate',0.012)")
+        with sqlite3.connect(self.path / "market.db") as c:
+            c.execute("CREATE TABLE index_daily_cache (key TEXT, data TEXT)")
+            sse = {"columns": ["date", "close"], "data": [
+                ["2026-11-10", 3000], ["2026-11-11", 2990], ["2026-11-12", 2980]]}
+            c.execute("INSERT INTO index_daily_cache VALUES ('sse',?)", (json.dumps(sse),))
 
     def now(self, clock="14:40", day="2026-11-12"):
         return dt.datetime.fromisoformat(day + "T" + clock).replace(tzinfo=qvix_core.CST)
@@ -83,13 +89,25 @@ class QvixTests(unittest.TestCase):
             result = web_qvix.calculate(self.path, self.now("14:40", "2026-11-13"))
             self.assertEqual((result["phase"], result["date"], result["qvix"]),
                              ("prev", "2026-11-12", 20))
-            self.assertEqual(result["threshold"], 23)
+            self.assertEqual((result["threshold_date"], result["threshold"]), ("2026-11-11", 22))
             quote.reset_mock()
             result = web_qvix.calculate(self.path, self.now("09:15"))
             self.assertEqual(result["phase"], "prev")
             self.assertEqual(result["date"], "2026-11-11")
+            self.assertEqual((result["threshold_date"], result["threshold"]), ("2026-11-10", 21))
+            result = web_qvix.calculate(self.path, self.now("14:40", "2026-11-15"))
+            self.assertEqual((result["date"], result["threshold_date"]), ("2026-11-12", "2026-11-11"))
             quote.assert_not_called()
             compute.assert_not_called()
+
+    def test_previous_session_does_not_use_an_older_threshold_when_the_prior_day_is_missing(self):
+        with sqlite3.connect(self.path / "qvix.db") as c:
+            c.execute("DELETE FROM qvix_self_history WHERE date='2026-11-11'")
+        result = web_qvix.calculate(self.path, self.now("14:40", "2026-11-15"))
+        self.assertEqual((result["date"], result["qvix"]), ("2026-11-12", 20))
+        self.assertEqual(result["threshold_date"], "2026-11-11")
+        self.assertIsNone(result["threshold"])
+        self.assertIsNone(result["hit"])
 
     def test_invalid_quote_date_is_rejected(self):
         with patch.object(qvix_core, "_get", return_value='var hq_str_sh510050="";'):

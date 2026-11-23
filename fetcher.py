@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from fund_rules import is_c_class, is_fof, is_locked_fund
+from fund_rules import fund_maturity_date, is_c_class, is_fof, is_locked_fund
 
 import pandas as pd
 import requests
@@ -492,6 +492,20 @@ def _window_by_date(df: pd.DataFrame, offset: pd.DateOffset) -> Optional[pd.Data
     if older.empty:
         return None
     return df.loc[older.index[-1]:]
+
+
+def nav_period_bounds(conn, code: str, asof: str, offset: pd.DateOffset):
+    """Return the same NAV anchor and end dates used by the as-of ranking."""
+    end = conn.execute(
+        "SELECT MAX(date) FROM fund_nav_daily WHERE code=? AND date<?",
+        (code, asof)).fetchone()[0]
+    if end is None:
+        return None, None
+    cutoff = (pd.Timestamp(end) - offset).date().isoformat()
+    anchor = conn.execute(
+        "SELECT MAX(date) FROM fund_nav_daily WHERE code=? AND date<=?",
+        (code, cutoff)).fetchone()[0]
+    return anchor, end
 
 
 def _max_drawdown(nav: pd.Series) -> Optional[float]:
@@ -1331,6 +1345,10 @@ def fund_inception_dates(conn=None) -> dict:
     finally:
         if own:
             conn.close()
+
+
+def fund_maturity_dates(conn) -> dict:
+    return {code: fund_maturity_date(date) for code, date in fund_inception_dates(conn).items()}
 
 
 def refresh_inception_dates(list_df=None, workers: int = 4,
