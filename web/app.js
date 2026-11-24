@@ -96,12 +96,12 @@ const pickColumns = [
   {key:'name',label:'基金名称',text:true}, {key:'ret3m',label:'近3月收益(%)',render:v=>num(v)},
   {key:'win_start',label:'近3月窗口',render:(v,r)=>v&&r.win_end?`${esc(v)} → ${esc(r.win_end)}`:'—'},
   {key:'beta',label:'波动率比值',render:v=>num(v)}, {key:'aum',label:'C类规模(亿)',render:v=>num(v)},
-  {key:'why',label:'结论',text:true,render:(v,r)=>esc(v||r.role||'通过')}
+  {key:'why',label:'结论',text:true,render:(v,r)=>esc(v||(r.selection_rank?`★ 第 ${r.selection_rank} 顺位`:r.role)||'通过')}
 ];
 function renderPick(result) {
   let html = notice(`本次净值截止日为 ${result.need_date}，净值库最新日期为 ${result.nav_max}。`);
   const s = result.std;
-  html += `<p class="muted">近3月跌幅最大 · 跌幅 ≤ ${num(s.max_drop,0)}% · 波动率比值 ≥ ${s.min_vol_ratio} · C类自身规模 ≥ ${s.min_aum} 亿${s.max_aum?'，上限 '+s.max_aum+' 亿':''}。${result.too_deep} 只跌幅超过上限。</p>`;
+  html += `<p class="muted">近3月跌幅前两名 · 跌幅 ≤ ${num(s.max_drop,0)}% · 波动率比值 ≥ ${s.min_vol_ratio} · C类自身规模 ≥ ${s.min_aum} 亿${s.max_aum?'，上限 '+s.max_aum+' 亿':''}。${result.too_deep} 只跌幅超过上限。</p>`;
   if (result.asof === result.qdate && result.thr != null) {
     const qvix = result.broken ? '期权链失效' : `QVIX ${num(result.qvix)}，阈值 ${num(result.thr)}`;
     const direction = result.sse_change == null ? '上证收盘涨跌待确认' : `上证 ${num(result.sse_change)}%`;
@@ -113,8 +113,11 @@ function renderPick(result) {
   }
   if (result.thr == null) html += notice('这一天没有足够的 QVIX 阈值历史，请换个日期。','warn');
   else html += table(result.rows, pickColumns);
-  if (result.chosen) html += notice(`★ ${result.chosen_name||result.chosen}（${result.chosen}）　基金回撤控制线 ${num(result.fund_line)}%　大盘回撤线 ${num(result.sse_line)}%`);
-  else if (result.thr != null) html += notice('没有符合全部门槛的候选，按策略放弃当天。','warn');
+  for (const choice of result.selections) {
+    html += notice(`第 ${choice.rank} 顺位 · 资金 ${num(choice.weight_pct,0)}% · ${choice.name}（${choice.code}）　基金回撤线 ${num(choice.fund_line)}%　大盘回撤线 ${num(result.sse_line)}%`);
+  }
+  if (result.selections.length === 1) html += notice('第二顺位没有合格基金，剩余 50% 留现金。');
+  if (!result.selections.length && result.thr != null) html += notice('没有符合全部门槛的候选，按策略放弃当天。','warn');
   $('pick-output').innerHTML = html;
   $('probe-panel').hidden = result.thr == null;
   state.pickDate = result.asof;

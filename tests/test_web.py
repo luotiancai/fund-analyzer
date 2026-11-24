@@ -115,9 +115,56 @@ class CalculationTests(unittest.TestCase):
         self.assertEqual({r["code"] for r in result["rows"][:-1]}, rejected)
         self.assertTrue(all(r["why"].startswith("波动") for r in result["rows"][:-1]))
         self.assertEqual(result["rows"][-1]["role"], "★ 选中")
+        self.assertEqual([(p["code"], p["weight_pct"]) for p in result["selections"]], [("000002", 50)])
+
+    def test_pick_selects_two_in_order_and_probe_reports_their_slots(self):
+        path = ROOT / "snapshots" / "paired-pick"
+        path.mkdir()
+        for filename in FILES.values():
+            shutil.copyfile(PATH / filename, path / filename)
+        with contextlib.closing(sqlite3.connect(":memory:")) as c:
+            for name, filename in FILES.items():
+                c.execute(f"ATTACH DATABASE ? AS {name}", (str(path / filename),))
+            dates = [r[0] for r in c.execute(
+                "SELECT date FROM fund_nav_daily WHERE code='000002' ORDER BY date")]
+            funds = json.loads(c.execute("SELECT data FROM fund_list").fetchone()[0])
+            for code, drift in (("000006", -.002), ("000007", -.0006)):
+                returns = .006 * np.sin(np.arange(len(dates)) / 5) + drift
+                nav = np.cumprod(1 + returns)
+                funds.append(dict(code=code, name=f"测试{code}混合C", type="混合型"))
+                c.executemany("INSERT INTO fund_nav_daily VALUES (?,?,?,?,?)", [
+                    (code, d, float(n), float(r * 100), float(n))
+                    for d, n, r in zip(dates, nav, returns)])
+                c.execute("INSERT INTO fund_nav_meta VALUES (?,?,?)",
+                          (code, time.time(), dates[-1]))
+                c.execute("INSERT INTO fund_inception VALUES (?,?,?,?)",
+                          (code, dates[0], "fixture", time.time()))
+                c.execute("INSERT INTO fund_scale_hist VALUES (?,?,?,?,?)",
+                          (code, "2025-12-31", 5., "2026-01-22", time.time()))
+            c.execute("UPDATE fund_list SET data=?", (json.dumps(funds),))
+            c.commit()
+
+        asof = today().isoformat()
+        codes = ["000006", "000002", "000007"]
+        request, output = ROOT / "paired-request.json", ROOT / "paired-result.json"
+        for operation, args in (("pick", {"asof": asof}), ("probe", {"asof": asof, "codes": codes})):
+            write_json(request, dict(snapshot=str(path), operation=operation, args=args))
+            subprocess.run([sys.executable, "web_tasks.py", str(request), str(output)],
+                           check=True, capture_output=True, timeout=15,
+                           cwd=Path(__file__).resolve().parents[1])
+            result = json.loads(output.read_text())
+            self.assertEqual([row.get("selection_rank") for row in result["rows"][:2]], [1, 2])
+            if operation == "pick":
+                self.assertEqual([row["code"] for row in result["rows"]], codes[:2])
+                self.assertEqual([p["code"] for p in result["selections"]], codes[:2])
+                self.assertEqual([p["weight_pct"] for p in result["selections"]], [50, 50])
+                self.assertNotEqual(*[p["fund_line"] for p in result["selections"]])
+            else:
+                self.assertEqual([row["code"] for row in result["rows"]], codes)
+                self.assertIn("排在入选基金之后", result["rows"][2]["role"])
 
     def test_pick_probe_and_filter_use_c_share_aum_and_ignore_large_a_sibling(self):
-        for aum in (None, 1.5, 2.0):
+        for aum in (None, .99, 1.0):
             with self.subTest(c_aum=aum):
                 path = ROOT / "snapshots" / f"own-c-aum-{aum}"
                 path.mkdir()
@@ -141,7 +188,7 @@ class CalculationTests(unittest.TestCase):
                 cases = [("pick", dict(asof=day)),
                          ("probe", dict(asof=day, codes=["000002"])),
                          ("filter", dict(asof=day, period="3m", types=[],
-                                         min_ret=None, max_dd=None, min_aum=2.0))]
+                                         min_ret=None, max_dd=None, min_aum=1.0))]
                 for operation, args in cases:
                     request = ROOT / f"own-c-aum-{aum}-{operation}.json"
                     output = ROOT / f"own-c-aum-{aum}-{operation}-result.json"
@@ -152,7 +199,7 @@ class CalculationTests(unittest.TestCase):
                     result = json.loads(output.read_text())
                     if operation == "pick":
                         self.assertEqual(result["std"]["aum_basis"], "single")
-                        self.assertEqual(result["chosen"], "000002" if aum == 2.0 else None)
+                        self.assertEqual(result["chosen"], "000002" if aum == 1.0 else None)
                         row = next(r for r in result["rows"] if r["code"] == "000002")
                         self.assertEqual(row["aum"], aum)
                     elif operation == "probe":
@@ -160,7 +207,7 @@ class CalculationTests(unittest.TestCase):
                     else:
                         codes = {r["code"] for r in result["rows"]}
                         self.assertNotIn("990001", codes)
-                        self.assertEqual("000002" in codes, aum == 2.0)
+                        self.assertEqual("000002" in codes, aum == 1.0)
 
     def test_upstream_holdings_cache_survives_code_and_data_generations(self):
         from web_cache import lookup_cache

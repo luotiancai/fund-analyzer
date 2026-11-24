@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""按标准策略算"今天会买哪只", 连带走到它之前被刷掉的那些。供 app 页面调用。
+"""按标准选基条件挑出跌幅最大的两只，连带展示淘汰路径。供网站调用。
 
 **只在线上页面用, 不做本地命令行入口**: 这个功能最容易出的错不是算错, 是
 拿旧数据算出一个看起来很正常的答案 —— 本地跑回测习惯带 --no-sync, 净值库
@@ -8,13 +8,13 @@
 标的也不一样。线上页面每小时从 Release 拉最新库, 数据新鲜度由跑批保证,
 再加上 data_freshness() 这道显式校验。
 
-为什么要列出被淘汰的: 策略只输出一个代码, 但那个代码是从跌幅榜一路往下走、
-被波动率和规模两道门槛筛掉一批之后才落到的。只看结果不知道"它凭什么是它",
+为什么要列出被淘汰的: 入选基金是从跌幅榜一路往下走、被波动率和规模两道门槛
+筛掉一批之后才找到的。只看结果不知道"它凭什么是它",
 也看不出今天这批候选整体是什么成色 —— 比如 2026-07-20 那天第一顺位是鹏华
 新能源汽车(跌 29.84%、波动 2.81), 只因为规模 22.39 亿超了当时的上限被刷掉,
 这种事只看最终结果完全看不见。
 
-结果按**近3月跌幅从深到浅**排(跟策略的遍历顺序一致), **走到选中那只就截止**
+结果按**近3月跌幅从深到浅**排(跟策略的遍历顺序一致), **选满两只就截止**
 —— 后面的候选策略根本没看过。每行标注被哪道门槛刷掉。跌幅超过上限的那批只
 报个数、不进表: 它们被一条跟基金本身无关的规则一刀切掉, 逐只列会把表刷满
 (实测某天有 48 只)。
@@ -22,7 +22,7 @@
 "QVIX 是否触发信号"只对**历史日期**报, 当天不报: 当天页面拿到的只是昨收,
 而盘中实时值由网站独立按钮查询，摆一个基于昨收的"未触发"反而
 误导; 历史日期的收盘值是定局, 那天有没有信号恰恰是解读结果的前提 —— 没信号
-的日子策略根本不买, 选中那只只是"假如买会买哪只"。
+的日子策略根本不买, 入选基金是假设触发时的候选。
 
 scan(asof) 收任意决策日, 不是只能算今天: 口径全是 T-1, 换个日期算的就是那天
 收盘后该买哪只。回测只留结果, 这里能看见完整的淘汰路径。
@@ -62,6 +62,7 @@ def _std_params():
 
 
 STD = _std_params()
+MAX_PICKS = 2
 
 
 class IncompleteNavError(ValueError):
@@ -200,7 +201,7 @@ def scan(asof) -> dict:
     """按标准策略走一遍当天的候选, 返回结构化结果(CLI 和页面共用)。
 
     rows 是**实际遍历路径**: 从跌幅最深处往下, 每行一个 dict(见 _row)。
-    走到选中那只就截止；没有合格标的时遍历完全部下跌候选，不按数量截断。
+    选满两只就截止；未选满时走完全部下跌候选，不按数量截断。
     跌幅超上限的那批只计数(too_deep), 不进 rows。
 
     想知道某只具体基金在今天这批候选里的位置, 用 probe() 单查, 不要把这条
@@ -228,7 +229,7 @@ def scan(asof) -> dict:
     out = {"asof": asof, **signal, "sse_change": sse_change,
            "nav_max": nav_max, "sse_max": sse_max, "behind": behind,
            "need_date": need_date, "missing": missing,
-           "std": STD, "rows": [], "too_deep": 0, "chosen": None,
+           "std": STD, "rows": [], "too_deep": 0, "selections": [], "chosen": None,
            "min_age_months": MIN_FUND_AGE_MONTHS,
            "fund_line": None, "sse_line": None, "names": names}
     if need_date is None or missing:
@@ -259,7 +260,8 @@ def scan(asof) -> dict:
     ranks = {c: i + 1 for i, c in enumerate(order)}
     out["n_drop"] = len(order)
 
-    rows, chosen, too_deep = [], None, 0
+    rows, selections, too_deep = [], [], 0
+    sse_line = thr / STD["dd_divisor"]
     for code in order:                              # 跌幅从深到浅
         r3 = cand[code]
         if r3 < -STD["max_drop"]:
@@ -267,19 +269,23 @@ def scan(asof) -> dict:
             continue
         window = _ret3m_window(conn, code, asof_s)
         why, beta, aum = _gates(conn, sse, code, asof_s, aums.get(code), window)
-        role = ""
+        name = names.get(code, code)
+        row = _row(code, name, r3, beta, aum, why, "★ 选中" if why is None else "",
+                   *window, ranks.get(code))
         if why is None:
-            chosen, role = code, "★ 选中"
-        rows.append(_row(code, names.get(code, code), r3, beta, aum, why,
-                         role, *window, ranks.get(code)))
-        if chosen is not None:
+            rank = len(selections) + 1
+            row["selection_rank"] = rank
+            selections.append(dict(code=code, name=name, rank=rank,
+                                   weight_pct=100 / MAX_PICKS, fund_line=sse_line * beta))
+        rows.append(row)
+        if len(selections) == MAX_PICKS:
             break
 
-    out.update(rows=rows, too_deep=too_deep, chosen=chosen, cand=cand,
+    out.update(rows=rows, too_deep=too_deep, selections=selections, cand=cand,
                ranks=ranks)
-    if chosen is not None:
-        out["fund_line"] = thr / STD["dd_divisor"] * beta
-        out["sse_line"] = thr / STD["dd_divisor"]
+    if selections:
+        first = selections[0]
+        out.update(chosen=first["code"], fund_line=first["fund_line"], sse_line=sse_line)
     return out
 
 
@@ -321,12 +327,17 @@ def probe(asof, codes, res: dict = None) -> list:
         ranks = {c: i + 1 for i, c in enumerate(
             sorted((c for c in cand if cand[c] < 0), key=cand.get))}
 
+    selected_rows = {row["code"]: row for row in (res or {}).get("rows", [])
+                     if row.get("selection_rank")}
     codes = [c.strip() for c in codes if c and c.strip()]
     aum_codes = [code for code in codes if fetcher.is_c_class(names.get(code))]
     aums = fetcher.funds_aum_asof(aum_codes, asof_s,
                                 merge_classes=(STD["aum_basis"] == "merged"))
     out = []
     for code in codes:
+        if code in selected_rows:
+            out.append(selected_rows[code])
+            continue
         if fetcher.is_fof(types.get(code), names.get(code)):
             out.append(_row(code, names.get(code, code), None, None, aums.get(code),
                             "规则排除: FOF基金", "", None, None, None))
@@ -372,6 +383,7 @@ def probe(asof, codes, res: dict = None) -> list:
             why = f"跌幅{r3:.2f}%超上限{STD['max_drop']:.0f}%" + (f" + {_w}" if _w else "")
         else:
             why, beta, aum = _gates(conn, sse, code, asof_s, aums.get(code), window)
+        role = "过了全部门槛，排在入选基金之后" if len(selected_rows) == MAX_PICKS else "过了全部门槛"
         out.append(_row(code, names.get(code, code), r3, beta, aum, why,
-                        "" if why else "过了全部门槛", *window, ranks.get(code)))
+                        "" if why else role, *window, ranks.get(code)))
     return out
