@@ -414,7 +414,10 @@ def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
         view = pd.DataFrame.from_records(rounds["legs"])
         view.insert(0, "买入日", rounds["买入日"])
         view["本轮组合收益"] = rounds["持有收益"].where(view["跌幅排名"].eq(1), "")
-        return caption, view, [""] * len(view)
+        reasons = view.pop("卖出原因") if "卖出原因" in view else [""] * len(view)
+        if FUND_LINE_COL in view and SSE_LINE_COL in view:
+            caption += "橙色标记触发的基金回撤线，蓝色标记触发的大盘回撤线。"
+        return caption, view, [trig_of(reason) for reason in reasons]
 
     # 择向策略逐笔方向不同(有的买涨幅最大、有的买跌幅最大),
     # 标的那列只能中性叫"选中标的",具体方向看「选向」列。
