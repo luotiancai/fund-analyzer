@@ -13,6 +13,7 @@ import pandas as pd
 
 import fetcher
 import qvix_calc
+from fund_rules import STANDARD_MIN_AUM
 
 _CST = ZoneInfo("Asia/Shanghai")
 
@@ -136,7 +137,7 @@ def chain_broken_mask(qvix_hist: pd.DataFrame) -> pd.Series:
 
 REVIEW_INTRO = (
     "**QVIX 恐慌信号 + 近3月跌幅最大**"
-    "(波动率比值≥1.5 + 规模≥2亿 + 近3月跌幅≤30%;没有真跌的合格候选就"
+    "(波动率比值≥1.5 + 近3月跌幅≤30%;没有真跌的合格候选就"
     "放弃当天、顺延到下一个信号日)**+ 基金/大盘双止损逐日盯盘**"
     "。卖出后隔 2 个交易日才允许下一次买入(赎回款 T+2 到账,"
     "卖出当天和次日买不进去)")
@@ -185,15 +186,18 @@ def review_summary(bt_df: pd.DataFrame, bt_id, bt_at, params=None) -> str:
     _loss = _rets[_rets <= 0]
     _loss_txt = ("、".join(f"{v:+.2f}%" for v in _loss)
                  if len(_loss) else "无")
-    merged = (params or {}).get("aum_basis", "single") == "merged"
+    params = params or {}
+    merged = params.get("aum_basis", "single") == "merged"
     basis = "A/C 等份额合并" if merged else "C 类自身"
-    calendar = (params or {}).get("lookback_basis") == "calendar_months"
-    require_sse_down = (params or {}).get("require_sse_down", False)
-    skip_rising_start = (params or {}).get("skip_rising_start_streaks", False)
-    threshold_years = (params or {}).get("threshold_years")
-    min_age_months = (params or {}).get("min_fund_age_months")
+    min_aum = params.get("min_aum", 2.0)
+    pool_min_aum = params.get("pool_min_aum", 2.0)
+    calendar = params.get("lookback_basis") == "calendar_months"
+    require_sse_down = params.get("require_sse_down", False)
+    skip_rising_start = params.get("skip_rising_start_streaks", False)
+    threshold_years = params.get("threshold_years")
+    min_age_months = params.get("min_fund_age_months")
     return (
-        f"本次跑批规模口径：**{basis}**。"
+        f"本次跑批按**{basis}规模≥{min_aum:g}亿**筛选。"
         + (f"QVIX 阈值取截至前一交易日的滚动 {threshold_years} 个自然年 90% 分位。"
            if threshold_years else "")
         + ("近3月收益按自然月计算。" if calendar else "")
@@ -210,14 +214,14 @@ def review_summary(bt_df: pd.DataFrame, bt_id, bt_at, params=None) -> str:
         f"剔除收益最高的一笔，其余 {_n - 1} 笔累计 {_cum_ex:+.2f}%。"
         f"亏损笔:{_loss_txt}。"
         "样本只有个位数、跨度6年,统计上很薄,别当成可靠预期。"
-        "「可买池分位」是这一笔在当天**本来可以买的所有基金**(规模≥2亿、"
+        f"「可买池分位」是这一笔在当天**本来可以买的所有基金**(规模≥{pool_min_aum:g}亿、"
         "排除QDII/海外和持有期锁定和净值脏数据"
-        + ("及已核实的历史限购" if (params or {}).get("pool_purchase_limits") else "")
+        + ("及已核实的历史限购" if params.get("pool_purchase_limits") else "")
         + ")里排第几——分母"
         "**不含**策略自己那三道筛选(真跌/跌幅≤30%/波动≥1.5),否则等于给"
         "筛选免票;每只都按同一套双止损跑过,50%就是闭眼瞎选"
         f"{_pct_txt}。"
-        "候选须同时满足\"真正下跌但跌幅≤30% + 波动率比值≥1.5 + 规模≥2亿\""
+        f"候选须同时满足\"真正下跌但跌幅≤30% + 波动率比值≥1.5 + 规模≥{min_aum:g}亿\""
         "(2026-08-12 在修好除权 bug 的数据上重验后定档:波动门槛低于1.5会让"
         "跌幅榜被\"没真跌的低波动标的\"占据;10亿上限的依据是事后最优解"
         "全部落在7亿以下——但那个观察是在2~10亿的池子里得出的、属于循环论证,"
@@ -257,15 +261,14 @@ def review_table(bt_df: pd.DataFrame, notes: dict):
         "类型", "买入时规模(亿)", "波动率比值(近3月)", "恐慌阈值",
         FUND_LINE_COL, SSE_LINE_COL, "近3月涨跌(前日口径)", "选向",
         # 「可买池分位」= 这一笔在**当天本来可以买的所有基金**里排第几
-        # (打败了百分之多少)。分母跟「可达天花板」那条对照跑批一致:
-        # 规模≥2亿 + 排除 QDII/海外、持有期锁定、净值脏数据, 其余不设
-        # 条件; 每只候选都按同一套双止损跑出实现收益, 跟本笔可比;
-        # 50% 就等于闭眼瞎选。
+        # (打败了百分之多少)。分母使用跑批记录的规模下限，并排除
+        # QDII/海外、持有期锁定、净值脏数据等，具体见 pct_rank.py。
+        # 每只候选都按同一套双止损跑出实现收益，跟本笔可比。
         # 它**不是**策略自己的候选池(策略还要过"真跌+跌幅≤30%+波动
         # ≥1.5"三道筛选) —— 这是故意的: 分母若用策略筛完的名单, 衡量
         # 的就只剩"在选好的候选里排第几", 等于给那几道筛选免票, 而它们
         # 恰恰是策略的一部分、也最该被检验。
-        # 分母为什么要卡 2亿: 不卡的话混进的是策略根本不会买的迷你
+        # 分母为什么设规模下限: 不卡的话混进的是策略根本不会买的迷你
         # 基金, 而且那批净值本身不可信(015111 在 2024-03-28 单日
         # +20.18%, 当季末净资产只剩100万 —— 那是93%份额被短期赎回、
         # 赎回费分摊给剩下7%造成的, 不是投资收益)。
@@ -349,7 +352,7 @@ def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
 
     # 过滤条件逐项列出来, 不写"与标准策略一致"——对照实验
     # 改的可能正是其中某一项(如规模门槛), 那句话会自相矛盾。
-    # 跟标准策略(波动≥1.5/规模≥2亿)不同的值加粗标出来。
+    # 跟标准策略不同的值加粗标出来。
     def _mark(val, std):
         return f"**{val}**" if val != std else f"{val}"
     _vr = x_params.get("min_vol_ratio", 1.5)
@@ -380,7 +383,7 @@ def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
         + (f"规模**{_aum}~{x_params['max_aum']}亿**"
            if x_params.get("max_aum") else
            f"规模**>{_aum:g}亿**" if x_params.get("min_aum_exclusive") else
-           f"规模≥{_mark(_aum, 2.0)}亿")
+           f"规模≥{_mark(_aum, STANDARD_MIN_AUM)}亿")
         + ("(合并份额口径)" if _basis == "merged" else "(单份额口径)")
         + (f"。候选池:{_mkt}" if _mkt else "")
         + (f",{x_params['exit_note']}" if x_params.get("exit_note") else

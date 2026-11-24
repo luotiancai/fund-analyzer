@@ -16,7 +16,7 @@
 "在已经选好的候选里排第几", 等于给前面那几道筛选免票; 而那几道恰恰是策略的
 一部分、也最需要被检验。用"那天本来可以买的所有基金"当分母, 衡量的才是整套
 选基规则(筛选+排序)合起来创造了多少价值。所以列名叫「可买池」而不是「同池」。
-  · 保留**规模≥2亿**这一条选基条件, 与标准策略同口径 —— 分母里混进策略
+  · 保留跑批记录的可买池规模下限。未记录的旧跑批沿用 2 亿。分母里混进策略
     根本不会买的迷你基金没有意义, 而且那批基金的净值本身就不可信(015111
     惠升领先优选 2024-03-28 单日 +20.18%, 而它当季末净资产只剩 100 万,
     那 20% 是 93% 份额被短期赎回、赎回费分摊给剩下 7% 造成的);
@@ -36,6 +36,7 @@
 ⚠️ **换了标准策略就要重跑这个脚本**, 否则页面上那一列是上一版的陈旧数据。
 每个信号日要把两三千到近五千只基金各跑一遍逐日止损, 实测约 15 分钟。
 """
+import hashlib
 import json
 import sys
 
@@ -45,7 +46,7 @@ import pandas as pd
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 import backtest_qvix as B      # noqa: E402
 import fetcher                 # noqa: E402
-from fund_purchase_rules import restricted_codes_on  # noqa: E402
+from fund_purchase_rules import RULES_FILE, purchase_rules, restricted_codes_on  # noqa: E402
 
 COL = "可买池分位"
 
@@ -81,6 +82,7 @@ def compute(run_id: int, dry_run: bool = False):
                        (run_id,)).fetchone()
     params = json.loads(row["params"] or "{}")
     trades = json.loads(row["trades"])
+    pool_min_aum = params.get("pool_min_aum", 2.0)
     maturity_dates = fetcher.fund_maturity_dates(conn) if params.get("min_fund_age_months") else None
     print(f"跑批 #{run_id}「{row['label']}」{len(trades)} 笔\n", flush=True)
 
@@ -92,11 +94,11 @@ def compute(run_id: int, dry_run: bool = False):
         cand = {c for c, m in metrics.items()
                 if m.get("ret_3m") is not None and c not in exclude and c not in restricted
                 and (maturity_dates is None or (c in maturity_dates and maturity_dates[c] <= asof))}
-        # 规模≥2亿: 用批量版一次 SQL 取完, 纯读库不触网(逐只 fund_aum_asof
+        # 规模用批量版一次 SQL 取完, 纯读库不触网(逐只 fund_aum_asof
         # 要查两万多次, 会把这个脚本拖到小时级)。
         aums = fetcher.funds_aum_asof(sorted(cand), asof,
                                     merge_classes=(params.get("aum_basis", "single") == "merged"))
-        cand = [c for c in sorted(cand) if aums.get(c) is not None and aums[c] >= 2.0]
+        cand = [c for c in sorted(cand) if aums.get(c) is not None and aums[c] >= pool_min_aum]
 
         hi = (buy + pd.Timedelta(days=500)).strftime("%Y-%m-%d")
         days_after = sse[sse["date"] >= buy]["date"].values
@@ -153,8 +155,11 @@ def compute(run_id: int, dry_run: bool = False):
     if dry_run:
         print("\n--dry-run: 不写库")
         return
-    conn.execute("UPDATE strategy_runs SET trades=? WHERE id=?",
-                 (json.dumps(trades, ensure_ascii=False, default=str), run_id))
+    params.update(pool_min_aum=pool_min_aum, pool_purchase_limits=purchase_rules()["version"],
+                  pool_purchase_rules_sha256=hashlib.sha256(RULES_FILE.read_bytes()).hexdigest())
+    conn.execute("UPDATE strategy_runs SET trades=?, params=? WHERE id=?",
+                 (json.dumps(trades, ensure_ascii=False, default=str),
+                  json.dumps(params, ensure_ascii=False), run_id))
     conn.commit()
     print(f"\n已写回跑批 #{run_id} 的「{COL}」列")
 

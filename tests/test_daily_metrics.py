@@ -136,6 +136,9 @@ class DailyMetricsTests(unittest.TestCase):
 
     def test_backtest_default_uses_c_share_aum_and_includes_exact_threshold(self):
         import backtest_qvix as B
+        from today_pick import STD
+
+        self.assertEqual(STD["min_aum"], 1.0)
         asof = (self.nav["date"].iloc[-1] + pd.offsets.BDay(1)).strftime("%Y-%m-%d")
         fetcher._save_fund_list_cache(pd.DataFrame([
             dict(code="000001", name="普通混合C", type="混合型"),
@@ -143,16 +146,16 @@ class DailyMetricsTests(unittest.TestCase):
         ]))
         with contextlib.closing(fetcher._conn()) as c:
             c.executemany("INSERT INTO fund_scale_hist VALUES (?,?,?,?,?)", [
-                ("000001", "2023-03-31", 1.9, "2023-04-25", time.time()),
+                ("000001", "2023-03-31", 0.9, "2023-04-25", time.time()),
                 ("000003", "2023-03-31", 10., "2023-04-25", time.time()),
             ])
             c.commit()
             with patch.object(B, "_metrics_asof_cached", return_value={"000001": {"ret_3m": -10.}}), \
                     patch.object(fetcher, "_SIBLING_MAP", None):
-                args = dict(pick="bottom", min_aum=2.0)
+                args = dict(pick="bottom", min_aum=STD["min_aum"])
                 self.assertIsNone(B.find_champion_on_date(c, asof, **args)[0])
                 self.assertEqual(B.find_champion_on_date(c, asof, aum_basis="merged", **args)[0], "000001")
-                c.execute("UPDATE fund_scale_hist SET aum=2.0 WHERE code='000001'")
+                c.execute("UPDATE fund_scale_hist SET aum=1.0 WHERE code='000001'")
                 c.commit()
                 self.assertEqual(B.find_champion_on_date(c, asof, **args)[0], "000001")
 

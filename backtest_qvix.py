@@ -5,7 +5,7 @@
   · 找不到"真正跌过"的合格候选就放弃当天, 顺延到下一个信号日
     (2026-08-12 之前这里有"改买涨幅最大"的兜底和配套的"顺延至标的换掉",
      两条都已删除, 理由见 run_backtest 里买入那段注释)
-- 标的: 前一交易日近3月冠军(C类全市场, C类自身规模≥2亿), 冠军排名复用 fetcher.compute_
+- 标的: 前一交易日近3月冠军(C类全市场, C类自身规模≥1亿), 冠军排名复用 fetcher.compute_
   metrics_asof——与基金筛选页"截至日期"筛选完全同口径(按日
   收益率连乘, 正确处理分红除权, 自带单日|收益率|>30%异常值过滤), 而非
   简化的 end_nav/anchor_nav-1(曾把 2020-07-16 算错成广发医疗保健夺冠,
@@ -21,7 +21,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fetcher
 import qvix_calc
-from fund_rules import HOLD_PERIOD_RE, MIN_FUND_AGE_MONTHS
+from fund_rules import HOLD_PERIOD_RE, MIN_FUND_AGE_MONTHS, STANDARD_MIN_AUM
 
 # 数据分成若干独立的库(见 fetcher.DB_LAYOUT), 连接统一走 fetcher._conn():
 # 它把各库 ATTACH 到一个连接上, 不带库名的表名照常解析, 所以下面的 SQL
@@ -30,7 +30,7 @@ from fund_rules import HOLD_PERIOD_RE, MIN_FUND_AGE_MONTHS
 # 基金规模(AUM)过滤:规模数据(季度期末净资产,亿元)存在 fund_scale.db 的
 # fund_scale_hist 表, 取数/按信号日取值的逻辑都在 fetcher(见
 # fetcher.fund_aum_asof, 无未来函数——只用已披露的季报)。这里直接调它。
-# 2026-11-17 起默认只看 C 类自身规模≥2亿。aum_basis="single"；
+# 2026-11-17 起默认只看 C 类自身规模，2026-11-24 起下限为 1 亿。aum_basis="single"；
 # 历史 A/C 合并口径通过 --aum-basis merged 显式复现，旧跑批记录保持原参数。
 
 # 已核实的净值异常(直连东财源头核对过, 不是本地缓存问题, 但明显非真实
@@ -689,7 +689,7 @@ def run_backtest(window: int | None = None, pct: float = fetcher.QVIX_THR_PCT,
                  minp_ratio: float = fetcher.QVIX_THR_COVERAGE,
                  min_corr: float = None, ret_col: str = "ret_3m", pick: str = "bottom",
                  min_vol_ratio: float = 1.5, dd_divisor: float = 5.0,
-                 min_aum: float = 2.0, require_drop: bool = True,
+                 min_aum: float = STANDARD_MIN_AUM, require_drop: bool = True,
                  regime_basis: str = "day", no_same_day_rebuy: bool = False,
                  sell_cooldown: int = 2,
                  max_aum: float = None,
@@ -811,8 +811,8 @@ def run_backtest(window: int | None = None, pct: float = fetcher.QVIX_THR_PCT,
     大盘回撤线=阈值/dd_divisor。默认5.0(线上在用口径), 可传4/6等回测
     更宽/更窄的止损带对效果的影响。
 
-    min_aum: 候选基金规模下限(亿元), 默认2.0(=2亿, 2026-08-06 定为标准,
-    此前是0.5亿)。规模来自 fetcher.fund_aum_asof(信号日当时能看到的最新
+    min_aum: 候选基金规模下限(亿元), 2026-11-24 起默认 1 亿。规模来自
+    fetcher.fund_aum_asof(信号日当时能看到的最新
     一期季报, 无未来函数——季报有披露滞后, 只用已披露的)。低于门槛、或那天
     还查不到任何已披露季报(多是成立太新的迷你基金)的候选跳过、往下一名找。
     最初加这道门槛(2026-07-28, 0.5亿)是因为"跌幅最大"排在最前面的常是几十万~
@@ -1340,9 +1340,9 @@ def main():
                              "6=更窄止损带")
     parser.add_argument("--min-aum",
                         type=lambda s: None if s.lower() == "none" else float(s),
-                        default=2.0,
+                        default=STANDARD_MIN_AUM,
                         help="基金规模下限(亿元,信号日当时能看到的最新季报口径),"
-                             "默认2.0=2亿(2026-08-06标准);0.5=5000万(旧标准);"
+                             f"默认{STANDARD_MIN_AUM:g}亿。"
                              "传none关闭。"
                              "低于门槛或查不到规模的候选跳过、往下一名找")
     parser.add_argument("--no-require-drop", action="store_true",
@@ -1426,7 +1426,7 @@ def main():
     _is_standard = (args.window is None and args.pct == fetcher.QVIX_THR_PCT
                     and args.min_corr is None and args.lookback == "3m"
                     and args.pick == "bottom" and args.min_vol_ratio == 1.5
-                    and args.dd_divisor == 5.0 and args.min_aum == 2.0
+                    and args.dd_divisor == 5.0 and args.min_aum == STANDARD_MIN_AUM
                     and args.max_aum is None
                     and args.aum_basis == "single"
                     # 候选池也得是标准的那个 —— 场内 ETF 版参数可以全默认,
@@ -1473,6 +1473,8 @@ def main():
         "jump_days": args.jump_days if args.signal_mode == "jump" else None,
         "jump_pct": args.jump_pct if args.signal_mode == "jump" else None,
     }
+    if _is_standard:
+        _params["pool_min_aum"] = args.min_aum
     if args.no_save:
         print("--no-save: 这次不落库")
     else:

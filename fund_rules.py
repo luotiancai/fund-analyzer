@@ -5,6 +5,7 @@ from calendar import monthrange
 from datetime import date
 
 MIN_FUND_AGE_MONTHS = 6
+STANDARD_MIN_AUM = 1.0  # 亿元，C 类份额自身规模。
 _C_CLASS_RE = re.compile(r"[Cc](类|\(|（|人民币|美元|$)")
 
 
