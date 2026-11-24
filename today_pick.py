@@ -58,7 +58,7 @@ def _std_params():
          if v.default is not inspect.Parameter.empty}
     return {k: d[k] for k in ("min_vol_ratio", "min_aum", "max_aum",
                               "max_drop", "dd_divisor", "aum_basis",
-                              "require_sse_down")}
+                              "require_sse_down", "skip_rising_start_streaks")}
 
 
 STD = _std_params()
@@ -68,23 +68,31 @@ class IncompleteNavError(ValueError):
     """An eligible C-class fund's NAV window cannot be verified as complete."""
 
 
-def _threshold(asof: pd.Timestamp, trading_days):
-    """信号日当天该比的阈值(截至前一交易日的自然两年分位)。
-    返回 (日期, QVIX值, 阈值, 是否链失效日)。最后那个见
-    qvix_calc.CHAIN_BROKEN: 算不出值本身就是极端行情, 那天直接算信号,
-    QVIX值会是 NaN —— 调用方不能只看值跟阈值的大小。"""
+def _qvix_status(asof: pd.Timestamp, sse):
+    """用截至决策日的 QVIX 历史判断阈值触发和策略入场信号。"""
+    status = dict(qdate=None, qvix=None, thr=None, broken=False, qvix_hit=False, hit=False)
     q = fetcher.load_qvix_self_history()
     if q is None or q.empty:
-        return None, None, None, False
+        return status
     q["date"] = pd.to_datetime(q["date"])
     q = q.loc[q["date"] <= asof, ["date", "qvix", "note"]].reset_index(drop=True)
     if q.empty:
-        return None, None, None, False
+        return status
     r = q.iloc[-1]
     if r["date"] != asof:
         q.loc[len(q)] = [asof, float("nan"), None]
-    threshold = fetcher.qvix_rolling_thresholds(q, trading_days, before=True).iloc[-1]
-    return r["date"], r["qvix"], threshold, qvix_calc.is_chain_broken(r["note"])
+    thresholds = fetcher.qvix_rolling_thresholds(q, sse["date"], before=True)
+    status.update(qdate=r["date"], qvix=r["qvix"], thr=thresholds.iat[-1],
+                  broken=qvix_calc.is_chain_broken(r["note"]))
+    if r["date"] != asof:
+        return status
+    hits = B.qvix_threshold_hits(q["qvix"], thresholds, q["note"])
+    status["qvix_hit"] = status["hit"] = bool(hits.iat[-1])
+    if status["qvix_hit"] and STD["require_sse_down"]:
+        eligible_days = B.sse_down_signal_days(
+            sse, q.loc[hits, "date"], skip_rising_start_streaks=STD["skip_rising_start_streaks"])
+        status["hit"] = bool(eligible_days.eq(asof).any())
+    return status
 
 
 def data_freshness(conn, asof=None, nav_max=None):
@@ -213,19 +221,11 @@ def scan(asof) -> dict:
     sse = sse.sort_values("date").reset_index(drop=True)
 
     asof = pd.Timestamp(asof)
-    qdate, qvix, thr, broken = _threshold(asof, sse["date"])
+    signal = _qvix_status(asof, sse)
+    thr = signal["thr"]
     nav_max, sse_max, behind, need_date, missing = data_freshness(conn, asof)
     sse_change = B.sse_day_change(sse, asof)
-    # 链失效日直接算触发(见 _threshold): 那天没有 QVIX 值可跟阈值比, 但
-    # "算不出来"这件事本身就是行情极端的证据, 跟回测口径一致
-    # (backtest_qvix 的信号集合同样把它们算进去)。
-    qvix_hit = (qdate == asof and thr is not None and not pd.isna(thr)
-                and (broken or (qvix is not None and not pd.isna(qvix) and qvix > thr)))
-    out = {"asof": asof, "qdate": qdate, "qvix": qvix, "thr": thr,
-           "broken": broken,
-           "sse_change": sse_change, "qvix_hit": qvix_hit,
-           "hit": qvix_hit and (not STD["require_sse_down"] or
-                                (sse_change is not None and sse_change < 0)),
+    out = {"asof": asof, **signal, "sse_change": sse_change,
            "nav_max": nav_max, "sse_max": sse_max, "behind": behind,
            "need_date": need_date, "missing": missing,
            "std": STD, "rows": [], "too_deep": 0, "chosen": None,

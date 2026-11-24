@@ -669,6 +669,22 @@ def get_fund_nav_after(conn, code, from_date):
     return out
 
 
+def qvix_threshold_hits(values, thresholds, notes):
+    return thresholds.notna() & ((values > thresholds) | notes.map(qvix_calc.is_chain_broken))
+
+
+def sse_down_signal_days(sse, signal_days, *, skip_rising_start_streaks):
+    change = sse["close"].diff()
+    raw_signal = sse["date"].isin(signal_days)
+    eligible = raw_signal & (change < 0)
+    if skip_rising_start_streaks:
+        # 先用上证交易日历划分波段：周末、假期不打断，未触发的交易日打断。
+        streak = (~raw_signal).cumsum()
+        rising_start = raw_signal & ~raw_signal.shift(fill_value=False) & (change > 0)
+        eligible &= ~streak.isin(streak[rising_start])
+    return sse.loc[eligible, "date"]
+
+
 def run_backtest(window: int | None = None, pct: float = fetcher.QVIX_THR_PCT,
                  minp_ratio: float = fetcher.QVIX_THR_COVERAGE,
                  min_corr: float = None, ret_col: str = "ret_3m", pick: str = "bottom",
@@ -683,10 +699,13 @@ def run_backtest(window: int | None = None, pct: float = fetcher.QVIX_THR_PCT,
                  signal_mode: str = "threshold",
                  jump_days: int = 3, jump_pct: float = 0.20,
                  max_drop: float = 30.0, require_sse_down: bool = True,
-                 require_fund_age: bool = True, qvix_series: str = "50"):
+                 require_fund_age: bool = True, qvix_series: str = "50",
+                 skip_rising_start_streaks: bool = True):
     """阈值默认取前一交易日前的滚动自然两年 90% 分位（含前一交易日）。
     window 可显式指定交易日数量以复现旧口径。minp_ratio 为窗口有效数据比例。
     默认按买入信号日核对份额成立满6个自然月，未查到成立日的份额不参选。
+    skip_rising_start_streaks: 在 require_sse_down 启用时，连续触发的首个交易日
+    若上证收涨，排除整个波段。首日收平时只排除当天。
 
     min_corr: 冠军候选与上证指数近3月相关系数门槛, 见
     find_champion_on_date 的 sse_df/min_corr 说明。2026-07-24 起默认
@@ -935,14 +954,15 @@ def run_backtest(window: int | None = None, pct: float = fetcher.QVIX_THR_PCT,
         # 跟阈值比, 直接判定为信号。
         # 只在 threshold 口径下这么判: jump 口径比的是 QVIX 自身的涨幅, 那天
         # 根本没有值可比, 强行塞进去等于换了个定义。
-        _broken = qvix["note"].map(qvix_calc.is_chain_broken)
-        signals = qvix[((qvix["close"] > qvix["thr"]) | _broken)
-                       & (qvix["thr"].notna())]
-    signals = signals[signals["date"] >= _signal_floor]
+        signals = qvix[qvix_threshold_hits(qvix["close"], qvix["thr"], qvix["note"])]
     if require_sse_down:
-        down_days = sse.loc[sse["close"].diff() < 0, "date"]
-        signals = signals[signals["date"].isin(down_days)]
+        eligible_days = sse_down_signal_days(
+            sse, signals["date"], skip_rising_start_streaks=skip_rising_start_streaks)
+        signals = signals[signals["date"].isin(eligible_days)]
         print("入场条件: 上证当日收跌")
+        if skip_rising_start_streaks:
+            print("连续信号首日上证收涨，整段排除")
+    signals = signals[signals["date"] >= _signal_floor]
     _n_broken = (0 if signal_mode == "jump"
                  else int(signals["note"].map(qvix_calc.is_chain_broken).sum()))
     print(f"信号日(QVIX > 阈值): {len(signals)} 天"
@@ -1271,8 +1291,11 @@ def main():
                              "传具体数值(如0.6)启用")
     parser.add_argument("--lookback", choices=["1m", "3m"], default="3m",
                         help="按自然月排名，默认3m(近3个月)，1m=近1个月")
-    parser.add_argument("--any-sse-direction", action="store_true",
-                        help="允许上证上涨或收平时入场，默认只允许当日收跌时入场")
+    sse_rules = parser.add_mutually_exclusive_group()
+    sse_rules.add_argument("--any-sse-direction", action="store_true",
+                           help="允许上证上涨或收平时入场，默认只允许当日收跌时入场")
+    sse_rules.add_argument("--skip-rising-start-streaks", action=argparse.BooleanOptionalAction,
+                           default=True, help="连续触发的首日上证收涨时，排除整个波段（默认开启）")
     parser.add_argument("--no-fund-age", action="store_true",
                         help="对照实验可关闭成立满6个自然月的门槛")
     parser.add_argument("--pick", choices=["top", "bottom", "regime"], default="bottom",
@@ -1369,6 +1392,7 @@ def main():
         _sync_before_run()
 
     _ret_col = "ret_1m" if args.lookback == "1m" else "ret_3m"
+    skip_rising_start_streaks = args.skip_rising_start_streaks and not args.any_sse_direction
     t0 = time.time()
     trades = run_backtest(window=args.window, pct=args.pct, min_corr=args.min_corr,
                           ret_col=_ret_col, pick=args.pick,
@@ -1387,7 +1411,8 @@ def main():
                           signal_mode=args.signal_mode,
                           jump_days=args.jump_days, jump_pct=args.jump_pct,
                           require_sse_down=not args.any_sse_direction,
-                          require_fund_age=not args.no_fund_age, qvix_series=args.qvix_series)
+                          require_fund_age=not args.no_fund_age, qvix_series=args.qvix_series,
+                          skip_rising_start_streaks=skip_rising_start_streaks)
     elapsed = time.time() - t0
 
     if not trades:
@@ -1412,6 +1437,7 @@ def main():
                     and args.max_drop == 30.0
                     and args.sell_cooldown == 2
                     and not args.any_sse_direction
+                    and skip_rising_start_streaks
                     and not args.no_fund_age
                     and not args.no_require_drop)
     _params = {
@@ -1422,6 +1448,7 @@ def main():
         "lookback_months": int(args.lookback[:-1]),
         "min_fund_age_months": 0 if args.no_fund_age else MIN_FUND_AGE_MONTHS,
         "require_sse_down": not args.any_sse_direction,
+        "skip_rising_start_streaks": skip_rising_start_streaks,
         "pick": args.pick, "min_vol_ratio": args.min_vol_ratio,
         "dd_divisor": args.dd_divisor, "min_aum": args.min_aum,
         "max_aum": args.max_aum,

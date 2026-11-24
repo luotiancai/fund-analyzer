@@ -105,7 +105,11 @@ function renderPick(result) {
   if (result.asof === result.qdate && result.thr != null) {
     const qvix = result.broken ? '期权链失效' : `QVIX ${num(result.qvix)}，阈值 ${num(result.thr)}`;
     const direction = result.sse_change == null ? '上证收盘涨跌待确认' : `上证 ${num(result.sse_change)}%`;
-    html += notice(`${qvix}，${direction}。${result.hit?'触发买入信号。':'下面展示当日的选基候选。'}`, result.hit?'':'warn');
+    let signal = result.hit ? '触发买入信号。' : '下面展示当日的选基候选。';
+    if (!result.hit && result.qvix_hit && result.sse_change < 0) {
+      signal = '该波段首日上证收涨，整段信号已剔除。' + signal;
+    }
+    html += notice(`${qvix}，${direction}。${signal}`, result.hit?'':'warn');
   }
   if (result.thr == null) html += notice('这一天没有足够的 QVIX 阈值历史，请换个日期。','warn');
   else html += table(result.rows, pickColumns);

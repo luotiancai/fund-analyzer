@@ -189,6 +189,7 @@ def review_summary(bt_df: pd.DataFrame, bt_id, bt_at, params=None) -> str:
     basis = "A/C 等份额合并" if merged else "C 类自身"
     calendar = (params or {}).get("lookback_basis") == "calendar_months"
     require_sse_down = (params or {}).get("require_sse_down", False)
+    skip_rising_start = (params or {}).get("skip_rising_start_streaks", False)
     threshold_years = (params or {}).get("threshold_years")
     min_age_months = (params or {}).get("min_fund_age_months")
     return (
@@ -198,6 +199,7 @@ def review_summary(bt_df: pd.DataFrame, bt_id, bt_at, params=None) -> str:
         + ("近3月收益按自然月计算。" if calendar else "")
         + (f"参选份额须成立满 {min_age_months} 个自然月。" if min_age_months else "")
         + ("入场须满足**上证当日收跌**。" if require_sse_down else "")
+        + ("连续触发的首个交易日若上证收涨，**整段剔除**。" if skip_rising_start else "")
         + ("这是历史合并口径跑批，当前选基已改为 C 类自身规模，尚未按新口径重跑。"
            if merged else "")
         + f"{_n} 笔已完成:胜率 {_wins / _n * 100:.1f}%({_wins}/{_n}),"
@@ -336,6 +338,8 @@ def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
     # 拿 pick 去套会把规则描述得完全不对。这类跑批自己在
     # params 里带 rule_note/exit_note, 有就顶掉自动拼的那句。
     _rule = x_params.get("rule_note") or _rule
+    if x_params.get("skip_rising_start_streaks"):
+        _rule = "连续触发的首个交易日若上证收涨，整段剔除。" + _rule
     if x_params.get("qvix_series") == "300" and x_params.get("threshold_years") is not None:
         years, pct = x_params["threshold_years"], x_params["pct"]
         start, end = x_params.get("min_signal_date"), x_params.get("data_asof")

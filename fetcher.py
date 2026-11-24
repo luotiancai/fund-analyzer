@@ -1871,6 +1871,8 @@ def describe_run(params: dict) -> str:
     bits = [head]
     if p.get("qvix_series") == "300":
         bits.insert(0, "沪深300 QVIX")
+    if p.get("skip_rising_start_streaks"):
+        bits.append("首日收涨的信号波段整段排除")
     if p.get("require_drop"):
         bits.append("跌向须真跌")
     if p.get("min_vol_ratio"):
