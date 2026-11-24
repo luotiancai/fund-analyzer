@@ -1474,7 +1474,7 @@ def main():
         "jump_pct": args.jump_pct if args.signal_mode == "jump" else None,
     }
     if _is_standard:
-        _params["pool_min_aum"] = args.min_aum
+        _params["pool_min_aum"] = None
     if args.no_save:
         print("--no-save: 这次不落库")
     else:

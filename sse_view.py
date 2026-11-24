@@ -196,6 +196,9 @@ def review_summary(bt_df: pd.DataFrame, bt_id, bt_at, params=None) -> str:
     skip_rising_start = params.get("skip_rising_start_streaks", False)
     threshold_years = params.get("threshold_years")
     min_age_months = params.get("min_fund_age_months")
+    pool_scope = ("净值库内所有可交易的 C 类基金**(不限规模、买卖日均有净值、"
+                  + (f"成立满{min_age_months}个自然月、" if min_age_months else "")
+                  if pool_min_aum is None else f"本来可以买的所有基金**(规模≥{pool_min_aum:g}亿、")
     return (
         f"本次跑批按**{basis}规模≥{min_aum:g}亿**筛选。"
         + (f"QVIX 阈值取截至前一交易日的滚动 {threshold_years} 个自然年 90% 分位。"
@@ -214,8 +217,8 @@ def review_summary(bt_df: pd.DataFrame, bt_id, bt_at, params=None) -> str:
         f"剔除收益最高的一笔，其余 {_n - 1} 笔累计 {_cum_ex:+.2f}%。"
         f"亏损笔:{_loss_txt}。"
         "样本只有个位数、跨度6年,统计上很薄,别当成可靠预期。"
-        f"「可买池分位」是这一笔在当天**本来可以买的所有基金**(规模≥{pool_min_aum:g}亿、"
-        "排除QDII/海外和持有期锁定和净值脏数据"
+        f"「可买池分位」是这一笔在当天**{pool_scope}"
+        "排除QDII/海外、FOF、持有期锁定和净值脏数据"
         + ("及已核实的历史限购" if params.get("pool_purchase_limits") else "")
         + ")里排第几——分母"
         "**不含**策略自己那三道筛选(真跌/跌幅≤30%/波动≥1.5),否则等于给"
@@ -382,6 +385,7 @@ def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
            else "**跌幅不设上限**、")
         + (f"规模**{_aum}~{x_params['max_aum']}亿**"
            if x_params.get("max_aum") else
+           "**规模不限**" if _aum is None else
            f"规模**>{_aum:g}亿**" if x_params.get("min_aum_exclusive") else
            f"规模≥{_mark(_aum, STANDARD_MIN_AUM)}亿")
         + ("(合并份额口径)" if _basis == "merged" else "(单份额口径)")

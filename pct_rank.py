@@ -16,10 +16,8 @@
 "在已经选好的候选里排第几", 等于给前面那几道筛选免票; 而那几道恰恰是策略的
 一部分、也最需要被检验。用"那天本来可以买的所有基金"当分母, 衡量的才是整套
 选基规则(筛选+排序)合起来创造了多少价值。所以列名叫「可买池」而不是「同池」。
-  · 保留跑批记录的可买池规模下限。未记录的旧跑批沿用 2 亿。分母里混进策略
-    根本不会买的迷你基金没有意义, 而且那批基金的净值本身就不可信(015111
-    惠升领先优选 2024-03-28 单日 +20.18%, 而它当季末净资产只剩 100 万,
-    那 20% 是 93% 份额被短期赎回、赎回费分摊给剩下 7% 造成的);
+  · 当前标准用净值库内所有可交易的 C 类份额，规模不限，买卖日均须有净值。
+    旧跑批按记录的可买池规模下限，未记录的沿用 2 亿。
   · 另排除**这笔交易本身不成立**的标的 —— QDII/海外(跟QVIX恐慌-反弹
     逻辑脱钩, 策略一贯排除)、FOF(净值披露滞后)、持有期锁定(赎不出来, 止损卖不掉)、净值僵化-
     补涨(脏数据);
@@ -38,6 +36,7 @@
 """
 import hashlib
 import json
+import re
 import sys
 
 import numpy as np
@@ -83,6 +82,13 @@ def compute(run_id: int, dry_run: bool = False):
     params = json.loads(row["params"] or "{}")
     trades = json.loads(row["trades"])
     pool_min_aum = params.get("pool_min_aum", 2.0)
+    all_c = pool_min_aum is None
+    if all_c:
+        c_codes = {code for code, name in names.items() if fetcher.is_c_class(name)}
+        qvix = fetcher.load_qvix_self_history(series=params.get("qvix_series", "50"))
+        qvix["threshold"] = fetcher.qvix_rolling_thresholds(
+            qvix, sse["date"], before=True, pct=params["pct"])
+        thresholds = qvix.set_index("date")["threshold"]
     maturity_dates = fetcher.fund_maturity_dates(conn) if params.get("min_fund_age_months") else None
     print(f"跑批 #{run_id}「{row['label']}」{len(trades)} 笔\n", flush=True)
 
@@ -94,19 +100,23 @@ def compute(run_id: int, dry_run: bool = False):
         cand = {c for c, m in metrics.items()
                 if m.get("ret_3m") is not None and c not in exclude and c not in restricted
                 and (maturity_dates is None or (c in maturity_dates and maturity_dates[c] <= asof))}
-        # 规模用批量版一次 SQL 取完, 纯读库不触网(逐只 fund_aum_asof
-        # 要查两万多次, 会把这个脚本拖到小时级)。
-        aums = fetcher.funds_aum_asof(sorted(cand), asof,
-                                    merge_classes=(params.get("aum_basis", "single") == "merged"))
-        cand = [c for c in sorted(cand) if aums.get(c) is not None and aums[c] >= pool_min_aum]
-
-        hi = (buy + pd.Timedelta(days=500)).strftime("%Y-%m-%d")
+        if all_c:
+            buy_nav_codes = {r[0] for r in conn.execute(
+                "SELECT code FROM fund_nav_daily WHERE date=? AND nav>0", (asof,))}
+            cand &= c_codes & buy_nav_codes
+            thr = thresholds.loc[asof]
+            hi = sse["date"].iat[-1].strftime("%Y-%m-%d")
+        else:
+            aums = fetcher.funds_aum_asof(sorted(cand), asof,
+                                         merge_classes=(params.get("aum_basis", "single") == "merged"))
+            cand = {c for c in cand if aums.get(c) is not None and aums[c] >= pool_min_aum}
+            hi = (buy + pd.Timedelta(days=500)).strftime("%Y-%m-%d")
         days_after = sse[sse["date"] >= buy]["date"].values
         buy_sse = float(sse_close.loc[buy])
         market_returns = sse_close.pct_change(fill_method=None)
 
-        rets = []
-        for code in cand:
+        rets = {}
+        for code in sorted(cand):
             window = fetcher.nav_period_bounds(conn, code, asof, fetcher.PERIOD_OFFSETS["3m"])
             if window[0] is None:
                 continue
@@ -121,19 +131,22 @@ def compute(run_id: int, dry_run: bool = False):
                 "WHERE code=? AND date>=? AND date<=? ORDER BY date", conn, params=(code, asof, hi))
             if post.empty or pd.isna(post["nav"].iloc[0]) or not post["nav"].iloc[0]:
                 continue
+            if all_c:
+                post = post[post["nav"] > 0].reset_index(drop=True)
             post["date"] = pd.to_datetime(post["date"])
             post["r"] = pd.to_numeric(post["daily_ret_pct"], errors="coerce") / 100.0
-            cur = float(post["nav"].iloc[0])
+            cur = 1.0 if all_c else float(post["nav"].iloc[0])
             series = {}
             for i, (d, r) in enumerate(zip(post["date"].values, post["r"].values)):
                 if i and not pd.isna(r):
                     cur = cur * (1 + r)
                 series[d] = cur
             buy_nav = series[post["date"].values[0]]
-            fund_lim, sse_lim = thr / 5.0 * beta, thr / 5.0
+            divisor = params["dd_divisor"] if all_c else 5.0
+            fund_lim, sse_lim = thr / divisor * beta, thr / divisor
             peak = last = buy_nav
             peak_sse = buy_sse
-            for d in days_after:
+            for d in days_after[1 if all_c else 0:]:
                 nav = series.get(d, last)
                 last = nav
                 peak = max(peak, nav)
@@ -141,16 +154,23 @@ def compute(run_id: int, dry_run: bool = False):
                 peak_sse = max(peak_sse, sc)
                 if ((peak - nav) / peak * 100 >= fund_lim
                         or (peak_sse - sc) / peak_sse * 100 >= sse_lim):
-                    n_days = (pd.Timestamp(d) - buy).days
-                    rets.append((nav / buy_nav - 1) * 100 - _fee(n_days))
+                    if not all_c or d in series:
+                        n_days = (pd.Timestamp(d) - buy).days
+                        rets[code] = (nav / buy_nav - 1) * 100 - _fee(n_days)
                     break
         if not rets:
             raise ValueError(f"{asof} 没有可计算分位的已平仓候选。")
         mine = float(t["费后收益"])
-        pct = 100.0 * sum(1 for v in rets if v < mine) / len(rets)
+        if all_c:
+            code = re.search(r"\((\d{6})\)$", t["冠军(C类全市场,按前一交易日榜单)"]).group(1)
+            current = rets.get(code)
+            if current is None or round(current, 2) != mine:
+                raise ValueError(f"{asof} 的标准交易收益与可买池模拟不一致。")
+            mine = current
+        pct = 100.0 * sum(1 for v in rets.values() if v < mine) / len(rets)
         t[COL] = f"{pct:.1f}%"
         print(f"  {t['买入日']} 池{len(rets):>5} | 本笔 {mine:+7.2f}% → "
-              f"分位 {pct:5.1f}% | 池中位 {np.median(rets):+6.2f}%", flush=True)
+              f"分位 {pct:5.1f}% | 池中位 {np.median(list(rets.values())):+6.2f}%", flush=True)
 
     if dry_run:
         print("\n--dry-run: 不写库")
