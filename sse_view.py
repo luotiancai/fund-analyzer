@@ -303,10 +303,11 @@ def run_label(r: dict) -> str:
     _t = fmt_cst(r["run_at"], "%m-%d %H:%M") or "—"
     _w = f"{r['win_rate']:.0f}%" if r["win_rate"] is not None else "—"
     _c = f"{r['cum_return']:+.0f}%" if r["cum_return"] is not None else "—"
+    unit = "轮" if (r.get("params") or {}).get("funds_per_entry", 1) > 1 else "笔"
     # 编号放最前面: label 是按参数自动拼的, 十几条跑批前缀
     # 高度雷同, 只有 #id 能一眼对上(讨论里说的也是这个号)。
     return (f"#{r['id']} · {_t} · {r['label']} · "
-            f"{r['n_trades']}笔 胜率{_w} 复利{_c}")
+            f"{r['n_trades']}{unit} 胜率{_w} 复利{_c}")
 
 
 def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
@@ -318,6 +319,7 @@ def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
     _x_ex = ((1 + _x_rets.drop(_x_rets.idxmax()) / 100).prod() - 1) * 100
     _x_loss = _x_rets[_x_rets <= 0]
     _x_pick = str(x_params.get("pick") or "bottom")
+    unit = "轮" if x_params.get("funds_per_entry", 1) > 1 else "笔"
     if _x_pick == "regime":
         # regime_basis 区分两版择向依据:早期那版比的是"截至
         # 前一日的回看窗口",在暴跌当天触发的信号上会把当天
@@ -394,18 +396,25 @@ def run_detail(x_df: pd.DataFrame, x_params: dict, run_id, x_at):
            ",双止损沿用标准公式，宽度按沪深300阈值计算"
            if x_params.get("qvix_series") == "300" else ",双止损口径同标准策略")
         + f"(粗体=与标准策略不同的参数)。"
-        f"　{_x_n} 笔已完成:胜率 {_x_wins / _x_n * 100:.1f}%"
+        f"　{_x_n} {unit}已完成:胜率 {_x_wins / _x_n * 100:.1f}%"
         f"({_x_wins}/{_x_n}),费后复利 {_x_cum:+.2f}%,"
         f"平均持有 {_x_days.mean():.0f} 天,"
         f"平均费后 {_x_rets.mean():+.2f}%,"
         f"最佳 {_x_rets.max():+.2f}% / 最差 {_x_rets.min():+.2f}%,"
-        f"剔除最佳那笔其余 {_x_n - 1} 笔仍有 {_x_ex:+.2f}%。"
-        f"亏损笔:"
+        f"剔除最佳那{unit}其余 {_x_n - 1} {unit}仍有 {_x_ex:+.2f}%。"
+        f"亏损{unit}:"
         + ("、".join(f"{v:+.2f}%" for v in _x_loss)
            if len(_x_loss) else "无") +
         "。历史跑批，仅供对比。"
         + (f"(跑批 #{run_id},跑于 {fmt_cst(x_at, '%Y-%m-%d %H:%M')})"
            if x_at else ""))
+
+    if unit == "轮":
+        rounds = x_df[["买入日", "持有收益", "legs"]].explode("legs", ignore_index=True)
+        view = pd.DataFrame.from_records(rounds["legs"])
+        view.insert(0, "买入日", rounds["买入日"])
+        view["本轮组合收益"] = rounds["持有收益"].where(view["跌幅排名"].eq(1), "")
+        return caption, view, [""] * len(view)
 
     # 择向策略逐笔方向不同(有的买涨幅最大、有的买跌幅最大),
     # 标的那列只能中性叫"选中标的",具体方向看「选向」列。
