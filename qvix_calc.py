@@ -3,7 +3,6 @@
 2026-11-20 两张有正常成交的认购合约被风险指标表填了零隐波。用它反推
 期权价格会漏掉这两张，算出 13.99，而上交所、东方财富和新浪收盘价都得到
 15.66。历史日线和每日更新共用这个模块；新浪盘中买卖价仍走 qvix_core。
-新浪逐合约历史日 K 收盘价可按相同公式单独计算比较日线。
 
 只用标准合约，使用最近两个到期月并按 30 天插值。近月到期前不提前换月；
 50ETF 没有周合约，换月后偶尔需要小幅外推，最近可用近月超过 40 天就停。
@@ -14,7 +13,6 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
-import json
 import logging
 import math
 import re
@@ -33,10 +31,6 @@ _CONTRACT_RE = re.compile(r"^(\d{6})([CP])(\d{4})M(\d{5})$")
 _SSE_HEADERS = {"Referer": "https://www.sse.com.cn/", "User-Agent": "Mozilla/5.0"}
 _CONTRACT_URL = "https://query.sse.com.cn/commonQuery.do"
 _CLOSE_URL = "https://yunhq.sse.com.cn:32042/v1/sho/dayk/"
-_SINA_CLOSE_URL = ("https://stock.finance.sina.com.cn/futures/api/jsonp_v2.php//"
-                   "StockOptionDaylineService.getSymbolInfo")
-_SINA_HEADERS = {"Referer": "https://stock.finance.sina.com.cn/option/quotes.html",
-                 "User-Agent": "Mozilla/5.0"}
 _SHIBOR_BACKUP_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 CHAIN_BROKEN = "链失效"
 
@@ -46,17 +40,11 @@ def is_chain_broken(note) -> bool:
     return isinstance(note, str) and note.startswith(CHAIN_BROKEN)
 
 
-def _get_json(url, params=None, *, headers=None, jsonp=False):
+def _get_json(url, params=None, *, headers=None):
     for attempt in range(3):
         try:
             response = requests.get(url, params=params, headers=headers, timeout=8)
             response.raise_for_status()
-            if jsonp:
-                body = response.text
-                start, end = body.find("("), body.rfind(")")
-                if not 0 <= start < end:
-                    raise ValueError("日线 JSONP 响应异常")
-                return json.loads(body[start + 1:end])
             return response.json()
         except (requests.RequestException, ValueError):
             if attempt == 2:
@@ -92,24 +80,6 @@ def _fetch_closes(symbol, begin, end):
         if not begin <= day <= end or day in closes:
             raise ValueError("合约日线日期越界或重复")
         close = float(raw_close) if raw_close is not None else 0.0
-        closes[day] = close if math.isfinite(close) and close > 0 else None
-    return closes
-
-
-def _fetch_sina_closes(symbol, begin, end):
-    """新浪历史日 K 与 AkShare option_sse_daily_sina 使用同一个接口。"""
-    rows = _get_json(_SINA_CLOSE_URL, {"symbol": f"CON_OP_{symbol}"},
-                     headers=_SINA_HEADERS, jsonp=True)
-    if not isinstance(rows, list):
-        raise ValueError("新浪合约日线响应异常")
-    closes = {}
-    for row in rows:
-        day = dt.date.fromisoformat(row["d"])
-        if not begin <= day <= end:
-            continue
-        if day in closes:
-            raise ValueError("新浪合约日线日期重复")
-        close = float(row["c"] or 0)
         closes[day] = close if math.isfinite(close) and close > 0 else None
     return closes
 
@@ -205,7 +175,7 @@ def _term(day, term, closes, curve):
     return None, broken, False
 
 
-def _calculate(day, pairs, closes, curve, *, source_name="上交所"):
+def _calculate(day, pairs, closes, curve):
     if not pairs:
         return None, "无可用近月/次月合约"
     if not curve:
@@ -215,7 +185,7 @@ def _calculate(day, pairs, closes, curve, *, source_name="上交所"):
         var1, b1, missing1 = _term(day, near, closes, curve)
         var2, b2, missing2 = _term(day, nxt, closes, curve)
         if missing1 or missing2:
-            return None, f"{source_name}期权收盘数据不全"
+            return None, "上交所期权收盘数据不全"
         broken |= b1 or b2
         if var1 is None or var2 is None:
             continue
@@ -230,13 +200,11 @@ def _calculate(day, pairs, closes, curve, *, source_name="上交所"):
     return None, "收盘价计算未得到有效的30天方差"
 
 
-def compute_qvix_history(dates, *, trading_days=None, delay=0.0, series="50", price_source="sse"):
+def compute_qvix_history(dates, *, trading_days=None, delay=0.0, series="50"):
     """按日计算 QVIX。每张合约只查一次日线，回填和每日跑批共用。"""
     dates = sorted(set(dates))
     if not dates:
         return {}
-    source_name, fetch_closes = {"sse": ("上交所", _fetch_closes),
-                                 "sina": ("新浪", _fetch_sina_closes)}[price_source]
     if trading_days is None:
         trading_days = fetcher._trading_days() or set()
     curves = _shibor_curves(dates)
@@ -255,12 +223,12 @@ def compute_qvix_history(dates, *, trading_days=None, delay=0.0, series="50", pr
 
     def load(symbol):
         try:
-            return symbol, fetch_closes(symbol, dates[0], dates[-1])
+            return symbol, _fetch_closes(symbol, dates[0], dates[-1])
         except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
-            log.warning("%s日线 QVIX 合约 %s 获取收盘价失败：%s", source_name, symbol, exc)
+            log.warning("日线 QVIX 合约 %s 获取收盘价失败：%s", symbol, exc)
             return symbol, None
 
-    log.info("%s日线 QVIX %d 个交易日，取 %d 张合约的收盘价", source_name, len(dates), len(symbols))
+    log.info("日线 QVIX %d 个交易日，取 %d 张合约的收盘价", len(dates), len(symbols))
     closes = {}
     with ThreadPoolExecutor(max_workers=6) as pool:
         for i, (symbol, values) in enumerate(pool.map(load, sorted(symbols)), 1):
@@ -269,7 +237,7 @@ def compute_qvix_history(dates, *, trading_days=None, delay=0.0, series="50", pr
             if i % 250 == 0:
                 log.info("日线 QVIX 已请求 %d/%d 张合约", i, len(symbols))
     for day, pairs in plans.items():
-        results[day] = _calculate(day, pairs, closes, curves[day], source_name=source_name)
+        results[day] = _calculate(day, pairs, closes, curves[day])
     return {day: results[day] for day in dates}
 
 

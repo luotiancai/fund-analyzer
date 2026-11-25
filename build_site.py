@@ -92,7 +92,6 @@ def collect() -> dict:
     hist = fetcher.load_qvix_self_history()
     if hist is not None and not hist.empty:
         out["qv"] = _qvix_data(hist, sse["date"])
-    out["qvix_sina"] = fetcher.load_qvix_sina_history()
 
     rv = {"intro": sse_view.md_inline(sse_view.REVIEW_INTRO)}
     bt_df, _p, bt_at, bt_id = fetcher.load_backtest_trades()
