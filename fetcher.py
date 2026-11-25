@@ -100,7 +100,7 @@ DB_LAYOUT = (
     # 排在 market 前面: 迁移期线上那份 market.db 里还留着一张同名的
     # qvix_self_history, 而不带库名的表名解析是按 ATTACH 顺序走的(先挂的先
     # 命中, 实测过), 排前面保证读写都落在新库上, 旧那张只是死重量。
-    ("qvix", "qvix.db", ("qvix_self_history", "qvix_300_history")),
+    ("qvix", "qvix.db", ("qvix_self_history", "qvix_300_history", "qvix_sina_history")),
     ("market", "market.db",
      ("index_daily_cache",)),
     ("strategy", "fund_strategy.db",
@@ -239,6 +239,9 @@ _DDL = {
         qvix_rt REAL);
     CREATE TABLE IF NOT EXISTS qvix.qvix_300_history (
         date TEXT PRIMARY KEY, qvix REAL, note TEXT, threshold REAL);
+    -- 由新浪历史日 K 收盘价计算的 50ETF 对照日线。
+    CREATE TABLE IF NOT EXISTS qvix.qvix_sina_history (
+        date TEXT PRIMARY KEY, qvix REAL NOT NULL);
 """,
 
 "market": """
@@ -1839,6 +1842,12 @@ def load_qvix_self_history(*, series="50") -> Optional[pd.DataFrame]:
     return df if not df.empty else None
 
 
+def load_qvix_sina_history() -> dict[str, float]:
+    """按日期读取新浪历史日 K 收盘价算出的 50ETF QVIX。"""
+    with closing(_conn()) as conn:
+        return dict(conn.execute("SELECT date, qvix FROM qvix.qvix_sina_history ORDER BY date"))
+
+
 def _run_summary(trades: list) -> tuple:
     """(笔数, 胜率%, 累计费后复利%) —— 只统计已平仓的笔。
 
@@ -2089,6 +2098,37 @@ def update_qvix_self_daily() -> tuple:
             logger.warning("日线 QVIX %s：%s", day, note)
         else:
             logger.info("日线 QVIX %s = %.2f", day, value)
+    return results[target]
+
+
+def update_qvix_sina_daily() -> tuple:
+    """刷新上一交易日的新浪日线 QVIX，并补最近 15 个自然日的缺口。"""
+    import qvix_calc
+
+    today = datetime.now(_CST).date()
+    trading_days = _trading_days()
+    if not trading_days:
+        return None, "拿不到交易日历"
+    cutoff = today - timedelta(days=15)
+    recent = sorted(day for day in trading_days if cutoff <= day < today)
+    if not recent:
+        return None, "近 15 天没有可补的交易日"
+
+    target = recent[-1]
+    known = load_qvix_sina_history()
+    pending = [day for day in recent if day == target or day.isoformat() not in known]
+    results = qvix_calc.compute_qvix_history(pending, trading_days=trading_days, price_source="sina")
+    with closing(_conn()) as conn, conn:
+        conn.executemany(
+            "INSERT INTO qvix.qvix_sina_history (date, qvix) VALUES (?, ?) "
+            "ON CONFLICT(date) DO UPDATE SET qvix=excluded.qvix",
+            [(day.isoformat(), value) for day, (value, _) in results.items() if value is not None],
+        )
+    for day, (value, note) in results.items():
+        if value is None:
+            logger.warning("新浪日线 QVIX %s：%s", day, note)
+        else:
+            logger.info("新浪日线 QVIX %s = %.2f", day, value)
     return results[target]
 
 

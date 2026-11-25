@@ -77,6 +77,13 @@ def run_qvix_only() -> list:
     except Exception as e:
         log.warning("   QVIX 实时口径收盘值失败(不影响日度值): %s", e)
 
+    try:
+        value, note = fetcher.update_qvix_sina_daily()
+        if value is None:
+            log.warning("   新浪日线 QVIX 未更新：%s", note)
+    except Exception as e:
+        log.warning("   新浪日线 QVIX 更新失败：%s", e)
+
     return filled
 
 

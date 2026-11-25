@@ -316,9 +316,8 @@ function renderDaily(i0) {
   const cols = ["日期", "收盘点位", "日涨跌(%)"];
   const withVix = Q && $("vix").checked;
   if (withVix) {
-    cols.push("上交所收盘 QVIX");
-    if (Q.r) cols.push("新浪盘口 QVIX", "差值（新浪减上交所）");
-    cols.push("上证50阈值");
+    cols.push("上交所收盘 QVIX", "新浪日线 QVIX", "日线差值（新浪减上交所）", "上证50阈值");
+    if (Q.r) cols.push("新浪盘口 QVIX");
   }
   const rows = [];
   for (let k = N - 1; k >= i0; k--) {
@@ -326,13 +325,10 @@ function renderDaily(i0) {
     if (withVix) {
       const pos = qvixIndex.get(S.d[k]);
       const close = Q.v[pos];
-      r.push(f2(close));
-      if (Q.r) {
-        const sina = Q.r[pos];
-        const gap = close == null || sina == null ? null : sina - close;
-        r.push(f2(sina), gap > 0 ? `+${f2(gap)}` : f2(gap));
-      }
-      r.push(f2(Q.t[pos]));
+      const sina = D.qvix_sina[S.d[k]];
+      const gap = close == null || sina == null ? null : sina - close;
+      r.push(f2(close), f2(sina), gap > 0 ? `+${f2(gap)}` : f2(gap), f2(Q.t[pos]));
+      if (Q.r) r.push(f2(Q.r[pos]));
     }
     rows.push(r);
   }

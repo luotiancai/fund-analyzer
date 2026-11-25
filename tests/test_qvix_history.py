@@ -12,6 +12,37 @@ import qvix_calc
 
 
 class QvixHistoryTests(unittest.TestCase):
+    def test_sina_close_parser_selects_requested_dates_and_rejects_zero_prices(self):
+        begin, end = dt.date(2026, 11, 19), dt.date(2026, 11, 20)
+        with patch.object(qvix_calc.requests, "get") as get:
+            get.return_value.text = ('/* Sina */\n([{"d":"2026-11-18","c":"0.01"},'
+                                     '{"d":"2026-11-19","c":"0"},'
+                                     '{"d":"2026-11-20","c":"0.0724"}]);')
+            closes = qvix_calc._fetch_sina_closes("10011425", begin, end)
+        self.assertEqual(closes, {begin: None, end: 0.0724})
+        self.assertEqual(get.call_args.kwargs["params"], {"symbol": "CON_OP_10011425"})
+
+    def test_sina_refresh_keeps_previous_values_and_uses_separate_history(self):
+        prior, target = dt.date(2026, 11, 19), dt.date(2026, 11, 20)
+        calendar = {prior, target}
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = {name: str(Path(tmp) / file) for name, file, _ in fetcher.DB_LAYOUT}
+            with patch.multiple(fetcher, DB_PATH=paths, _schema_ready=False), \
+                    patch.object(fetcher, "datetime", wraps=dt.datetime) as clock, \
+                    patch.object(fetcher, "_trading_days", return_value=calendar), \
+                    patch.object(qvix_calc, "compute_qvix_history") as compute:
+                clock.now.return_value = dt.datetime(2026, 11, 21, 7)
+                fetcher.save_qvix_self_history([{"date": str(target), "qvix": 15.66}],
+                                               trading_days=calendar)
+                compute.return_value = {prior: (14.9, None), target: (15.7, None)}
+                self.assertEqual(fetcher.update_qvix_sina_daily(), (15.7, None))
+                compute.assert_called_once_with([prior, target], trading_days=calendar, price_source="sina")
+                compute.return_value = {target: (None, "接口超时")}
+                self.assertEqual(fetcher.update_qvix_sina_daily(), (None, "接口超时"))
+                compute.assert_called_with([target], trading_days=calendar, price_source="sina")
+                self.assertEqual(fetcher.load_qvix_sina_history(), {str(prior): 14.9, str(target): 15.7})
+                self.assertEqual(fetcher.load_qvix_self_history()["qvix"].tolist(), [15.66])
+
     def test_listing_uses_the_contract_even_when_implied_volatility_is_zero(self):
         day = dt.date(2026, 11, 20)
         row = {"TRADE_DATE": str(day), "CONTRACT_ID": "510050C2612M02800",
