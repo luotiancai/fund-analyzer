@@ -93,7 +93,7 @@ function table(rows, columns, options={}) {
 }
 const pickColumns = [
   {key:'rank',label:'跌幅榜',render:v=>v??'—'}, {key:'code',label:'基金代码',render:codeLink},
-  {key:'name',label:'基金名称',text:true}, {key:'ret3m',label:'近3月收益(%)',render:v=>num(v)},
+  {key:'name',label:'基金名称',text:true}, {key:'ret3m',label:'近3月收益(%)',render:v=>num(v,4)},
   {key:'win_start',label:'近3月窗口',render:(v,r)=>v&&r.win_end?`${esc(v)} → ${esc(r.win_end)}`:'—'},
   {key:'beta',label:'波动率比值',render:v=>num(v)}, {key:'aum',label:'C类规模(亿)',render:v=>num(v)},
   {key:'why',label:'结论',text:true,render:(v,r)=>esc(v||(r.selection_rank?`★ 第 ${r.selection_rank} 顺位`:r.role)||'通过')}
